@@ -1,0 +1,29 @@
+## TUIエディタのユーザー要求
+
+- 軽量で高速なターミナル内IDE
+- Windows Terminal + WSL、SSH環境で快適に動作
+- 左サイドバーでファイルツリーとGit操作を切り替え
+- VS Code風の操作感と画面構成
+- 複数ファイルをタブで編集
+- 実PTYを使った統合ターミナル
+- Gitの変更確認、差分、stage、unstage、commit、branch、push、pull
+- エラー・警告をコード上の下線とProblemsパネルに表示
+- 最小限のLSP対応
+  - C / C++
+  - Rust
+  - Python
+  - JSON
+  - Markdown
+- 必要なLSP機能
+  - diagnostics
+  - hover
+  - 定義ジャンプ
+  - 基本的な補完
+- Tree-sitterによるシンタックスハイライト
+- コンパイラやリンターの結果も診断として統合
+- キーボード中心で操作し、マウス操作にも対応可能
+- 洗練された低グレアのダークテーマ
+- True Colorと256色ターミナルに対応
+- Unicode表示を標準とし、Nerd Fontは任意
+- フォントはターミナル側で設定
+- 見た目にこだわりつつ、アニメーションなど重い表現は使わない
