@@ -29,8 +29,8 @@ Precedence when documents disagree: `USER_WANTED.md` > `SPEC/*` > this file. If 
 
 ## 2. Product Principles
 
-1. **Terminal-native first.** Everything runs inside a standard terminal emulator. Target platforms: WSL2 (Ubuntu) and native Ubuntu, including SSH, tmux, and as a single window managed by **Herder** (an orchestrator for coding agents and terminal windows — see `SPEC/SPEC.md` §4.3). No browser views, no GUI-only APIs.
-2. **Herder owns agents; Mica owns the workspace.** Mica never manages agents, chats with them, or shows their logs — that is Herder's job. Herder-managed agents appear to Mica only as external processes changing files, and integration happens through the CLI and the command layer, never through screen coordinates or synthetic key input.
+1. **Terminal-native first.** Everything runs inside a standard terminal emulator. Target platforms: WSL2 (Ubuntu) and native Ubuntu, over a plain terminal, over SSH, or as a single window managed by **Herdr** (an orchestrator for coding agents and terminal windows — see `SPEC/SPEC.md` §4.3). Terminal multiplexers (tmux, screen) are explicitly out of scope — the user doesn't use them; don't spend design or testing effort there. No browser views, no GUI-only APIs.
+2. **Herdr owns agents; Mica owns the workspace.** Mica never manages agents, chats with them, or shows their logs — that is Herdr's job. Herdr-managed agents appear to Mica only as external processes changing files, and integration happens through the CLI and the command layer, never through screen coordinates or synthetic key input.
 3. **Keyboard-first, mouse-supported.** Every core operation must have a keyboard path *and* work naturally with the mouse. Both go through the same command layer.
 4. **Never lose user text.** Unsaved edits survive external file changes, crashes, and failed saves. When in doubt, block the destructive path and ask. This outranks every convenience feature.
 5. **Fast feedback.** Opening files, switching views, typing, and rendering diagnostics must feel immediate. Anything slow runs off the render loop and reports back via events.
@@ -135,7 +135,8 @@ Hard-won constraints; check your change against them.
 
 - **Unicode widths:** CJK is 2 columns; emoji ZWJ sequences are single graphemes; cursor movement, mouse hit-testing, and selection rendering must agree on width math.
 - **LSP positions are UTF-16** code units; convert correctly at the boundary.
-- **Terminal keys are lossy:** `Ctrl+Shift+<letter>` may be swallowed by the emulator (Windows Terminal) or tmux. Every binding needs a reachable fallback (palette, `Alt+N`).
+- **Terminal keys are lossy:** `Ctrl+Shift+<letter>` may be swallowed by the emulator (Windows Terminal). Every binding needs a reachable fallback (palette, `Alt+N`).
 - **File watchers lie:** events get dropped, coalesced, or reordered; renames may arrive as delete+create. Always keep manual refresh working; debounce storms (branch switches touch thousands of files).
 - **PTY output floods:** `yes` or a build log must not freeze the UI; batch output events, don't re-render full scrollback per frame.
 - **Git state is external:** another process (agent, `git` in the terminal) can change it at any moment — re-verify before destructive operations instead of trusting cached status.
+- **Herdr detach/reattach must not lose state:** Herdr is a real PTY multiplexer (persistent sessions, detach/reattach, SSH `--remote` reattach). Mica runs as the program inside one Herdr pane — treat every reattach like a terminal resize/reconnect and redraw cleanly (`SPEC/SPEC.md` §4.3.4, `SPEC/09_quality.md` §3). Don't build Mica's own multi-pane/session features — Herdr already owns that layer; Mica's integrated terminal (`SPEC/05_terminal.md`) is a separate, inner PTY, not a Herdr pane.

@@ -54,6 +54,7 @@ enabled = true
 
 [ui]
 theme = "mica-dark"     # 名前または~/.config/mica/themes/内のファイル名
+locale = "auto"         # "auto" | "en" | "ja"(UIの表示言語。01_ui.md §7参照)
 icon_mode = "unicode"   # "ascii" | "unicode" | "nerd_font"
 sidebar_width = 30
 bottom_panel_height = 12
@@ -106,6 +107,7 @@ mica src/main.rs:42:8     # 42行8列へ
 --config <PATH>     設定ファイルの指定
 --log-file <PATH>   ログ出力先
 --log-level <LVL>   ログレベル
+--locale <LOCALE>   UI表示言語("en" | "ja")。既定はシステムロケールから自動判定
 --safe-mode         ユーザー設定・テーマ・LSPを読み込まず起動
 --version
 --help
