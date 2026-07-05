@@ -40,6 +40,10 @@ impl CommandRegistry {
                     title: "Save File",
                 },
                 CommandMeta {
+                    id: EDITOR_SAVE_AS,
+                    title: "Save As",
+                },
+                CommandMeta {
                     id: EDITOR_CLOSE,
                     title: "Close Editor",
                 },
@@ -94,6 +98,94 @@ impl CommandRegistry {
                 CommandMeta {
                     id: VIEW_SEARCH,
                     title: "Show Search",
+                },
+                CommandMeta {
+                    id: GIT_REFRESH,
+                    title: "Git: Refresh",
+                },
+                CommandMeta {
+                    id: GIT_STAGE,
+                    title: "Git: Stage Selected File",
+                },
+                CommandMeta {
+                    id: GIT_UNSTAGE,
+                    title: "Git: Unstage Selected File",
+                },
+                CommandMeta {
+                    id: GIT_RESTORE,
+                    title: "Git: Restore Selected File",
+                },
+                CommandMeta {
+                    id: GIT_COMMIT,
+                    title: "Git: Commit Staged Changes",
+                },
+                CommandMeta {
+                    id: GIT_BRANCH_SWITCH,
+                    title: "Git: Switch Branch",
+                },
+                CommandMeta {
+                    id: GIT_BRANCH_CREATE,
+                    title: "Git: Create Branch",
+                },
+                CommandMeta {
+                    id: GIT_FETCH,
+                    title: "Git: Fetch",
+                },
+                CommandMeta {
+                    id: GIT_PULL,
+                    title: "Git: Pull (Fast-forward Only)",
+                },
+                CommandMeta {
+                    id: GIT_PUSH,
+                    title: "Git: Push",
+                },
+                CommandMeta {
+                    id: SEARCH_INCLUDE_GLOBS,
+                    title: "Search: Set Include Globs",
+                },
+                CommandMeta {
+                    id: SEARCH_EXCLUDE_GLOBS,
+                    title: "Search: Set Exclude Globs",
+                },
+                CommandMeta {
+                    id: TERMINAL_TOGGLE,
+                    title: "Toggle Integrated Terminal",
+                },
+                CommandMeta {
+                    id: TERMINAL_NEW_SESSION,
+                    title: "Terminal: Restart Session",
+                },
+                CommandMeta {
+                    id: VIEW_OUTPUT,
+                    title: "Show Output Panel",
+                },
+                CommandMeta {
+                    id: VIEW_DIFF,
+                    title: "Show Diff Panel",
+                },
+                CommandMeta {
+                    id: VIEW_TERMINAL,
+                    title: "Show Terminal Panel",
+                },
+                CommandMeta {
+                    id: DIAGNOSTICS_OPEN_PROBLEMS,
+                    title: "Show Problems Panel",
+                },
+                CommandMeta {
+                    id: DIAGNOSTICS_REFRESH,
+                    title: "Diagnostics: Run Cargo Check",
+                },
+                CommandMeta {
+                    id: LSP_HOVER,
+                    title: "LSP: Hover",
+                },
+                CommandMeta {
+                    id: LSP_DEFINITION,
+                    title: "LSP: Go to Definition",
+                },
+                CommandMeta {
+                    id: LSP_COMPLETION,
+                    title: "LSP: Completion",
                 },
                 CommandMeta {
                     id: COMMAND_PALETTE_OPEN,

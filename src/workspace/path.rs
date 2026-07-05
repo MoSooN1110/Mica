@@ -74,7 +74,8 @@ impl WorkspaceRoot {
         })
     }
 
-    pub(crate) fn resolve_lexical(&self, input: impl AsRef<Path>) -> Result<PathBuf, PathError> {
+    /// Normalizes without following the final symlink and enforces the root.
+    pub fn resolve_lexical(&self, input: impl AsRef<Path>) -> Result<PathBuf, PathError> {
         let input = input.as_ref();
         let joined = if input.is_absolute() {
             input.to_path_buf()

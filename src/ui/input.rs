@@ -5,7 +5,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    app::{AppState, Focus, Overlay},
+    app::{AppState, BottomPanelView, Focus, Overlay},
     command::Command,
     workspace::TreeEntryKind,
 };
@@ -27,11 +27,34 @@ pub fn command_for_key(state: &AppState, event: KeyEvent) -> Option<Command> {
         }
         if matches!(
             state.overlay,
-            Some(Overlay::ConfirmDelete { .. } | Overlay::ConfirmClose { .. })
+            Some(
+                Overlay::ConfirmDelete { .. }
+                    | Overlay::ConfirmClose { .. }
+                    | Overlay::ConfirmSaveAs { .. }
+                    | Overlay::ConfirmGitRestore { .. }
+                    | Overlay::ConfirmGitHunkRestore { .. }
+                    | Overlay::ConfirmQuitTerminal
+            )
         ) {
             return match event.code {
                 KeyCode::Esc => Some(Command::Cancel),
                 KeyCode::Enter => Some(Command::PaletteAccept),
+                _ => None,
+            };
+        }
+        if matches!(state.overlay, Some(Overlay::LspHover)) {
+            return match event.code {
+                KeyCode::Enter => Some(Command::PaletteAccept),
+                KeyCode::Esc => Some(Command::Cancel),
+                _ => None,
+            };
+        }
+        if matches!(state.overlay, Some(Overlay::LspCompletion)) {
+            return match event.code {
+                KeyCode::Up => Some(Command::MoveUp { extend: false }),
+                KeyCode::Down => Some(Command::MoveDown { extend: false }),
+                KeyCode::Enter => Some(Command::PaletteAccept),
+                KeyCode::Esc => Some(Command::Cancel),
                 _ => None,
             };
         }
@@ -49,6 +72,12 @@ pub fn command_for_key(state: &AppState, event: KeyEvent) -> Option<Command> {
                 _ => None,
             };
         }
+        if matches!(state.overlay, Some(Overlay::GitCommitInput))
+            && event.code == KeyCode::Enter
+            && event.modifiers.contains(KeyModifiers::SHIFT)
+        {
+            return Some(Command::PaletteNewline);
+        }
         return match event.code {
             KeyCode::Esc => Some(Command::Cancel),
             KeyCode::Enter => Some(Command::PaletteAccept),
@@ -65,6 +94,68 @@ pub fn command_for_key(state: &AppState, event: KeyEvent) -> Option<Command> {
         return Some(Command::Invoke(id.to_owned()));
     }
     if state.focus == Focus::Sidebar {
+        if state.sidebar_view == crate::app::SidebarView::SourceControl {
+            return match event.code {
+                KeyCode::Up => Some(Command::SelectGit(state.git_selected.saturating_sub(1))),
+                KeyCode::Down => Some(Command::SelectGit(
+                    (state.git_selected + 1).min(state.git_entries().len().saturating_sub(1)),
+                )),
+                KeyCode::Enter => Some(Command::OpenGitDiff),
+                KeyCode::Char('r' | 'R') => Some(Command::Invoke("git.refresh".to_owned())),
+                KeyCode::Char('s' | 'S') => Some(Command::Invoke("git.stage".to_owned())),
+                KeyCode::Char('u' | 'U') => Some(Command::Invoke("git.unstage".to_owned())),
+                KeyCode::Char('d' | 'D') => Some(Command::Invoke("git.restore".to_owned())),
+                KeyCode::Char('c' | 'C') => Some(Command::Invoke("git.commit".to_owned())),
+                KeyCode::Char('b' | 'B') => Some(Command::Invoke("git.branch_switch".to_owned())),
+                KeyCode::Char('n' | 'N') => Some(Command::Invoke("git.branch_create".to_owned())),
+                KeyCode::Char('f' | 'F') => Some(Command::Invoke("git.fetch".to_owned())),
+                KeyCode::Char('p') => Some(Command::Invoke("git.pull".to_owned())),
+                KeyCode::Char('P') => Some(Command::Invoke("git.push".to_owned())),
+                KeyCode::Esc => Some(Command::Invoke("view.toggle_sidebar".to_owned())),
+                _ => None,
+            };
+        }
+        if state.sidebar_view == crate::app::SidebarView::Search {
+            return match event.code {
+                KeyCode::Up => Some(Command::WorkspaceSearchSelect(
+                    state.workspace_search_selected.saturating_sub(1),
+                )),
+                KeyCode::Down => Some(Command::WorkspaceSearchSelect(
+                    (state.workspace_search_selected + 1)
+                        .min(state.workspace_matches.len().saturating_sub(1)),
+                )),
+                KeyCode::Enter => Some(Command::WorkspaceSearchOpen),
+                KeyCode::Left | KeyCode::Right => state
+                    .workspace_matches
+                    .get(state.workspace_search_selected)
+                    .map(|matched| Command::WorkspaceSearchToggleFile(matched.path.clone())),
+                KeyCode::Backspace => Some(Command::WorkspaceSearchBackspace),
+                KeyCode::Char('c') if event.modifiers.contains(KeyModifiers::ALT) => {
+                    Some(Command::WorkspaceSearchToggleCase)
+                }
+                KeyCode::Char('w') if event.modifiers.contains(KeyModifiers::ALT) => {
+                    Some(Command::WorkspaceSearchToggleWord)
+                }
+                KeyCode::Char('r') if event.modifiers.contains(KeyModifiers::ALT) => {
+                    Some(Command::WorkspaceSearchToggleRegex)
+                }
+                KeyCode::Char('h') if event.modifiers.contains(KeyModifiers::ALT) => {
+                    Some(Command::WorkspaceSearchToggleHidden)
+                }
+                KeyCode::Char('b') if event.modifiers.contains(KeyModifiers::ALT) => {
+                    Some(Command::WorkspaceSearchToggleBinary)
+                }
+                KeyCode::Char(character)
+                    if !event
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    Some(Command::WorkspaceSearchInput(character))
+                }
+                KeyCode::Esc => Some(Command::Invoke("view.toggle_sidebar".to_owned())),
+                _ => None,
+            };
+        }
         return match event.code {
             KeyCode::Up => Some(Command::SelectTree(state.tree_selected.saturating_sub(1))),
             KeyCode::Down => Some(Command::SelectTree(
@@ -80,6 +171,64 @@ pub fn command_for_key(state: &AppState, event: KeyEvent) -> Option<Command> {
             KeyCode::F(2) => Some(Command::Invoke("file.rename".to_owned())),
             KeyCode::Delete => Some(Command::Invoke("file.delete".to_owned())),
             KeyCode::Esc => Some(Command::Invoke("view.toggle_sidebar".to_owned())),
+            _ => None,
+        };
+    }
+    if state.focus == Focus::BottomPanel {
+        if state.bottom_panel_view == BottomPanelView::Problems {
+            return match event.code {
+                KeyCode::Up => Some(Command::DiagnosticSelect(
+                    state.diagnostic_selected.saturating_sub(1),
+                )),
+                KeyCode::Down => Some(Command::DiagnosticSelect(
+                    (state.diagnostic_selected + 1)
+                        .min(state.visible_diagnostics().len().saturating_sub(1)),
+                )),
+                KeyCode::Enter => Some(Command::DiagnosticOpen),
+                KeyCode::Char('f' | 'F') => Some(Command::DiagnosticCycleFilter),
+                KeyCode::Esc => Some(Command::Invoke("view.toggle_bottom_panel".to_owned())),
+                _ => None,
+            };
+        }
+        if state.bottom_panel_view == BottomPanelView::Terminal {
+            if event.code == KeyCode::Char('c')
+                && event
+                    .modifiers
+                    .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+            {
+                return Some(Command::TerminalCopy);
+            }
+            if event.code == KeyCode::Char('v')
+                && event
+                    .modifiers
+                    .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+            {
+                return Some(Command::TerminalPaste(state.internal_clipboard.clone()));
+            }
+            if event.code == KeyCode::Char('`')
+                && event
+                    .modifiers
+                    .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+            {
+                return Some(Command::TerminalInput(vec![0]));
+            }
+            if event.code == KeyCode::PageUp && event.modifiers.contains(KeyModifiers::SHIFT) {
+                return Some(Command::TerminalScroll(-10));
+            }
+            if event.code == KeyCode::PageDown && event.modifiers.contains(KeyModifiers::SHIFT) {
+                return Some(Command::TerminalScroll(10));
+            }
+            let application_cursor = state.terminal.snapshot(0).application_cursor;
+            return crate::terminal::encode_key(event, application_cursor)
+                .map(Command::TerminalInput);
+        }
+        return match event.code {
+            KeyCode::Up | KeyCode::Char('k') => Some(Command::GitHunkPrevious),
+            KeyCode::Down | KeyCode::Char('j') => Some(Command::GitHunkNext),
+            KeyCode::Char('s' | 'S') | KeyCode::Enter => Some(Command::GitHunkStageToggle),
+            KeyCode::Char('d' | 'D') | KeyCode::Delete => Some(Command::GitHunkRestore),
+            KeyCode::Char('o' | 'O') => Some(Command::GitHunkOpenFile),
+            KeyCode::Esc => Some(Command::Invoke("view.toggle_bottom_panel".to_owned())),
             _ => None,
         };
     }
@@ -110,6 +259,50 @@ pub fn command_for_key(state: &AppState, event: KeyEvent) -> Option<Command> {
 }
 
 pub fn command_for_mouse(state: &AppState, regions: Regions, event: MouseEvent) -> Option<Command> {
+    if event.kind == MouseEventKind::Down(MouseButton::Left)
+        && contains(regions.bottom, (event.column, event.row))
+        && event.row == regions.bottom.y
+    {
+        let column = event.column.saturating_sub(regions.bottom.x);
+        let id = if column < 11 {
+            "diagnostics.open_problems"
+        } else if column < 18 {
+            "view.diff"
+        } else if column < 27 {
+            "view.output"
+        } else {
+            "view.terminal"
+        };
+        return Some(Command::Invoke(id.to_owned()));
+    }
+    if contains(regions.bottom, (event.column, event.row))
+        && state.bottom_panel_view == BottomPanelView::Terminal
+    {
+        return match event.kind {
+            MouseEventKind::ScrollUp => Some(Command::TerminalScroll(-3)),
+            MouseEventKind::ScrollDown => Some(Command::TerminalScroll(3)),
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
+                let row = usize::from(event.row.saturating_sub(regions.bottom.y + 1));
+                let column = usize::from(event.column.saturating_sub(regions.bottom.x));
+                Some(Command::TerminalSetSelection {
+                    row,
+                    column,
+                    extend: matches!(event.kind, MouseEventKind::Drag(MouseButton::Left)),
+                })
+            }
+            _ => None,
+        };
+    }
+    if event.kind == MouseEventKind::Down(MouseButton::Left)
+        && contains(regions.bottom, (event.column, event.row))
+        && state.bottom_panel_view == BottomPanelView::Problems
+    {
+        let row = usize::from(event.row.saturating_sub(regions.bottom.y + 1));
+        return match state.diagnostic_rows().get(row) {
+            Some(crate::app::DiagnosticRow::Item(index)) => Some(Command::DiagnosticSelect(*index)),
+            _ => None,
+        };
+    }
     let left_down = event.kind == MouseEventKind::Down(MouseButton::Left);
     let left_drag = event.kind == MouseEventKind::Drag(MouseButton::Left);
     if !left_down && !left_drag {
@@ -128,6 +321,31 @@ pub fn command_for_mouse(state: &AppState, regions: Regions, event: MouseEvent) 
     }
     if left_down && contains(regions.sidebar, point) {
         let index = usize::from(event.row.saturating_sub(regions.sidebar.y));
+        if state.sidebar_view == crate::app::SidebarView::SourceControl {
+            return state.git_index_at_row(index).map(Command::SelectGitAndOpen);
+        }
+        if state.sidebar_view == crate::app::SidebarView::Search {
+            if index == 1 {
+                let column = usize::from(event.column.saturating_sub(regions.sidebar.x));
+                return match column {
+                    0..=7 => Some(Command::WorkspaceSearchToggleCase),
+                    8..=15 => Some(Command::WorkspaceSearchToggleWord),
+                    16..=24 => Some(Command::WorkspaceSearchToggleRegex),
+                    25..=34 => Some(Command::WorkspaceSearchToggleHidden),
+                    _ => Some(Command::WorkspaceSearchToggleBinary),
+                };
+            }
+            let row = index.saturating_sub(3);
+            return match state.workspace_search_rows().get(row) {
+                Some(crate::app::WorkspaceSearchRow::File(path)) => {
+                    Some(Command::WorkspaceSearchToggleFile(path.clone()))
+                }
+                Some(crate::app::WorkspaceSearchRow::Match(index)) => {
+                    Some(Command::WorkspaceSearchSelectAndOpen(*index))
+                }
+                None => None,
+            };
+        }
         return state.tree.visible_entry(index).map(|entry| {
             if entry.kind == TreeEntryKind::Directory {
                 Command::ToggleTree(index)
@@ -153,6 +371,12 @@ pub fn command_for_mouse(state: &AppState, regions: Regions, event: MouseEvent) 
             start += width;
         }
     }
+    if left_down && contains(regions.bottom, point) {
+        let line = usize::from(event.row.saturating_sub(regions.bottom.y + 1));
+        return state
+            .git_hunk_at_diff_line(line)
+            .map(Command::SelectGitHunk);
+    }
     if contains(regions.editor, point) && event.row > regions.editor.y {
         let tab = state.active_tab()?;
         let line_index =
@@ -160,7 +384,7 @@ pub fn command_for_mouse(state: &AppState, regions: Regions, event: MouseEvent) 
         if line_index >= tab.buffer.text().len_lines() {
             return None;
         }
-        let gutter_width = tab.buffer.text().len_lines().to_string().len().max(2) + 1;
+        let gutter_width = tab.buffer.text().len_lines().to_string().len().max(2) + 3;
         let display_column =
             usize::from(event.column.saturating_sub(regions.editor.x)).saturating_sub(gutter_width);
         let line = tab.buffer.text().line(line_index).to_string();

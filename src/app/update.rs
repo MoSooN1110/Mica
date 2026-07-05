@@ -2,8 +2,8 @@ use std::{path::PathBuf, sync::atomic::Ordering};
 
 use crate::{
     app::{
-        AppEvent, AppState, BufferTab, Effect, FileOperationRequest, FileOperationResult, Focus,
-        Overlay, PathAction, SidebarView,
+        AppEvent, AppState, BottomPanelView, BufferTab, Effect, FileOperationRequest,
+        FileOperationResult, Focus, Overlay, PathAction, SaveAsInspection, SaveAsPlan, SidebarView,
     },
     buffer::{CharOffset, ExternalChangeOutcome, Selection},
     command::{self, Command},
@@ -70,7 +70,9 @@ impl AppState {
                     }
                     Err(error) => self.notification = Some(error),
                 }
-                self.active_syntax_effect().into_iter().collect()
+                let mut effects = self.active_syntax_effect().into_iter().collect::<Vec<_>>();
+                effects.extend(self.lsp_open_effect(&path));
+                effects
             }
             AppEvent::TreeLoaded(result) => {
                 match result {
@@ -121,8 +123,49 @@ impl AppState {
                         tab,
                         snapshot: next,
                     }]
+                } else if saved {
+                    let mut effects = vec![Effect::RefreshGit];
+                    if let Some(effect) = self.lsp_save_effect(&snapshot.path) {
+                        effects.push(effect);
+                    }
+                    effects
                 } else {
                     Vec::new()
+                }
+            }
+            AppEvent::SaveAsInspected(result) => match result {
+                Ok(SaveAsInspection::Ready(plan)) => self.start_save_as(plan),
+                Ok(SaveAsInspection::ConfirmOverwrite(plan)) => {
+                    self.overlay = Some(Overlay::ConfirmSaveAs { plan });
+                    self.focus = Focus::Overlay;
+                    Vec::new()
+                }
+                Err(error) => {
+                    self.notification = Some(error);
+                    Vec::new()
+                }
+            },
+            AppEvent::SaveAsCompleted { plan, result } => {
+                self.saving_tabs.remove(&plan.tab);
+                self.save_as_tabs.remove(&plan.tab);
+                match result {
+                    Ok(()) => {
+                        if let Some(tab) = self.tabs.get_mut(plan.tab) {
+                            tab.buffer.set_path(plan.snapshot.path.clone());
+                            tab.buffer.complete_save(&plan.snapshot);
+                        }
+                        self.notification =
+                            Some(format!("Saved as {}", plan.snapshot.path.display()));
+                        let mut effects = vec![Effect::ScanWorkspace, Effect::RefreshGit];
+                        if self.active_tab == Some(plan.tab) {
+                            effects.extend(self.active_syntax_effect());
+                        }
+                        effects
+                    }
+                    Err(error) => {
+                        self.notification = Some(error);
+                        Vec::new()
+                    }
                 }
             }
             AppEvent::WorkspaceChanged(_paths) => {
@@ -136,6 +179,7 @@ impl AppState {
                     .collect();
                 vec![
                     Effect::ScanWorkspace,
+                    Effect::RefreshGit,
                     Effect::RefreshOpenFiles {
                         files,
                         read_only: self.force_read_only,
@@ -211,7 +255,7 @@ impl AppState {
                 Vec::new()
             }
             AppEvent::FileOperationCompleted(result) => {
-                let mut effects = vec![Effect::ScanWorkspace];
+                let mut effects = vec![Effect::ScanWorkspace, Effect::RefreshGit];
                 match result {
                     Ok(FileOperationResult::Created { path, directory }) => {
                         self.notification = Some(format!("Created {}", path.display()));
@@ -350,6 +394,188 @@ impl AppState {
                 }
                 Vec::new()
             }
+            AppEvent::GitStatusLoaded(result) => {
+                self.git_loading = false;
+                match result {
+                    Ok(status) => {
+                        self.git_status = Some(status);
+                        self.git_error = None;
+                        self.git_selected = self
+                            .git_selected
+                            .min(self.git_entries().len().saturating_sub(1));
+                    }
+                    Err(error) => {
+                        self.git_status = None;
+                        self.git_error = Some(error);
+                    }
+                }
+                Vec::new()
+            }
+            AppEvent::GitDiffLoaded(result) => {
+                match result {
+                    Ok(diff) => {
+                        self.git_diff = Some(diff);
+                        self.git_hunk_selected = 0;
+                        self.bottom_panel_visible = true;
+                        self.bottom_panel_view = BottomPanelView::Diff;
+                        self.focus = Focus::BottomPanel;
+                    }
+                    Err(error) => {
+                        self.append_output("git", &error);
+                        self.notification = Some(error);
+                    }
+                }
+                Vec::new()
+            }
+            AppEvent::GitOperationCompleted {
+                result,
+                workspace_changed,
+            } => {
+                let succeeded = result.is_ok();
+                match result {
+                    Ok(message) => self.notification = Some(message),
+                    Err(error) => {
+                        self.append_output("git", &error);
+                        self.notification = Some(error);
+                    }
+                }
+                if succeeded {
+                    self.git_diff = None;
+                }
+                self.git_loading = true;
+                let mut effects = vec![Effect::RefreshGit];
+                if workspace_changed {
+                    let files = self
+                        .tabs
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, tab)| {
+                            tab.buffer.path().map(|path| (index, path.to_path_buf()))
+                        })
+                        .collect();
+                    effects.push(Effect::ScanWorkspace);
+                    effects.push(Effect::RefreshOpenFiles {
+                        files,
+                        read_only: self.force_read_only,
+                    });
+                }
+                effects
+            }
+            AppEvent::GitBranchesLoaded(result) => {
+                match result {
+                    Ok(branches) => {
+                        self.git_branches = branches;
+                        self.git_branch_selected = self
+                            .git_branch_selected
+                            .min(self.git_branches.len().saturating_sub(1));
+                    }
+                    Err(error) => {
+                        self.append_output("git", &error);
+                        self.notification = Some(error);
+                    }
+                }
+                Vec::new()
+            }
+            AppEvent::WorkspaceSearchBatch {
+                generation,
+                matches,
+                done,
+                error,
+            } => {
+                if generation != self.workspace_search_generation {
+                    return Vec::new();
+                }
+                self.workspace_matches.extend(matches);
+                self.workspace_matches.sort_by(|left, right| {
+                    left.path
+                        .cmp(&right.path)
+                        .then(left.line.cmp(&right.line))
+                        .then(left.column.cmp(&right.column))
+                });
+                self.workspace_search_running = !done;
+                if let Some(error) = error {
+                    self.append_output("search", &error);
+                    self.notification = Some(error);
+                }
+                self.workspace_search_selected = self
+                    .workspace_search_selected
+                    .min(self.workspace_matches.len().saturating_sub(1));
+                Vec::new()
+            }
+            AppEvent::TerminalStarted { generation, result } => {
+                if generation != self.terminal_generation {
+                    return Vec::new();
+                }
+                match result {
+                    Ok(()) => {
+                        self.terminal_started = true;
+                        self.terminal_running = true;
+                        self.terminal_exit = None;
+                        self.notification = Some("Terminal started".to_owned());
+                    }
+                    Err(error) => {
+                        self.terminal_started = false;
+                        self.terminal_running = false;
+                        self.notification = Some(error);
+                    }
+                }
+                Vec::new()
+            }
+            AppEvent::TerminalOutput { generation, bytes } => {
+                if generation != self.terminal_generation {
+                    return Vec::new();
+                }
+                self.terminal.feed(&bytes);
+                Vec::new()
+            }
+            AppEvent::TerminalExited {
+                generation,
+                code,
+                success,
+            } => {
+                if generation != self.terminal_generation {
+                    return Vec::new();
+                }
+                self.terminal_running = false;
+                self.terminal_exit = Some((code, success));
+                self.notification = Some(format!("Terminal exited with code {code}"));
+                Vec::new()
+            }
+            AppEvent::TerminalError { generation, error } => {
+                if generation != self.terminal_generation {
+                    return Vec::new();
+                }
+                self.append_output("terminal", &error);
+                self.notification = Some(format!("Terminal: {error}"));
+                Vec::new()
+            }
+            AppEvent::DiagnosticsReplaced {
+                source,
+                generation,
+                diagnostics,
+            } => {
+                self.diagnostics
+                    .replace_source(source, generation, diagnostics);
+                self.diagnostic_selected = self
+                    .diagnostic_selected
+                    .min(self.visible_diagnostics().len().saturating_sub(1));
+                Vec::new()
+            }
+            AppEvent::DiagnosticsFailed {
+                source,
+                generation,
+                error,
+            } => {
+                self.diagnostics.clear_source(source, generation);
+                self.append_output("diagnostics", &error);
+                self.notification = Some(error);
+                Vec::new()
+            }
+            AppEvent::OutputMessage { source, message } => {
+                self.append_output(&source, message);
+                Vec::new()
+            }
+            AppEvent::LspClient { language, event } => self.handle_lsp_event(language, event),
         }
     }
 
@@ -361,7 +587,7 @@ impl AppState {
             Command::Invoke(id) => self.invoke(&id),
             Command::InsertText(text) => {
                 self.edit(|tab| tab.buffer.insert(&text));
-                self.active_syntax_effect().into_iter().collect()
+                self.active_post_edit_effects()
             }
             Command::InsertNewline => {
                 self.edit(|tab| {
@@ -372,11 +598,11 @@ impl AppState {
                     };
                     tab.buffer.insert(newline)
                 });
-                self.active_syntax_effect().into_iter().collect()
+                self.active_post_edit_effects()
             }
             Command::DeleteBackward => {
                 self.edit(|tab| tab.buffer.delete_backward());
-                self.active_syntax_effect().into_iter().collect()
+                self.active_post_edit_effects()
             }
             Command::MoveLeft { extend } => {
                 self.move_horizontal(false, extend);
@@ -409,6 +635,263 @@ impl AppState {
                 self.tree_selected = index.min(self.tree.visible_len().saturating_sub(1));
                 Vec::new()
             }
+            Command::SelectGit(index) => {
+                self.git_selected = index.min(self.git_entries().len().saturating_sub(1));
+                Vec::new()
+            }
+            Command::SelectGitAndOpen(index) => {
+                self.git_selected = index.min(self.git_entries().len().saturating_sub(1));
+                let Some((path, target)) = self.git_entries().get(self.git_selected).cloned()
+                else {
+                    return Vec::new();
+                };
+                vec![Effect::LoadGitDiff { path, target }]
+            }
+            Command::OpenGitDiff => {
+                let Some((path, target)) = self.git_entries().get(self.git_selected).cloned()
+                else {
+                    return Vec::new();
+                };
+                vec![Effect::LoadGitDiff { path, target }]
+            }
+            Command::SelectGitHunk(index) => {
+                let count = self.git_diff.as_ref().map_or(0, |diff| diff.hunks.len());
+                self.git_hunk_selected = index.min(count.saturating_sub(1));
+                self.focus = Focus::BottomPanel;
+                Vec::new()
+            }
+            Command::GitHunkPrevious => {
+                self.git_hunk_selected = self.git_hunk_selected.saturating_sub(1);
+                Vec::new()
+            }
+            Command::GitHunkNext => {
+                let count = self.git_diff.as_ref().map_or(0, |diff| diff.hunks.len());
+                self.git_hunk_selected = (self.git_hunk_selected + 1).min(count.saturating_sub(1));
+                Vec::new()
+            }
+            Command::GitHunkStageToggle => {
+                let Some(diff) = &self.git_diff else {
+                    return Vec::new();
+                };
+                let Some(hunk) = diff.hunks.get(self.git_hunk_selected) else {
+                    return Vec::new();
+                };
+                let operation = match diff.target {
+                    crate::git::DiffTarget::WorkingTree => {
+                        crate::app::GitOperation::StageHunk(hunk.patch.clone())
+                    }
+                    crate::git::DiffTarget::Staged => {
+                        crate::app::GitOperation::UnstageHunk(hunk.patch.clone())
+                    }
+                };
+                vec![Effect::GitOperation(operation)]
+            }
+            Command::GitHunkRestore => {
+                let Some(diff) = &self.git_diff else {
+                    return Vec::new();
+                };
+                if diff.target != crate::git::DiffTarget::WorkingTree {
+                    self.notification = Some("Only working-tree hunks can be restored".to_owned());
+                    return Vec::new();
+                }
+                let Some(hunk) = diff.hunks.get(self.git_hunk_selected) else {
+                    return Vec::new();
+                };
+                self.overlay = Some(Overlay::ConfirmGitHunkRestore {
+                    patch: hunk.patch.clone(),
+                });
+                self.focus = Focus::Overlay;
+                Vec::new()
+            }
+            Command::GitHunkOpenFile => {
+                let Some(diff) = &self.git_diff else {
+                    return Vec::new();
+                };
+                let Some(hunk) = diff.hunks.get(self.git_hunk_selected) else {
+                    return Vec::new();
+                };
+                let path = self.workspace.as_path().join(&diff.path);
+                self.focus = Focus::Editor;
+                vec![Effect::OpenFile {
+                    path,
+                    read_only: self.force_read_only,
+                    line: Some(hunk.new_start.max(1)),
+                    column: Some(1),
+                }]
+            }
+            Command::WorkspaceSearchInput(character) => {
+                self.workspace_search.query.push(character);
+                self.start_workspace_search().into_iter().collect()
+            }
+            Command::WorkspaceSearchBackspace => {
+                self.workspace_search.query.pop();
+                self.start_workspace_search().into_iter().collect()
+            }
+            Command::WorkspaceSearchSelect(index) => {
+                self.workspace_search_selected =
+                    index.min(self.workspace_matches.len().saturating_sub(1));
+                Vec::new()
+            }
+            Command::WorkspaceSearchSelectAndOpen(index) => {
+                self.workspace_search_selected =
+                    index.min(self.workspace_matches.len().saturating_sub(1));
+                let Some(matched) = self
+                    .workspace_matches
+                    .get(self.workspace_search_selected)
+                    .cloned()
+                else {
+                    return Vec::new();
+                };
+                self.focus = Focus::Editor;
+                vec![Effect::OpenFile {
+                    path: self.workspace.as_path().join(matched.path),
+                    read_only: self.force_read_only,
+                    line: Some(matched.line),
+                    column: Some(matched.column),
+                }]
+            }
+            Command::WorkspaceSearchOpen => {
+                let Some(matched) = self
+                    .workspace_matches
+                    .get(self.workspace_search_selected)
+                    .cloned()
+                else {
+                    return Vec::new();
+                };
+                self.focus = Focus::Editor;
+                vec![Effect::OpenFile {
+                    path: self.workspace.as_path().join(matched.path),
+                    read_only: self.force_read_only,
+                    line: Some(matched.line),
+                    column: Some(matched.column),
+                }]
+            }
+            Command::WorkspaceSearchToggleCase => {
+                self.workspace_search.case_sensitive = !self.workspace_search.case_sensitive;
+                self.start_workspace_search().into_iter().collect()
+            }
+            Command::WorkspaceSearchToggleWord => {
+                self.workspace_search.whole_word = !self.workspace_search.whole_word;
+                self.start_workspace_search().into_iter().collect()
+            }
+            Command::WorkspaceSearchToggleRegex => {
+                self.workspace_search.regex = !self.workspace_search.regex;
+                self.start_workspace_search().into_iter().collect()
+            }
+            Command::WorkspaceSearchToggleHidden => {
+                self.workspace_search.show_hidden = !self.workspace_search.show_hidden;
+                self.start_workspace_search().into_iter().collect()
+            }
+            Command::WorkspaceSearchToggleBinary => {
+                self.workspace_search.include_binary = !self.workspace_search.include_binary;
+                self.start_workspace_search().into_iter().collect()
+            }
+            Command::WorkspaceSearchToggleFile(path) => {
+                if !self.workspace_search_collapsed.remove(&path) {
+                    self.workspace_search_collapsed.insert(path);
+                }
+                Vec::new()
+            }
+            Command::TerminalInput(bytes) => {
+                if self.terminal_running {
+                    self.terminal_scroll_offset = 0;
+                    self.terminal_selection = None;
+                    vec![Effect::TerminalInput(bytes)]
+                } else {
+                    Vec::new()
+                }
+            }
+            Command::TerminalPaste(text) => {
+                if !self.terminal_running {
+                    return Vec::new();
+                }
+                let bracketed = self.terminal.snapshot(0).bracketed_paste;
+                vec![Effect::TerminalInput(crate::terminal::encode_paste(
+                    &text, bracketed,
+                ))]
+            }
+            Command::TerminalScroll(delta) => {
+                let maximum = self.terminal.scrollback_len();
+                self.terminal_scroll_offset = if delta < 0 {
+                    self.terminal_scroll_offset
+                        .saturating_add(delta.unsigned_abs() as usize)
+                        .min(maximum)
+                } else {
+                    self.terminal_scroll_offset.saturating_sub(delta as usize)
+                };
+                Vec::new()
+            }
+            Command::FocusTerminal => {
+                if self.bottom_panel_view == BottomPanelView::Terminal {
+                    self.focus = Focus::BottomPanel;
+                }
+                Vec::new()
+            }
+            Command::TerminalSetSelection {
+                row,
+                column,
+                extend,
+            } => {
+                self.focus = Focus::BottomPanel;
+                let point = (row, column);
+                self.terminal_selection = Some(if extend {
+                    self.terminal_selection
+                        .map_or((point, point), |(anchor, _)| (anchor, point))
+                } else {
+                    (point, point)
+                });
+                Vec::new()
+            }
+            Command::TerminalCopy => {
+                let Some((start, end)) = self.terminal_selection else {
+                    self.notification = Some("Select terminal text to copy".to_owned());
+                    return Vec::new();
+                };
+                let text = self
+                    .terminal
+                    .selected_text(self.terminal_scroll_offset, start, end);
+                if text.is_empty() {
+                    self.notification = Some("Terminal selection is empty".to_owned());
+                    Vec::new()
+                } else {
+                    self.internal_clipboard = text.clone();
+                    self.notification = Some("Copied terminal selection".to_owned());
+                    vec![Effect::CopyToClipboard(text)]
+                }
+            }
+            Command::DiagnosticSelect(index) => {
+                self.diagnostic_selected =
+                    index.min(self.visible_diagnostics().len().saturating_sub(1));
+                Vec::new()
+            }
+            Command::DiagnosticOpen => {
+                let Some(diagnostic) = self
+                    .visible_diagnostics()
+                    .get(self.diagnostic_selected)
+                    .cloned()
+                    .cloned()
+                else {
+                    return Vec::new();
+                };
+                self.focus = Focus::Editor;
+                vec![Effect::OpenFile {
+                    path: diagnostic.file,
+                    read_only: self.force_read_only,
+                    line: Some(diagnostic.range.start.line + 1),
+                    column: Some(diagnostic.range.start.column + 1),
+                }]
+            }
+            Command::DiagnosticCycleFilter => {
+                self.diagnostic_filter = match self.diagnostic_filter {
+                    None => Some(crate::diagnostics::DiagnosticSeverity::Error),
+                    Some(crate::diagnostics::DiagnosticSeverity::Error) => {
+                        Some(crate::diagnostics::DiagnosticSeverity::Warning)
+                    }
+                    _ => None,
+                };
+                self.diagnostic_selected = 0;
+                Vec::new()
+            }
             Command::SelectTab(index) => {
                 if index < self.tabs.len() {
                     self.active_tab = Some(index);
@@ -416,10 +899,7 @@ impl AppState {
                 }
                 self.active_syntax_effect().into_iter().collect()
             }
-            Command::CloseTab(index) => {
-                self.request_close_tab(index);
-                Vec::new()
-            }
+            Command::CloseTab(index) => self.request_close_tab(index),
             Command::SetCursor {
                 char_offset,
                 extend,
@@ -445,10 +925,17 @@ impl AppState {
             Command::Cancel => Vec::new(),
             Command::Resize(width, height) => {
                 self.terminal_size = (width, height);
-                Vec::new()
+                if self.terminal_started {
+                    let (rows, cols) = self.terminal_panel_size();
+                    self.terminal.resize(usize::from(rows), usize::from(cols));
+                    vec![Effect::ResizeTerminal { rows, cols }]
+                } else {
+                    Vec::new()
+                }
             }
             Command::PaletteInput(_)
             | Command::PaletteBackspace
+            | Command::PaletteNewline
             | Command::PaletteAccept
             | Command::SearchNext
             | Command::SearchPrevious
@@ -481,6 +968,9 @@ impl AppState {
             }
             Command::PaletteInput(character) => {
                 self.palette_query.push(character);
+                if matches!(self.overlay, Some(Overlay::GitBranchPicker)) {
+                    self.git_branch_selected = 0;
+                }
                 if matches!(self.overlay, Some(Overlay::FilePicker)) {
                     return vec![self.start_file_search()];
                 }
@@ -490,12 +980,18 @@ impl AppState {
             }
             Command::PaletteBackspace => {
                 self.palette_query.pop();
+                if matches!(self.overlay, Some(Overlay::GitBranchPicker)) {
+                    self.git_branch_selected = 0;
+                }
                 if matches!(self.overlay, Some(Overlay::FilePicker)) {
                     return vec![self.start_file_search()];
                 }
                 if let Some(Overlay::BufferSearch { tab }) = self.overlay.as_ref() {
                     return self.start_buffer_search(*tab).into_iter().collect();
                 }
+            }
+            Command::PaletteNewline if matches!(self.overlay, Some(Overlay::GitCommitInput)) => {
+                self.palette_query.push('\n');
             }
             Command::SearchNext => {
                 if let Some(Overlay::BufferSearch { tab }) = self.overlay.as_ref() {
@@ -511,10 +1007,24 @@ impl AppState {
                 self.file_picker_selected = self.file_picker_selected.saturating_sub(1);
                 return self.selected_preview_effect().into_iter().collect();
             }
+            Command::MoveUp { .. } if matches!(self.overlay, Some(Overlay::GitBranchPicker)) => {
+                self.git_branch_selected = self.git_branch_selected.saturating_sub(1);
+            }
+            Command::MoveUp { .. } if matches!(self.overlay, Some(Overlay::LspCompletion)) => {
+                self.lsp_completion_selected = self.lsp_completion_selected.saturating_sub(1);
+            }
             Command::MoveDown { .. } if matches!(self.overlay, Some(Overlay::FilePicker)) => {
                 self.file_picker_selected =
                     (self.file_picker_selected + 1).min(self.file_matches.len().saturating_sub(1));
                 return self.selected_preview_effect().into_iter().collect();
+            }
+            Command::MoveDown { .. } if matches!(self.overlay, Some(Overlay::GitBranchPicker)) => {
+                self.git_branch_selected = (self.git_branch_selected + 1)
+                    .min(self.visible_git_branches().len().saturating_sub(1));
+            }
+            Command::MoveDown { .. } if matches!(self.overlay, Some(Overlay::LspCompletion)) => {
+                self.lsp_completion_selected = (self.lsp_completion_selected + 1)
+                    .min(self.lsp_completions.len().saturating_sub(1));
             }
             Command::PaletteAccept => {
                 let overlay = self.overlay.take();
@@ -562,6 +1072,22 @@ impl AppState {
                             return Vec::new();
                         }
                         self.focus = Focus::Editor;
+                        if let PathAction::SaveAs { tab } = &action {
+                            let Some(tab_state) = self.tabs.get(*tab) else {
+                                return Vec::new();
+                            };
+                            return match tab_state.buffer.prepare_save() {
+                                Ok(snapshot) => vec![Effect::InspectSaveAs {
+                                    tab: *tab,
+                                    destination: path,
+                                    snapshot,
+                                }],
+                                Err(error) => {
+                                    self.notification = Some(error.to_string());
+                                    Vec::new()
+                                }
+                            };
+                        }
                         let request = match action {
                             PathAction::CreateFile => FileOperationRequest::CreateFile(path),
                             PathAction::CreateDirectory => {
@@ -571,6 +1097,7 @@ impl AppState {
                                 source,
                                 destination: path,
                             },
+                            PathAction::SaveAs { .. } => return Vec::new(),
                         };
                         return vec![Effect::FileOperation(request)];
                     }
@@ -582,10 +1109,93 @@ impl AppState {
                     Some(Overlay::ConfirmClose { tab }) => {
                         self.palette_query.clear();
                         self.focus = Focus::Editor;
-                        self.close_tab(tab);
+                        return self.close_tab(tab).into_iter().collect();
+                    }
+                    Some(Overlay::ConfirmSaveAs { plan }) => {
+                        self.palette_query.clear();
+                        return self.start_save_as(plan);
                     }
                     Some(Overlay::RecoveryPrompt) => {
                         self.overlay = Some(Overlay::RecoveryPrompt);
+                    }
+                    Some(Overlay::GitCommitInput) => {
+                        let message = std::mem::take(&mut self.palette_query);
+                        self.focus = Focus::Editor;
+                        if message.trim().is_empty() {
+                            self.notification = Some("Commit message cannot be empty".to_owned());
+                            return Vec::new();
+                        }
+                        return vec![Effect::GitOperation(crate::app::GitOperation::Commit(
+                            message,
+                        ))];
+                    }
+                    Some(Overlay::ConfirmGitRestore { path }) => {
+                        self.focus = Focus::Editor;
+                        return vec![Effect::GitOperation(crate::app::GitOperation::Restore(
+                            path,
+                        ))];
+                    }
+                    Some(Overlay::ConfirmGitHunkRestore { patch }) => {
+                        self.focus = Focus::Editor;
+                        return vec![Effect::GitOperation(crate::app::GitOperation::RestoreHunk(
+                            patch,
+                        ))];
+                    }
+                    Some(Overlay::GitBranchPicker) => {
+                        let branch = self
+                            .visible_git_branches()
+                            .get(self.git_branch_selected)
+                            .map(|branch| branch.name.clone());
+                        self.palette_query.clear();
+                        self.focus = Focus::Editor;
+                        if let Some(branch) = branch {
+                            return vec![Effect::GitOperation(
+                                crate::app::GitOperation::SwitchBranch(branch),
+                            )];
+                        }
+                    }
+                    Some(Overlay::GitBranchCreate) => {
+                        let branch = std::mem::take(&mut self.palette_query);
+                        self.focus = Focus::Editor;
+                        if branch.trim().is_empty() {
+                            self.notification = Some("Branch name cannot be empty".to_owned());
+                            return Vec::new();
+                        }
+                        return vec![Effect::GitOperation(
+                            crate::app::GitOperation::CreateBranch(branch),
+                        )];
+                    }
+                    Some(Overlay::SearchIncludeGlobs) => {
+                        self.workspace_search.include_globs = split_globs(&self.palette_query);
+                        self.palette_query.clear();
+                        self.focus = Focus::Sidebar;
+                        return self.start_workspace_search().into_iter().collect();
+                    }
+                    Some(Overlay::SearchExcludeGlobs) => {
+                        self.workspace_search.exclude_globs = split_globs(&self.palette_query);
+                        self.palette_query.clear();
+                        self.focus = Focus::Sidebar;
+                        return self.start_workspace_search().into_iter().collect();
+                    }
+                    Some(Overlay::ConfirmQuitTerminal) => {
+                        self.should_quit = true;
+                        self.focus = Focus::Editor;
+                        return vec![Effect::StopTerminal];
+                    }
+                    Some(Overlay::LspHover) => {
+                        self.focus = Focus::Editor;
+                    }
+                    Some(Overlay::LspCompletion) => {
+                        self.focus = Focus::Editor;
+                        let Some(completion) = self
+                            .lsp_completions
+                            .get(self.lsp_completion_selected)
+                            .cloned()
+                        else {
+                            return Vec::new();
+                        };
+                        self.edit(|tab| tab.buffer.insert(&completion.insert_text));
+                        return self.active_post_edit_effects();
                     }
                     None => {}
                 }
@@ -619,6 +1229,9 @@ impl AppState {
                 if self.tabs.iter().any(|tab| tab.buffer.is_dirty()) {
                     self.notification =
                         Some("Unsaved changes: save or close them before quitting".to_owned());
+                } else if self.terminal_running {
+                    self.overlay = Some(Overlay::ConfirmQuitTerminal);
+                    self.focus = Focus::Overlay;
                 } else {
                     self.should_quit = true;
                 }
@@ -628,6 +1241,10 @@ impl AppState {
                 let Some(index) = self.active_tab else {
                     return Vec::new();
                 };
+                if self.save_as_tabs.contains(&index) {
+                    self.notification = Some("Save As is already in progress".to_owned());
+                    return Vec::new();
+                }
                 match self.tabs[index].buffer.prepare_save() {
                     Ok(snapshot) => {
                         if self.saving_tabs.contains(&index) {
@@ -648,9 +1265,25 @@ impl AppState {
                     }
                 }
             }
+            command::EDITOR_SAVE_AS => {
+                let Some(tab) = self.active_tab else {
+                    return Vec::new();
+                };
+                if self.saving_tabs.contains(&tab) {
+                    self.notification = Some("Wait for the current save to finish".to_owned());
+                    return Vec::new();
+                }
+                let initial = self.tabs[tab]
+                    .buffer
+                    .path()
+                    .and_then(|path| path.strip_prefix(self.workspace.as_path()).ok())
+                    .map_or_else(String::new, |path| path.to_string_lossy().into_owned());
+                self.open_path_input(PathAction::SaveAs { tab }, initial);
+                Vec::new()
+            }
             command::EDITOR_CLOSE => {
                 if let Some(index) = self.active_tab {
-                    self.request_close_tab(index);
+                    return self.request_close_tab(index);
                 }
                 Vec::new()
             }
@@ -677,7 +1310,7 @@ impl AppState {
                         self.internal_clipboard = text.clone();
                         self.notification = Some("Cut selection".to_owned());
                         let mut effects = vec![Effect::CopyToClipboard(text)];
-                        effects.extend(self.active_syntax_effect());
+                        effects.extend(self.active_post_edit_effects());
                         effects
                     }
                     Ok(false) => Vec::new(),
@@ -694,7 +1327,7 @@ impl AppState {
                     let text = self.internal_clipboard.clone();
                     self.edit(|tab| tab.buffer.insert(&text));
                 }
-                self.active_syntax_effect().into_iter().collect()
+                self.active_post_edit_effects()
             }
             command::EDITOR_FIND => {
                 let Some(tab) = self.active_tab else {
@@ -708,11 +1341,11 @@ impl AppState {
             }
             command::EDITOR_UNDO => {
                 self.edit(|tab| tab.buffer.undo().map(|_| ()));
-                self.active_syntax_effect().into_iter().collect()
+                self.active_post_edit_effects()
             }
             command::EDITOR_REDO => {
                 self.edit(|tab| tab.buffer.redo().map(|_| ()));
-                self.active_syntax_effect().into_iter().collect()
+                self.active_post_edit_effects()
             }
             command::COMMAND_PALETTE_OPEN => {
                 self.overlay = Some(Overlay::CommandPalette);
@@ -752,6 +1385,82 @@ impl AppState {
                 self.bottom_panel_visible = !self.bottom_panel_visible;
                 Vec::new()
             }
+            command::TERMINAL_TOGGLE => {
+                if self.bottom_panel_visible && self.bottom_panel_view == BottomPanelView::Terminal
+                {
+                    self.bottom_panel_visible = false;
+                    self.focus = Focus::Editor;
+                    return Vec::new();
+                }
+                self.bottom_panel_visible = true;
+                self.bottom_panel_view = BottomPanelView::Terminal;
+                self.focus = Focus::BottomPanel;
+                if self.terminal_started {
+                    Vec::new()
+                } else {
+                    vec![self.start_terminal_effect()]
+                }
+            }
+            command::TERMINAL_NEW_SESSION => {
+                self.bottom_panel_visible = true;
+                self.bottom_panel_view = BottomPanelView::Terminal;
+                self.focus = Focus::BottomPanel;
+                self.terminal_started = false;
+                self.terminal_running = false;
+                vec![Effect::StopTerminal, self.start_terminal_effect()]
+            }
+            command::VIEW_OUTPUT => {
+                self.bottom_panel_visible = true;
+                self.bottom_panel_view = BottomPanelView::Output;
+                self.focus = Focus::BottomPanel;
+                Vec::new()
+            }
+            command::VIEW_DIFF => {
+                self.bottom_panel_visible = true;
+                self.bottom_panel_view = BottomPanelView::Diff;
+                self.focus = Focus::BottomPanel;
+                Vec::new()
+            }
+            command::VIEW_TERMINAL => {
+                self.bottom_panel_visible = true;
+                self.bottom_panel_view = BottomPanelView::Terminal;
+                self.focus = Focus::BottomPanel;
+                if self.terminal_started {
+                    Vec::new()
+                } else {
+                    vec![self.start_terminal_effect()]
+                }
+            }
+            command::DIAGNOSTICS_OPEN_PROBLEMS => {
+                self.bottom_panel_visible = true;
+                self.bottom_panel_view = BottomPanelView::Problems;
+                self.focus = Focus::BottomPanel;
+                Vec::new()
+            }
+            command::DIAGNOSTICS_REFRESH => {
+                if !self.workspace.as_path().join("Cargo.toml").is_file() {
+                    self.notification =
+                        Some("Cargo diagnostics require Cargo.toml in the workspace".to_owned());
+                    return Vec::new();
+                }
+                self.compiler_diagnostic_generation =
+                    self.compiler_diagnostic_generation.saturating_add(1);
+                self.notification = Some("Running cargo check…".to_owned());
+                vec![Effect::RunCargoCheck {
+                    generation: self.compiler_diagnostic_generation,
+                }]
+            }
+            command::LSP_HOVER => {
+                self.lsp_request_effect("textDocument/hover", crate::app::PendingLspRequest::Hover)
+            }
+            command::LSP_DEFINITION => self.lsp_request_effect(
+                "textDocument/definition",
+                crate::app::PendingLspRequest::Definition,
+            ),
+            command::LSP_COMPLETION => self.lsp_request_effect(
+                "textDocument/completion",
+                crate::app::PendingLspRequest::Completion,
+            ),
             command::VIEW_EXPLORER => {
                 self.sidebar_visible = true;
                 self.sidebar_view = SidebarView::Explorer;
@@ -762,15 +1471,98 @@ impl AppState {
                 self.sidebar_visible = true;
                 self.sidebar_view = SidebarView::SourceControl;
                 self.focus = Focus::Sidebar;
-                Vec::new()
+                self.git_loading = true;
+                vec![Effect::RefreshGit]
             }
             command::VIEW_SEARCH => {
                 self.sidebar_visible = true;
                 self.sidebar_view = SidebarView::Search;
                 self.focus = Focus::Sidebar;
+                self.start_workspace_search().into_iter().collect()
+            }
+            command::GIT_REFRESH => {
+                self.git_loading = true;
+                vec![Effect::RefreshGit]
+            }
+            command::GIT_STAGE => self.selected_git_operation(true),
+            command::GIT_UNSTAGE => self.selected_git_operation(false),
+            command::GIT_RESTORE => {
+                let Some((path, target)) = self.git_entries().get(self.git_selected).cloned()
+                else {
+                    return Vec::new();
+                };
+                if target != crate::git::DiffTarget::WorkingTree {
+                    self.notification = Some("Select an unstaged change to restore".to_owned());
+                    return Vec::new();
+                }
+                self.overlay = Some(Overlay::ConfirmGitRestore { path });
+                self.focus = Focus::Overlay;
                 Vec::new()
             }
-            command::WORKSPACE_REFRESH => vec![Effect::ScanWorkspace],
+            command::GIT_COMMIT => {
+                let staged = self
+                    .git_status
+                    .as_ref()
+                    .is_some_and(|status| status.files.iter().any(|file| file.staged));
+                if !staged {
+                    self.notification = Some("No staged changes to commit".to_owned());
+                    return Vec::new();
+                }
+                self.overlay = Some(Overlay::GitCommitInput);
+                self.palette_query.clear();
+                self.focus = Focus::Overlay;
+                Vec::new()
+            }
+            command::GIT_BRANCH_SWITCH => {
+                self.overlay = Some(Overlay::GitBranchPicker);
+                self.palette_query.clear();
+                self.git_branch_selected = 0;
+                self.focus = Focus::Overlay;
+                vec![Effect::LoadGitBranches]
+            }
+            command::GIT_BRANCH_CREATE => {
+                self.overlay = Some(Overlay::GitBranchCreate);
+                self.palette_query.clear();
+                self.focus = Focus::Overlay;
+                Vec::new()
+            }
+            command::GIT_FETCH => vec![Effect::GitOperation(crate::app::GitOperation::Fetch)],
+            command::GIT_PULL => vec![Effect::GitOperation(crate::app::GitOperation::Pull)],
+            command::GIT_PUSH => {
+                if self
+                    .git_status
+                    .as_ref()
+                    .is_some_and(|status| status.upstream.is_none())
+                {
+                    let branch = self
+                        .git_status
+                        .as_ref()
+                        .and_then(|status| status.branch.as_deref())
+                        .unwrap_or("<branch>");
+                    self.notification = Some(format!(
+                        "No upstream; run `git push --set-upstream origin {branch}` in Terminal"
+                    ));
+                    Vec::new()
+                } else {
+                    vec![Effect::GitOperation(crate::app::GitOperation::Push)]
+                }
+            }
+            command::SEARCH_INCLUDE_GLOBS => {
+                self.palette_query = self.workspace_search.include_globs.join(", ");
+                self.overlay = Some(Overlay::SearchIncludeGlobs);
+                self.focus = Focus::Overlay;
+                Vec::new()
+            }
+            command::SEARCH_EXCLUDE_GLOBS => {
+                self.palette_query = self.workspace_search.exclude_globs.join(", ");
+                self.overlay = Some(Overlay::SearchExcludeGlobs);
+                self.focus = Focus::Overlay;
+                Vec::new()
+            }
+            command::WORKSPACE_REFRESH => {
+                self.git_loading = true;
+                vec![Effect::ScanWorkspace, Effect::RefreshGit]
+            }
             command::WORKSPACE_OPEN_FILE => {
                 self.overlay = Some(Overlay::FilePicker);
                 self.palette_query.clear();
@@ -799,8 +1591,422 @@ impl AppState {
             self.notification = Some(error.to_string());
             false
         } else {
+            if let Some(path) = tab.buffer.path().map(ToOwned::to_owned) {
+                self.diagnostics.mark_file_stale(&path);
+            }
             self.reveal_cursor(self.active_tab.unwrap_or(0));
             true
+        }
+    }
+
+    fn selected_git_operation(&mut self, stage: bool) -> Vec<Effect> {
+        let Some((path, target)) = self.git_entries().get(self.git_selected).cloned() else {
+            return Vec::new();
+        };
+        let valid = if stage {
+            target == crate::git::DiffTarget::WorkingTree
+        } else {
+            target == crate::git::DiffTarget::Staged
+        };
+        if !valid {
+            self.notification = Some(if stage {
+                "Select an unstaged change".to_owned()
+            } else {
+                "Select a staged change".to_owned()
+            });
+            return Vec::new();
+        }
+        let operation = if stage {
+            crate::app::GitOperation::Stage(path)
+        } else {
+            crate::app::GitOperation::Unstage(path)
+        };
+        vec![Effect::GitOperation(operation)]
+    }
+
+    fn start_workspace_search(&mut self) -> Option<Effect> {
+        let generation = self
+            .workspace_search_cancellation
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        self.workspace_search_cancellation
+            .store(generation, Ordering::Relaxed);
+        self.workspace_search_generation = generation;
+        self.workspace_matches.clear();
+        self.workspace_search_selected = 0;
+        self.workspace_search_running = !self.workspace_search.query.is_empty();
+        if self.workspace_search.query.is_empty() {
+            return None;
+        }
+        let open_buffers = self
+            .tabs
+            .iter()
+            .filter_map(|tab| {
+                tab.buffer
+                    .path()
+                    .map(|path| (path.to_path_buf(), tab.buffer.text().to_string()))
+            })
+            .collect();
+        Some(Effect::SearchWorkspace {
+            generation,
+            options: self.workspace_search.clone(),
+            open_buffers,
+            cancellation: self.workspace_search_cancellation.clone(),
+        })
+    }
+
+    fn terminal_panel_size(&self) -> (u16, u16) {
+        let (width, height) = self.terminal_size;
+        let rows = self
+            .settings
+            .ui
+            .bottom_panel_height
+            .min(height.saturating_sub(2) / 2)
+            .saturating_sub(1)
+            .max(1);
+        let sidebar = if self.sidebar_visible {
+            self.settings.ui.sidebar_width
+        } else {
+            0
+        };
+        let cols = width.saturating_sub(3).saturating_sub(sidebar).max(2);
+        (rows, cols)
+    }
+
+    fn start_terminal_effect(&mut self) -> Effect {
+        self.terminal_generation = self.terminal_generation.saturating_add(1);
+        let (rows, cols) = self.terminal_panel_size();
+        self.terminal.resize(usize::from(rows), usize::from(cols));
+        let configured = self.settings.terminal.shell.trim();
+        Effect::StartTerminal {
+            generation: self.terminal_generation,
+            shell: (!configured.is_empty()).then(|| PathBuf::from(configured)),
+            cwd: self.workspace.as_path().to_path_buf(),
+            rows,
+            cols,
+        }
+    }
+
+    fn lsp_open_effect(&mut self, path: &std::path::Path) -> Vec<Effect> {
+        if !self.settings.lsp.enabled {
+            return Vec::new();
+        }
+        let Some((language, settings)) = self.language_for_path(path) else {
+            return Vec::new();
+        };
+        if self.lsp_started.contains(&language) {
+            return self
+                .lsp_did_open_effect(path, &language)
+                .into_iter()
+                .collect();
+        }
+        if self.lsp_starting.insert(language.clone()) {
+            vec![Effect::StartLsp {
+                language,
+                settings,
+                workspace: self.workspace.as_path().to_path_buf(),
+            }]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn active_post_edit_effects(&mut self) -> Vec<Effect> {
+        let mut effects = self.active_syntax_effect().into_iter().collect::<Vec<_>>();
+        if let Some(effect) = self.active_lsp_change_effect() {
+            effects.push(effect);
+        }
+        effects
+    }
+
+    fn active_lsp_change_effect(&mut self) -> Option<Effect> {
+        let tab = self.active_tab()?;
+        let path = tab.buffer.path()?.to_path_buf();
+        let text = tab.buffer.text().to_string();
+        let (language, _) = self.language_for_path(&path)?;
+        if !self.lsp_started.contains(&language) {
+            return None;
+        }
+        let version = self.lsp_versions.entry(path.clone()).or_insert(1);
+        *version = version.saturating_add(1);
+        Some(Effect::SendLsp {
+            language,
+            message: serde_json::json!({
+                "jsonrpc":"2.0",
+                "method":"textDocument/didChange",
+                "params": {
+                    "textDocument": {"uri": file_uri(&path), "version": *version},
+                    "contentChanges": [{"text": text}]
+                }
+            }),
+        })
+    }
+
+    fn lsp_save_effect(&self, path: &std::path::Path) -> Option<Effect> {
+        let (language, _) = self.language_for_path(path)?;
+        self.lsp_started
+            .contains(&language)
+            .then(|| Effect::SendLsp {
+                language,
+                message: serde_json::json!({
+                    "jsonrpc":"2.0",
+                    "method":"textDocument/didSave",
+                    "params":{"textDocument":{"uri":file_uri(path)}}
+                }),
+            })
+    }
+
+    fn lsp_did_open_effect(&mut self, path: &std::path::Path, language: &str) -> Option<Effect> {
+        let tab = self
+            .tabs
+            .iter()
+            .find(|tab| tab.buffer.path() == Some(path))?;
+        let version = *self.lsp_versions.entry(path.to_path_buf()).or_insert(1);
+        Some(Effect::SendLsp {
+            language: language.to_owned(),
+            message: serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {"textDocument": {
+                    "uri": file_uri(path),
+                    "languageId": language,
+                    "version": version,
+                    "text": tab.buffer.text().to_string(),
+                }}
+            }),
+        })
+    }
+
+    fn handle_lsp_event(
+        &mut self,
+        language: String,
+        event: crate::lsp::LspClientEvent,
+    ) -> Vec<Effect> {
+        match event {
+            crate::lsp::LspClientEvent::Started => Vec::new(),
+            crate::lsp::LspClientEvent::Initialized => {
+                self.lsp_starting.remove(&language);
+                self.lsp_started.insert(language.clone());
+                let paths = self
+                    .tabs
+                    .iter()
+                    .filter_map(|tab| tab.buffer.path().map(ToOwned::to_owned))
+                    .filter(|path| {
+                        self.language_for_path(path)
+                            .is_some_and(|(name, _)| name == language)
+                    })
+                    .collect::<Vec<_>>();
+                paths
+                    .iter()
+                    .filter_map(|path| self.lsp_did_open_effect(path, &language))
+                    .collect()
+            }
+            crate::lsp::LspClientEvent::Message(message) => {
+                self.handle_lsp_message(&language, &message)
+            }
+            crate::lsp::LspClientEvent::Stderr(message) => {
+                self.append_output(&format!("lsp:{language}"), message);
+                Vec::new()
+            }
+            crate::lsp::LspClientEvent::Exited(code) => {
+                self.lsp_started.remove(&language);
+                self.lsp_starting.remove(&language);
+                self.lsp_diagnostic_generation = self.lsp_diagnostic_generation.saturating_add(1);
+                self.diagnostics.clear_source(
+                    crate::diagnostics::DiagnosticSource::Lsp,
+                    self.lsp_diagnostic_generation,
+                );
+                let message = format!("LSP {language} exited ({code:?})");
+                self.append_output("lsp", &message);
+                self.notification = Some(message);
+                self.lsp_restart_effects(&language)
+            }
+            crate::lsp::LspClientEvent::Error(error) => {
+                self.lsp_started.remove(&language);
+                self.lsp_starting.remove(&language);
+                if self.lsp_warned.insert(language.clone()) {
+                    self.notification = Some(format!("LSP {language}: {error}"));
+                }
+                self.append_output(&format!("lsp:{language}"), error);
+                self.lsp_restart_effects(&language)
+            }
+        }
+    }
+
+    fn lsp_restart_effects(&mut self, language: &str) -> Vec<Effect> {
+        let mut effects = vec![Effect::StopLsp {
+            language: language.to_owned(),
+        }];
+        let restarts = self.lsp_restarts.entry(language.to_owned()).or_default();
+        if *restarts >= 3 {
+            self.append_output("lsp", format!("{language}: restart limit reached"));
+            return effects;
+        }
+        let Some(settings) = self.settings.languages.get(language).cloned() else {
+            return effects;
+        };
+        *restarts = restarts.saturating_add(1);
+        self.lsp_starting.insert(language.to_owned());
+        effects.push(Effect::StartLsp {
+            language: language.to_owned(),
+            settings,
+            workspace: self.workspace.as_path().to_path_buf(),
+        });
+        effects
+    }
+
+    fn handle_lsp_message(&mut self, _language: &str, message: &serde_json::Value) -> Vec<Effect> {
+        if let Some(id) = message.get("id").and_then(serde_json::Value::as_u64)
+            && let Some(request) = self.lsp_pending.remove(&id)
+        {
+            return self.handle_lsp_response(request, message.get("result"));
+        }
+        if message.get("method").and_then(serde_json::Value::as_str)
+            != Some("textDocument/publishDiagnostics")
+        {
+            return Vec::new();
+        }
+        let Some(params) = message.get("params") else {
+            return Vec::new();
+        };
+        let Some(uri) = params.get("uri").and_then(serde_json::Value::as_str) else {
+            return Vec::new();
+        };
+        let Some(path) = file_uri_to_path(uri) else {
+            return Vec::new();
+        };
+        let source = self
+            .tabs
+            .iter()
+            .find(|tab| tab.buffer.path() == Some(path.as_path()))
+            .map(|tab| tab.buffer.text().to_string());
+        let diagnostics = params
+            .get("diagnostics")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|item| lsp_diagnostic(&path, source.as_deref(), item))
+            .collect();
+        self.lsp_diagnostic_generation = self.lsp_diagnostic_generation.saturating_add(1);
+        self.diagnostics.replace_source(
+            crate::diagnostics::DiagnosticSource::Lsp,
+            self.lsp_diagnostic_generation,
+            diagnostics,
+        );
+        Vec::new()
+    }
+
+    fn lsp_request_effect(
+        &mut self,
+        method: &str,
+        request: crate::app::PendingLspRequest,
+    ) -> Vec<Effect> {
+        let Some(tab) = self.active_tab() else {
+            return Vec::new();
+        };
+        let Some(path) = tab.buffer.path().map(ToOwned::to_owned) else {
+            return Vec::new();
+        };
+        let text = tab.buffer.text().to_string();
+        let cursor = tab.buffer.selection().head.0;
+        let Some((language, _)) = self.language_for_path(&path) else {
+            return Vec::new();
+        };
+        if !self.lsp_started.contains(&language) {
+            self.notification = Some(format!("LSP {language} is not ready"));
+            return Vec::new();
+        }
+        let id = self.lsp_next_request_id;
+        self.lsp_next_request_id = self.lsp_next_request_id.saturating_add(1);
+        self.lsp_pending.insert(id, request);
+        let position = crate::lsp::char_offset_to_position(&text, cursor);
+        vec![Effect::SendLsp {
+            language,
+            message: serde_json::json!({
+                "jsonrpc":"2.0",
+                "id":id,
+                "method":method,
+                "params":{"textDocument":{"uri":file_uri(&path)},"position":position}
+            }),
+        }]
+    }
+
+    fn handle_lsp_response(
+        &mut self,
+        request: crate::app::PendingLspRequest,
+        result: Option<&serde_json::Value>,
+    ) -> Vec<Effect> {
+        let Some(result) = result.filter(|result| !result.is_null()) else {
+            self.notification = Some("LSP returned no result".to_owned());
+            return Vec::new();
+        };
+        match request {
+            crate::app::PendingLspRequest::Hover => {
+                self.lsp_hover = hover_lines(result);
+                if self.lsp_hover.is_empty() {
+                    self.notification = Some("No hover information".to_owned());
+                } else {
+                    self.overlay = Some(Overlay::LspHover);
+                    self.focus = Focus::Overlay;
+                }
+                Vec::new()
+            }
+            crate::app::PendingLspRequest::Definition => {
+                let location = if result.is_array() {
+                    result.as_array().and_then(|items| items.first())
+                } else {
+                    Some(result)
+                };
+                let Some(location) = location else {
+                    return Vec::new();
+                };
+                let uri = location
+                    .get("uri")
+                    .or_else(|| location.get("targetUri"))
+                    .and_then(serde_json::Value::as_str);
+                let range = location
+                    .get("range")
+                    .or_else(|| location.get("targetSelectionRange"));
+                let Some(path) = uri.and_then(file_uri_to_path) else {
+                    return Vec::new();
+                };
+                let start = range.and_then(|range| range.get("start"));
+                let line = start
+                    .and_then(|start| start.get("line"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as usize
+                    + 1;
+                let column = start
+                    .and_then(|start| start.get("character"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as usize
+                    + 1;
+                vec![Effect::OpenFile {
+                    path,
+                    read_only: self.force_read_only,
+                    line: Some(line),
+                    column: Some(column),
+                }]
+            }
+            crate::app::PendingLspRequest::Completion => {
+                let items = result
+                    .as_array()
+                    .or_else(|| result.get("items").and_then(serde_json::Value::as_array));
+                self.lsp_completions = items
+                    .into_iter()
+                    .flatten()
+                    .filter_map(completion_candidate)
+                    .take(200)
+                    .collect();
+                self.lsp_completion_selected = 0;
+                if self.lsp_completions.is_empty() {
+                    self.notification = Some("No completions".to_owned());
+                } else {
+                    self.overlay = Some(Overlay::LspCompletion);
+                    self.focus = Focus::Overlay;
+                }
+                Vec::new()
+            }
         }
     }
 
@@ -940,6 +2146,28 @@ impl AppState {
         })
     }
 
+    fn start_save_as(&mut self, plan: SaveAsPlan) -> Vec<Effect> {
+        if plan.tab >= self.tabs.len() {
+            return Vec::new();
+        }
+        if self.tabs.iter().enumerate().any(|(index, tab)| {
+            index != plan.tab && tab.buffer.path() == Some(plan.snapshot.path.as_path())
+        }) {
+            self.notification = Some(format!(
+                "{} is already open in another tab",
+                plan.snapshot.path.display()
+            ));
+            self.overlay = None;
+            self.focus = Focus::Editor;
+            return Vec::new();
+        }
+        self.overlay = None;
+        self.focus = Focus::Editor;
+        self.saving_tabs.insert(plan.tab);
+        self.save_as_tabs.insert(plan.tab);
+        vec![Effect::SaveAs(plan)]
+    }
+
     fn recover_pending(&mut self) -> Vec<Effect> {
         for recovered in std::mem::take(&mut self.pending_recovery) {
             let mut buffer = crate::buffer::TextBuffer::recovered(
@@ -1029,26 +2257,42 @@ impl AppState {
         self.reveal_cursor(tab_index);
     }
 
-    fn request_close_tab(&mut self, index: usize) {
+    fn request_close_tab(&mut self, index: usize) -> Vec<Effect> {
         if index >= self.tabs.len() {
-            return;
+            return Vec::new();
         }
         if !self.saving_tabs.is_empty() {
             self.notification = Some("Wait for pending saves before closing a tab".to_owned());
-            return;
+            return Vec::new();
         }
         if self.tabs[index].buffer.is_dirty() {
             self.overlay = Some(Overlay::ConfirmClose { tab: index });
             self.focus = Focus::Overlay;
         } else {
-            self.close_tab(index);
+            return self.close_tab(index).into_iter().collect();
         }
+        Vec::new()
     }
 
-    fn close_tab(&mut self, index: usize) {
+    fn close_tab(&mut self, index: usize) -> Option<Effect> {
         if index >= self.tabs.len() || !self.saving_tabs.is_empty() {
-            return;
+            return None;
         }
+        let lsp_close = self.tabs[index]
+            .buffer
+            .path()
+            .and_then(|path| {
+                self.language_for_path(path)
+                    .map(|(language, _)| (path.to_path_buf(), language))
+            })
+            .filter(|(_, language)| self.lsp_started.contains(language))
+            .map(|(path, language)| Effect::SendLsp {
+                language,
+                message: serde_json::json!({
+                    "jsonrpc":"2.0","method":"textDocument/didClose",
+                    "params":{"textDocument":{"uri":file_uri(&path)}}
+                }),
+            });
         self.tabs.remove(index);
         self.active_tab = match self.active_tab {
             None => None,
@@ -1057,6 +2301,7 @@ impl AppState {
             Some(active) if active == index => Some(index.min(self.tabs.len() - 1)),
             Some(active) => Some(active),
         };
+        lsp_close
     }
 
     fn reveal_cursor(&mut self, tab_index: usize) {
@@ -1091,6 +2336,153 @@ impl AppState {
             tab.view.scroll_line = cursor_line.saturating_sub(visible_height - 1);
         }
     }
+}
+
+fn split_globs(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|pattern| !pattern.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn file_uri(path: &std::path::Path) -> String {
+    let mut uri = String::from("file://");
+    for byte in path.to_string_lossy().bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.' | b'~') {
+            uri.push(char::from(byte));
+        } else {
+            uri.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    uri
+}
+
+fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
+    let encoded = uri.strip_prefix("file://")?;
+    let bytes = encoded.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let value = std::str::from_utf8(&bytes[index + 1..index + 3])
+                .ok()
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok())?;
+            decoded.push(value);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    Some(PathBuf::from(String::from_utf8(decoded).ok()?))
+}
+
+fn lsp_diagnostic(
+    path: &std::path::Path,
+    source_text: Option<&str>,
+    value: &serde_json::Value,
+) -> Option<crate::diagnostics::Diagnostic> {
+    let range = value.get("range")?;
+    let position = |name: &str| -> Option<(usize, usize)> {
+        let position = range.get(name)?;
+        Some((
+            position.get("line")?.as_u64()? as usize,
+            position.get("character")?.as_u64()? as usize,
+        ))
+    };
+    let (start_line, start_column) = position("start")?;
+    let (end_line, end_column) = position("end")?;
+    let char_offset = |line: usize, column: usize| {
+        source_text.map(|text| {
+            crate::lsp::position_to_char_offset(
+                text,
+                lsp_types::Position::new(line as u32, column as u32),
+            )
+        })
+    };
+    let severity = match value.get("severity").and_then(serde_json::Value::as_u64) {
+        Some(1) => crate::diagnostics::DiagnosticSeverity::Error,
+        Some(2) => crate::diagnostics::DiagnosticSeverity::Warning,
+        Some(3) => crate::diagnostics::DiagnosticSeverity::Information,
+        _ => crate::diagnostics::DiagnosticSeverity::Hint,
+    };
+    let code = value.get("code").and_then(|code| match code {
+        serde_json::Value::String(code) => Some(code.clone()),
+        serde_json::Value::Number(code) => Some(code.to_string()),
+        _ => None,
+    });
+    Some(crate::diagnostics::Diagnostic {
+        file: path.to_path_buf(),
+        range: crate::diagnostics::TextRange {
+            start: crate::diagnostics::TextPosition {
+                line: start_line,
+                column: start_column,
+                char_offset: char_offset(start_line, start_column),
+            },
+            end: crate::diagnostics::TextPosition {
+                line: end_line,
+                column: end_column,
+                char_offset: char_offset(end_line, end_column),
+            },
+        },
+        severity,
+        message: value.get("message")?.as_str()?.to_owned(),
+        source: crate::diagnostics::DiagnosticSource::Lsp,
+        code,
+        stale: false,
+    })
+}
+
+fn hover_lines(result: &serde_json::Value) -> Vec<String> {
+    let Some(contents) = result.get("contents") else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    let mut append = |value: &serde_json::Value| {
+        let text = value
+            .as_str()
+            .or_else(|| value.get("value").and_then(serde_json::Value::as_str));
+        if let Some(text) = text {
+            lines.extend(text.lines().map(str::to_owned));
+        }
+    };
+    if let Some(items) = contents.as_array() {
+        for item in items {
+            append(item);
+        }
+    } else {
+        append(contents);
+    }
+    lines
+}
+
+fn completion_candidate(value: &serde_json::Value) -> Option<crate::app::CompletionCandidate> {
+    let label = value.get("label")?.as_str()?.to_owned();
+    let is_snippet = value
+        .get("insertTextFormat")
+        .and_then(serde_json::Value::as_u64)
+        == Some(2);
+    let insert_text = if is_snippet {
+        label.clone()
+    } else {
+        value
+            .get("textEdit")
+            .and_then(|edit| edit.get("newText"))
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| value.get("insertText").and_then(serde_json::Value::as_str))
+            .unwrap_or(&label)
+            .to_owned()
+    };
+    Some(crate::app::CompletionCandidate {
+        label,
+        insert_text,
+        detail: value
+            .get("detail")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+    })
 }
 
 #[cfg(test)]
@@ -1216,6 +2608,419 @@ mod tests {
 
         state.update(AppEvent::Command(Command::SearchNext));
         assert_eq!(state.tabs[0].buffer.selection().range(), 4..5);
+    }
+
+    #[test]
+    fn source_control_commands_dispatch_selected_file_operations() {
+        let mut state = state();
+        state.update(AppEvent::GitStatusLoaded(Ok(crate::git::GitStatus {
+            branch: Some("main".to_owned()),
+            files: vec![crate::git::GitFileChange {
+                path: PathBuf::from("src/main.rs"),
+                original_path: None,
+                kind: crate::git::GitFileKind::Modified,
+                index_status: '.',
+                worktree_status: 'M',
+                staged: false,
+                unstaged: true,
+                conflicted: false,
+                untracked: false,
+            }],
+            ..Default::default()
+        })));
+
+        let effects = state.update(AppEvent::Command(Command::Invoke(
+            command::GIT_STAGE.to_owned(),
+        )));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::GitOperation(crate::app::GitOperation::Stage(path))]
+                if path == &PathBuf::from("src/main.rs")
+        ));
+
+        state.update(AppEvent::Command(Command::Invoke(
+            command::GIT_RESTORE.to_owned(),
+        )));
+        assert!(matches!(
+            state.overlay,
+            Some(Overlay::ConfirmGitRestore { ref path })
+                if path == &PathBuf::from("src/main.rs")
+        ));
+    }
+
+    #[test]
+    fn commit_requires_staged_changes_and_collects_message() {
+        let mut state = state();
+        state.update(AppEvent::Command(Command::Invoke(
+            command::GIT_COMMIT.to_owned(),
+        )));
+        assert_eq!(
+            state.notification.as_deref(),
+            Some("No staged changes to commit")
+        );
+
+        state.git_status = Some(crate::git::GitStatus {
+            files: vec![crate::git::GitFileChange {
+                path: PathBuf::from("new.rs"),
+                original_path: None,
+                kind: crate::git::GitFileKind::Added,
+                index_status: 'A',
+                worktree_status: '.',
+                staged: true,
+                unstaged: false,
+                conflicted: false,
+                untracked: false,
+            }],
+            ..Default::default()
+        });
+        state.update(AppEvent::Command(Command::Invoke(
+            command::GIT_COMMIT.to_owned(),
+        )));
+        state.update(AppEvent::Command(Command::PaletteInput('o')));
+        state.update(AppEvent::Command(Command::PaletteInput('k')));
+        state.update(AppEvent::Command(Command::PaletteNewline));
+        state.update(AppEvent::Command(Command::PaletteInput('!')));
+        let effects = state.update(AppEvent::Command(Command::PaletteAccept));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::GitOperation(crate::app::GitOperation::Commit(message))]
+                if message == "ok\n!"
+        ));
+    }
+
+    #[test]
+    fn branch_picker_filters_and_dispatches_switch() {
+        let mut state = state();
+        let effects = state.update(AppEvent::Command(Command::Invoke(
+            command::GIT_BRANCH_SWITCH.to_owned(),
+        )));
+        assert!(matches!(effects.as_slice(), [Effect::LoadGitBranches]));
+        state.update(AppEvent::GitBranchesLoaded(Ok(vec![
+            crate::git::GitBranch {
+                name: "main".to_owned(),
+                current: true,
+                remote: false,
+                upstream: None,
+            },
+            crate::git::GitBranch {
+                name: "feature".to_owned(),
+                current: false,
+                remote: false,
+                upstream: None,
+            },
+        ])));
+        for character in "feat".chars() {
+            state.update(AppEvent::Command(Command::PaletteInput(character)));
+        }
+        let effects = state.update(AppEvent::Command(Command::PaletteAccept));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::GitOperation(crate::app::GitOperation::SwitchBranch(branch))]
+                if branch == "feature"
+        ));
+    }
+
+    #[test]
+    fn branch_completion_refreshes_tree_and_open_buffers() {
+        let mut state = state();
+        let path = state.workspace.as_path().join("open.rs");
+        state.tabs.push(BufferTab {
+            buffer: TextBuffer::empty(Some(path.clone()), false),
+            view: Default::default(),
+            highlights: Vec::new(),
+            syntax_generation: 0,
+        });
+        let effects = state.update(AppEvent::GitOperationCompleted {
+            result: Ok("Switched".to_owned()),
+            workspace_changed: true,
+        });
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::ScanWorkspace))
+        );
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::RefreshOpenFiles { files, .. } if files == &vec![(0, path.clone())]
+        )));
+    }
+
+    #[test]
+    fn diff_hunk_commands_stage_restore_and_open_target_line() {
+        let mut state = state();
+        let raw = "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -3 +3 @@\n-old\n+new\n";
+        let diff = crate::git::parse_unified_diff(
+            PathBuf::from("src/a.rs"),
+            crate::git::DiffTarget::WorkingTree,
+            raw.to_owned(),
+        );
+        state.update(AppEvent::GitDiffLoaded(Ok(diff)));
+
+        let effects = state.update(AppEvent::Command(Command::GitHunkStageToggle));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::GitOperation(crate::app::GitOperation::StageHunk(patch))]
+                if patch.contains("@@ -3 +3 @@")
+        ));
+
+        state.update(AppEvent::Command(Command::GitHunkRestore));
+        assert!(matches!(
+            state.overlay,
+            Some(Overlay::ConfirmGitHunkRestore { .. })
+        ));
+        let effects = state.update(AppEvent::Command(Command::PaletteAccept));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::GitOperation(crate::app::GitOperation::RestoreHunk(
+                _
+            ))]
+        ));
+
+        let effects = state.update(AppEvent::Command(Command::GitHunkOpenFile));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::OpenFile { path, line: Some(3), .. }]
+                if path == &state.workspace.as_path().join("src/a.rs")
+        ));
+    }
+
+    #[test]
+    fn workspace_search_effect_uses_open_buffer_text_and_ignores_stale_batches() {
+        let mut state = state();
+        let path = state.workspace.as_path().join("live.rs");
+        let mut buffer = TextBuffer::empty(Some(path.clone()), false);
+        buffer.insert("unsaved needle").unwrap();
+        state.tabs.push(BufferTab {
+            buffer,
+            view: Default::default(),
+            highlights: Vec::new(),
+            syntax_generation: 0,
+        });
+        state.sidebar_view = SidebarView::Search;
+
+        let effects = state.update(AppEvent::Command(Command::WorkspaceSearchInput('n')));
+        let [
+            Effect::SearchWorkspace {
+                generation,
+                open_buffers,
+                ..
+            },
+        ] = effects.as_slice()
+        else {
+            panic!("expected workspace search effect");
+        };
+        assert_eq!(
+            open_buffers.get(&path).map(String::as_str),
+            Some("unsaved needle")
+        );
+
+        state.update(AppEvent::WorkspaceSearchBatch {
+            generation: generation.saturating_sub(1),
+            matches: vec![crate::search::WorkspaceMatch {
+                path: PathBuf::from("stale.rs"),
+                line: 1,
+                column: 1,
+                line_text: "n".to_owned(),
+                match_start: 0,
+                match_end: 1,
+            }],
+            done: true,
+            error: None,
+        });
+        assert!(state.workspace_matches.is_empty());
+    }
+
+    #[test]
+    fn workspace_search_rows_group_and_collapse_files() {
+        let mut state = state();
+        state.workspace_matches = vec![
+            crate::search::WorkspaceMatch {
+                path: PathBuf::from("a.rs"),
+                line: 1,
+                column: 1,
+                line_text: "x".to_owned(),
+                match_start: 0,
+                match_end: 1,
+            },
+            crate::search::WorkspaceMatch {
+                path: PathBuf::from("a.rs"),
+                line: 2,
+                column: 1,
+                line_text: "x".to_owned(),
+                match_start: 0,
+                match_end: 1,
+            },
+        ];
+        assert_eq!(state.workspace_search_rows().len(), 3);
+        state.update(AppEvent::Command(Command::WorkspaceSearchToggleFile(
+            PathBuf::from("a.rs"),
+        )));
+        assert_eq!(state.workspace_search_rows().len(), 1);
+    }
+
+    #[test]
+    fn terminal_toggle_starts_session_and_stale_output_is_ignored() {
+        let mut state = state();
+        state.terminal_size = (100, 30);
+        let effects = state.update(AppEvent::Command(Command::Invoke(
+            command::TERMINAL_TOGGLE.to_owned(),
+        )));
+        let [
+            Effect::StartTerminal {
+                generation,
+                cwd,
+                rows,
+                cols,
+                ..
+            },
+        ] = effects.as_slice()
+        else {
+            panic!("expected terminal start");
+        };
+        assert_eq!(*generation, state.terminal_generation);
+        assert_eq!(cwd, state.workspace.as_path());
+        assert!(*rows > 0 && *cols > 0);
+        assert_eq!(state.bottom_panel_view, BottomPanelView::Terminal);
+
+        state.update(AppEvent::TerminalOutput {
+            generation: generation.saturating_sub(1),
+            bytes: b"stale".to_vec(),
+        });
+        assert!(
+            state
+                .terminal
+                .snapshot(0)
+                .lines
+                .iter()
+                .flatten()
+                .all(|cell| cell.character != 's')
+        );
+        state.update(AppEvent::TerminalOutput {
+            generation: *generation,
+            bytes: b"live".to_vec(),
+        });
+        assert_eq!(state.terminal.snapshot(0).lines[0][0].character, 'l');
+    }
+
+    #[test]
+    fn quitting_with_running_terminal_requires_confirmation() {
+        let mut state = state();
+        state.terminal_running = true;
+        state.update(AppEvent::Command(Command::Invoke(
+            command::APP_QUIT.to_owned(),
+        )));
+        assert!(!state.should_quit);
+        assert!(matches!(state.overlay, Some(Overlay::ConfirmQuitTerminal)));
+        let effects = state.update(AppEvent::Command(Command::PaletteAccept));
+        assert!(state.should_quit);
+        assert!(matches!(effects.as_slice(), [Effect::StopTerminal]));
+    }
+
+    #[test]
+    fn terminal_selection_copy_uses_shared_clipboard_effect() {
+        let mut state = state();
+        state.terminal.feed(b"copy me");
+        state.update(AppEvent::Command(Command::TerminalSetSelection {
+            row: 0,
+            column: 0,
+            extend: false,
+        }));
+        state.update(AppEvent::Command(Command::TerminalSetSelection {
+            row: 0,
+            column: 3,
+            extend: true,
+        }));
+        let effects = state.update(AppEvent::Command(Command::TerminalCopy));
+        assert_eq!(state.internal_clipboard, "copy");
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::CopyToClipboard(text)] if text == "copy"
+        ));
+    }
+
+    #[test]
+    fn rust_file_lazily_starts_lsp_and_sends_full_document_changes() {
+        let mut state = state();
+        let path = state.workspace.as_path().join("main.rs");
+        let mut buffer = TextBuffer::empty(Some(path.clone()), false);
+        buffer.insert("fn main() {}").unwrap();
+        let effects = state.update(AppEvent::FileOpened {
+            path: path.clone(),
+            line: None,
+            column: None,
+            result: Ok(buffer),
+        });
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::StartLsp { language, .. } if language == "rust"
+        )));
+
+        let effects = state.update(AppEvent::LspClient {
+            language: "rust".to_owned(),
+            event: crate::lsp::LspClientEvent::Initialized,
+        });
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::SendLsp { message, .. }
+                if message.get("method").and_then(serde_json::Value::as_str)
+                    == Some("textDocument/didOpen")
+        )));
+        let effects = state.update(AppEvent::Command(Command::InsertText("x".to_owned())));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::SendLsp { message, .. }
+                if message.get("method").and_then(serde_json::Value::as_str)
+                    == Some("textDocument/didChange")
+        )));
+    }
+
+    #[test]
+    fn lsp_diagnostics_convert_utf16_and_hover_response_opens_overlay() {
+        let mut state = state();
+        let path = state.workspace.as_path().join("unicode.rs");
+        let mut buffer = TextBuffer::empty(Some(path.clone()), false);
+        buffer.insert("a😀value").unwrap();
+        state.tabs.push(BufferTab {
+            buffer,
+            view: Default::default(),
+            highlights: Vec::new(),
+            syntax_generation: 0,
+        });
+        state.active_tab = Some(0);
+        state.lsp_started.insert("rust".to_owned());
+        state.update(AppEvent::LspClient {
+            language: "rust".to_owned(),
+            event: crate::lsp::LspClientEvent::Message(serde_json::json!({
+                "jsonrpc":"2.0","method":"textDocument/publishDiagnostics",
+                "params":{"uri":file_uri(&path),"diagnostics":[{
+                    "range":{"start":{"line":0,"character":3},"end":{"line":0,"character":8}},
+                    "severity":1,"message":"bad value","code":"E1"
+                }]}
+            })),
+        });
+        assert_eq!(
+            state.diagnostics.diagnostics()[0].range.start.char_offset,
+            Some(2)
+        );
+
+        let effects = state.update(AppEvent::Command(Command::Invoke(
+            command::LSP_HOVER.to_owned(),
+        )));
+        let id = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::SendLsp { message, .. } => message.get("id")?.as_u64(),
+                _ => None,
+            })
+            .unwrap();
+        state.update(AppEvent::LspClient {
+            language: "rust".to_owned(),
+            event: crate::lsp::LspClientEvent::Message(serde_json::json!({
+                "jsonrpc":"2.0","id":id,"result":{"contents":{"kind":"markdown","value":"**type**"}}
+            })),
+        });
+        assert!(matches!(state.overlay, Some(Overlay::LspHover)));
+        assert_eq!(state.lsp_hover, vec!["**type**"]);
     }
 
     #[test]

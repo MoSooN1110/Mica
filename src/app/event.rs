@@ -23,6 +23,11 @@ pub enum AppEvent {
         snapshot: SaveSnapshot,
         result: Result<(), String>,
     },
+    SaveAsInspected(Result<SaveAsInspection, String>),
+    SaveAsCompleted {
+        plan: SaveAsPlan,
+        result: Result<(), String>,
+    },
     WorkspaceChanged(Vec<PathBuf>),
     ExternalFilesRead(Vec<ExternalFileRead>),
     DeleteInspected(Result<DeletePlan, String>),
@@ -50,6 +55,54 @@ pub enum AppEvent {
         result: Result<Vec<crate::editor::HighlightSpan>, String>,
     },
     RecoveryDiscarded(Result<(), String>),
+    GitStatusLoaded(Result<crate::git::GitStatus, String>),
+    GitDiffLoaded(Result<crate::git::FileDiff, String>),
+    GitOperationCompleted {
+        result: Result<String, String>,
+        workspace_changed: bool,
+    },
+    GitBranchesLoaded(Result<Vec<crate::git::GitBranch>, String>),
+    WorkspaceSearchBatch {
+        generation: u64,
+        matches: Vec<crate::search::WorkspaceMatch>,
+        done: bool,
+        error: Option<String>,
+    },
+    TerminalStarted {
+        generation: u64,
+        result: Result<(), String>,
+    },
+    TerminalOutput {
+        generation: u64,
+        bytes: Vec<u8>,
+    },
+    TerminalExited {
+        generation: u64,
+        code: u32,
+        success: bool,
+    },
+    TerminalError {
+        generation: u64,
+        error: String,
+    },
+    DiagnosticsReplaced {
+        source: crate::diagnostics::DiagnosticSource,
+        generation: u64,
+        diagnostics: Vec<crate::diagnostics::Diagnostic>,
+    },
+    DiagnosticsFailed {
+        source: crate::diagnostics::DiagnosticSource,
+        generation: u64,
+        error: String,
+    },
+    OutputMessage {
+        source: String,
+        message: String,
+    },
+    LspClient {
+        language: String,
+        event: crate::lsp::LspClientEvent,
+    },
 }
 
 #[derive(Debug)]
@@ -72,6 +125,12 @@ pub enum Effect {
         tab: usize,
         snapshot: SaveSnapshot,
     },
+    InspectSaveAs {
+        tab: usize,
+        destination: PathBuf,
+        snapshot: SaveSnapshot,
+    },
+    SaveAs(SaveAsPlan),
     RefreshOpenFiles {
         files: Vec<(usize, PathBuf)>,
         read_only: bool,
@@ -105,6 +164,75 @@ pub enum Effect {
         cancellation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     },
     DiscardRecovery(Vec<PathBuf>),
+    RefreshGit,
+    LoadGitDiff {
+        path: PathBuf,
+        target: crate::git::DiffTarget,
+    },
+    GitOperation(GitOperation),
+    LoadGitBranches,
+    SearchWorkspace {
+        generation: u64,
+        options: crate::search::WorkspaceSearchOptions,
+        open_buffers: std::collections::HashMap<PathBuf, String>,
+        cancellation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    },
+    StartTerminal {
+        generation: u64,
+        shell: Option<PathBuf>,
+        cwd: PathBuf,
+        rows: u16,
+        cols: u16,
+    },
+    TerminalInput(Vec<u8>),
+    ResizeTerminal {
+        rows: u16,
+        cols: u16,
+    },
+    StopTerminal,
+    RunCargoCheck {
+        generation: u64,
+    },
+    StartLsp {
+        language: String,
+        settings: crate::config::LanguageSettings,
+        workspace: PathBuf,
+    },
+    SendLsp {
+        language: String,
+        message: serde_json::Value,
+    },
+    StopLsp {
+        language: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum GitOperation {
+    Stage(PathBuf),
+    Unstage(PathBuf),
+    Restore(PathBuf),
+    StageHunk(String),
+    UnstageHunk(String),
+    RestoreHunk(String),
+    Commit(String),
+    SwitchBranch(String),
+    CreateBranch(String),
+    Fetch,
+    Pull,
+    Push,
+}
+
+#[derive(Debug, Clone)]
+pub struct SaveAsPlan {
+    pub tab: usize,
+    pub snapshot: SaveSnapshot,
+}
+
+#[derive(Debug)]
+pub enum SaveAsInspection {
+    Ready(SaveAsPlan),
+    ConfirmOverwrite(SaveAsPlan),
 }
 
 #[derive(Debug, Clone)]

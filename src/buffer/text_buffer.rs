@@ -12,7 +12,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use super::{
     CharOffset, Edit, Selection, atomic_save_if_unchanged,
     history::History,
-    persistence::{SaveError, hash_bytes},
+    persistence::{SaveError, disk_content_hash},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,7 +131,7 @@ impl TextBuffer {
             path: path.to_path_buf(),
             source,
         })?;
-        let disk_hash = hash_bytes(&bytes);
+        let disk_hash = disk_content_hash(&bytes);
         let (has_bom, content) = bytes
             .strip_prefix(&[0xEF, 0xBB, 0xBF])
             .map_or((false, bytes.as_slice()), |rest| (true, rest));
@@ -352,7 +352,7 @@ impl TextBuffer {
         Ok(SaveSnapshot {
             path,
             content_hash: hash_text(&self.text),
-            disk_hash: hash_bytes(&bytes),
+            disk_hash: disk_content_hash(&bytes),
             expected_disk_hash: self.disk_hash,
             generation: self.generation,
             bytes,
@@ -383,7 +383,7 @@ impl TextBuffer {
                 });
             }
         };
-        self.disk_state = if Some(hash_bytes(&bytes)) == self.disk_hash {
+        self.disk_state = if Some(disk_content_hash(&bytes)) == self.disk_hash {
             DiskState::Present
         } else {
             DiskState::ModifiedExternally

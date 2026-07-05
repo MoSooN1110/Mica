@@ -31,7 +31,7 @@ pub fn atomic_save_if_unchanged(
     expected_disk_hash: Option<u64>,
 ) -> Result<(), SaveError> {
     let current = match fs::read(path) {
-        Ok(bytes) => Some(hash_bytes(&bytes)),
+        Ok(bytes) => Some(disk_content_hash(&bytes)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(source) => {
             return Err(SaveError::Io {
@@ -127,7 +127,7 @@ fn write_through(path: &Path, bytes: &[u8]) -> Result<(), SaveError> {
         })
 }
 
-pub(crate) fn hash_bytes(bytes: &[u8]) -> u64 {
+pub fn disk_content_hash(bytes: &[u8]) -> u64 {
     let mut hasher = DefaultHasher::new();
     bytes.hash(&mut hasher);
     hasher.finish()
@@ -146,7 +146,7 @@ mod tests {
         let path = temporary_file("save-conflict");
         let _ = fs::remove_file(&path);
         fs::write(&path, b"opened").unwrap();
-        let expected = Some(hash_bytes(b"opened"));
+        let expected = Some(disk_content_hash(b"opened"));
         fs::write(&path, b"external agent edit").unwrap();
         assert!(matches!(
             atomic_save_if_unchanged(&path, b"local edit", expected),
@@ -174,7 +174,7 @@ mod tests {
         let _ = fs::remove_file(&link);
         fs::write(&path, b"before").unwrap();
         fs::hard_link(&path, &link).unwrap();
-        atomic_save_if_unchanged(&path, b"after", Some(hash_bytes(b"before"))).unwrap();
+        atomic_save_if_unchanged(&path, b"after", Some(disk_content_hash(b"before"))).unwrap();
         assert_eq!(fs::read(&link).unwrap(), b"after");
         fs::remove_file(path).unwrap();
         fs::remove_file(link).unwrap();

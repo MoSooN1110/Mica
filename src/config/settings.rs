@@ -122,6 +122,26 @@ pub struct LspSettings {
     pub enabled: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LanguageSettings {
+    pub extensions: Vec<String>,
+    pub command: String,
+    pub args: Vec<String>,
+    pub root_markers: Vec<String>,
+}
+
+impl Default for LanguageSettings {
+    fn default() -> Self {
+        Self {
+            extensions: Vec::new(),
+            command: String::new(),
+            args: Vec::new(),
+            root_markers: vec![".git".to_owned()],
+        }
+    }
+}
+
 impl Default for LspSettings {
     fn default() -> Self {
         Self { enabled: true }
@@ -154,7 +174,7 @@ impl Default for UiSettings {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
     pub editor: EditorSettings,
@@ -163,8 +183,78 @@ pub struct Settings {
     pub terminal: TerminalSettings,
     pub diagnostics: DiagnosticsSettings,
     pub lsp: LspSettings,
+    pub languages: HashMap<String, LanguageSettings>,
     pub ui: UiSettings,
     pub keymap: HashMap<String, String>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            editor: EditorSettings::default(),
+            workspace: WorkspaceSettings::default(),
+            git: GitSettings::default(),
+            terminal: TerminalSettings::default(),
+            diagnostics: DiagnosticsSettings::default(),
+            lsp: LspSettings::default(),
+            languages: default_languages(),
+            ui: UiSettings::default(),
+            keymap: HashMap::new(),
+        }
+    }
+}
+
+fn default_languages() -> HashMap<String, LanguageSettings> {
+    [
+        (
+            "c_cpp",
+            vec!["c", "cc", "cpp", "cxx", "h", "hh", "hpp", "hxx"],
+            "clangd",
+            Vec::new(),
+            vec!["compile_commands.json", "CMakeLists.txt", ".git"],
+        ),
+        (
+            "rust",
+            vec!["rs"],
+            "rust-analyzer",
+            Vec::new(),
+            vec!["Cargo.toml", ".git"],
+        ),
+        (
+            "python",
+            vec!["py", "pyi"],
+            "pyright-langserver",
+            vec!["--stdio"],
+            vec!["pyproject.toml", "setup.py", "requirements.txt", ".git"],
+        ),
+        (
+            "json",
+            vec!["json", "jsonc"],
+            "vscode-json-language-server",
+            vec!["--stdio"],
+            vec![".git"],
+        ),
+        (
+            "markdown",
+            vec!["md", "markdown"],
+            "marksman",
+            vec!["server"],
+            vec![".git"],
+        ),
+    ]
+    .into_iter()
+    .map(|(name, extensions, command, args, markers)| {
+        (
+            name.to_owned(),
+            LanguageSettings {
+                extensions: extensions.into_iter().map(str::to_owned).collect(),
+                command: command.to_owned(),
+                args: args.into_iter().map(str::to_owned).collect(),
+                root_markers: markers.into_iter().map(str::to_owned).collect(),
+            },
+        )
+    })
+    .collect()
 }
 
 #[derive(Debug)]

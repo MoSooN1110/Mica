@@ -56,6 +56,7 @@ impl Default for Keymap {
     fn default() -> Self {
         let defaults = [
             ("ctrl-s", "editor.save"),
+            ("ctrl-shift-s", "editor.save_as"),
             ("ctrl-w", "editor.close"),
             ("ctrl-c", "editor.copy"),
             ("ctrl-x", "editor.cut"),
@@ -67,6 +68,7 @@ impl Default for Keymap {
             ("ctrl-shift-p", "command_palette.open"),
             ("ctrl-b", "view.toggle_sidebar"),
             ("ctrl-j", "view.toggle_bottom_panel"),
+            ("ctrl-`", "terminal.toggle"),
             ("alt-1", "view.explorer"),
             ("alt-2", "view.source_control"),
             ("alt-3", "view.search"),

@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     error::Error,
     io::{self, Read, stdout},
     sync::mpsc::{self, Receiver, Sender},
@@ -18,15 +19,19 @@ use crossterm::{
 };
 use mica::{
     app::{
-        AppEvent, AppState, Effect, ExternalFileRead, FileOperationRequest, FileOperationResult,
+        AppEvent, AppState, BottomPanelView, Effect, ExternalFileRead, FileOperationRequest,
+        FileOperationResult, GitOperation, SaveAsInspection, SaveAsPlan,
     },
-    buffer::{BufferError, TextBuffer, atomic_save_if_unchanged},
+    buffer::{BufferError, SaveSnapshot, TextBuffer, atomic_save_if_unchanged, disk_content_hash},
     cli::{Cli, CliLocale},
     command::Command,
     config::{ConfigLoad, Keymap, Locale},
     editor::highlight_rust,
-    search::{find_matches, fuzzy_files},
+    git::{GitBackend, GitCliBackend},
+    lsp::{LspClient, LspClientConfig},
+    search::{find_matches, fuzzy_files, search_workspace},
     session::{SessionJournal, SessionStore, discard_recovery},
+    terminal::{TerminalConfig, TerminalEvent, TerminalSession},
     ui::{ColorMode, Regions, Theme, command_for_key, command_for_mouse, render},
     workspace::{FileOperations, FileTree, WorkspaceRoot, WorkspaceWatcher},
 };
@@ -94,7 +99,13 @@ fn run() -> Result<(), Box<dyn Error>> {
         Err(error) => state.notification = Some(format!("Session recovery unavailable: {error}")),
     }
     let (sender, receiver) = mpsc::channel();
-    execute_effects(&state, vec![Effect::ScanWorkspace], &sender);
+    let mut runtime = Runtime::new(sender.clone());
+    execute_effects(
+        &state,
+        vec![Effect::ScanWorkspace, Effect::RefreshGit],
+        &sender,
+        &mut runtime,
+    );
     for path in restored_paths {
         execute_effects(
             &state,
@@ -105,6 +116,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 column: None,
             }],
             &sender,
+            &mut runtime,
         );
     }
     if let Some(path) = target.file {
@@ -117,6 +129,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 column: target.column,
             }],
             &sender,
+            &mut runtime,
         );
     }
     let watch_sender = sender.clone();
@@ -150,7 +163,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         receiver,
         sender,
         session_journal.as_ref(),
+        &mut runtime,
     )?;
+    runtime.shutdown();
     if let Some(journal) = session_journal {
         journal.shutdown(state.session_snapshot());
     }
@@ -164,12 +179,16 @@ fn event_loop(
     receiver: Receiver<AppEvent>,
     sender: Sender<AppEvent>,
     session_journal: Option<&SessionJournal>,
+    runtime: &mut Runtime,
 ) -> io::Result<()> {
     let mut regions = Regions::default();
     while !state.should_quit {
-        while let Ok(event) = receiver.try_recv() {
+        for _ in 0..256 {
+            let Ok(event) = receiver.try_recv() else {
+                break;
+            };
             let effects = state.update(event);
-            execute_effects(state, effects, &sender);
+            execute_effects(state, effects, &sender, runtime);
             if let Some(journal) = session_journal {
                 journal.submit(state.session_snapshot());
             }
@@ -186,12 +205,18 @@ fn event_loop(
                 command_for_mouse(state, regions, mouse)
             }
             Event::Resize(width, height) => Some(Command::Resize(width, height)),
+            Event::Paste(text)
+                if state.focus == mica::app::Focus::BottomPanel
+                    && state.bottom_panel_view == BottomPanelView::Terminal =>
+            {
+                Some(Command::TerminalPaste(text))
+            }
             Event::Paste(text) => Some(Command::InsertText(text)),
             _ => None,
         };
         if let Some(command) = command {
             let effects = state.update(AppEvent::Command(command));
-            execute_effects(state, effects, &sender);
+            execute_effects(state, effects, &sender, runtime);
             if let Some(journal) = session_journal {
                 journal.submit(state.session_snapshot());
             }
@@ -200,7 +225,149 @@ fn event_loop(
     Ok(())
 }
 
-fn execute_effects(state: &AppState, effects: Vec<Effect>, sender: &Sender<AppEvent>) {
+struct Runtime {
+    terminal: Option<TerminalRuntime>,
+    lsp: HashMap<String, LspClient>,
+}
+
+impl Runtime {
+    fn new(events: Sender<AppEvent>) -> Self {
+        Self {
+            terminal: Some(TerminalRuntime::spawn(events)),
+            lsp: HashMap::new(),
+        }
+    }
+
+    fn send_terminal(&self, command: TerminalRuntimeCommand) {
+        if let Some(terminal) = &self.terminal {
+            terminal.send(command);
+        }
+    }
+
+    fn shutdown(&mut self) {
+        self.lsp.clear();
+        self.terminal.take();
+    }
+}
+
+enum TerminalRuntimeCommand {
+    Start {
+        generation: u64,
+        config: TerminalConfig,
+    },
+    Input(Vec<u8>),
+    Resize {
+        rows: u16,
+        cols: u16,
+    },
+    Stop,
+    Shutdown,
+}
+
+struct TerminalRuntime {
+    commands: Sender<TerminalRuntimeCommand>,
+    join: Option<thread::JoinHandle<()>>,
+}
+
+impl TerminalRuntime {
+    fn spawn(events: Sender<AppEvent>) -> Self {
+        let (commands, receiver) = mpsc::channel();
+        let join = thread::spawn(move || {
+            let mut session: Option<TerminalSession> = None;
+            let mut current_generation = 0u64;
+            while let Ok(command) = receiver.recv() {
+                match command {
+                    TerminalRuntimeCommand::Start { generation, config } => {
+                        current_generation = generation;
+                        session.take();
+                        let event_sender = events.clone();
+                        match TerminalSession::spawn(config, move |event| {
+                            let event = match event {
+                                TerminalEvent::Output(bytes) => {
+                                    AppEvent::TerminalOutput { generation, bytes }
+                                }
+                                TerminalEvent::Exited { code, success } => {
+                                    AppEvent::TerminalExited {
+                                        generation,
+                                        code,
+                                        success,
+                                    }
+                                }
+                                TerminalEvent::Error(error) => {
+                                    AppEvent::TerminalError { generation, error }
+                                }
+                            };
+                            let _ = event_sender.send(event);
+                        }) {
+                            Ok(next) => {
+                                session = Some(next);
+                                let _ = events.send(AppEvent::TerminalStarted {
+                                    generation,
+                                    result: Ok(()),
+                                });
+                            }
+                            Err(error) => {
+                                let _ = events.send(AppEvent::TerminalStarted {
+                                    generation,
+                                    result: Err(error.to_string()),
+                                });
+                            }
+                        }
+                    }
+                    TerminalRuntimeCommand::Input(bytes) => {
+                        if let Some(session) = &session
+                            && let Err(error) = session.input(bytes)
+                        {
+                            let _ = events.send(AppEvent::TerminalError {
+                                generation: current_generation,
+                                error,
+                            });
+                        }
+                    }
+                    TerminalRuntimeCommand::Resize { rows, cols } => {
+                        if let Some(session) = &session
+                            && let Err(error) = session.resize(rows, cols)
+                        {
+                            let _ = events.send(AppEvent::TerminalError {
+                                generation: current_generation,
+                                error,
+                            });
+                        }
+                    }
+                    TerminalRuntimeCommand::Stop => {
+                        session.take();
+                    }
+                    TerminalRuntimeCommand::Shutdown => break,
+                }
+            }
+            session.take();
+        });
+        Self {
+            commands,
+            join: Some(join),
+        }
+    }
+
+    fn send(&self, command: TerminalRuntimeCommand) {
+        let _ = self.commands.send(command);
+    }
+}
+
+impl Drop for TerminalRuntime {
+    fn drop(&mut self) {
+        let _ = self.commands.send(TerminalRuntimeCommand::Shutdown);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+fn execute_effects(
+    state: &AppState,
+    effects: Vec<Effect>,
+    sender: &Sender<AppEvent>,
+    runtime: &mut Runtime,
+) {
     for effect in effects {
         let sender = sender.clone();
         match effect {
@@ -257,6 +424,28 @@ fn execute_effects(state: &AppState, effects: Vec<Effect>, sender: &Sender<AppEv
                         snapshot,
                         result,
                     });
+                });
+            }
+            Effect::InspectSaveAs {
+                tab,
+                destination,
+                mut snapshot,
+            } => {
+                let root = state.workspace.clone();
+                thread::spawn(move || {
+                    let result = inspect_save_as(&root, destination, tab, &mut snapshot);
+                    let _ = sender.send(AppEvent::SaveAsInspected(result));
+                });
+            }
+            Effect::SaveAs(plan) => {
+                thread::spawn(move || {
+                    let result = atomic_save_if_unchanged(
+                        &plan.snapshot.path,
+                        &plan.snapshot.bytes,
+                        plan.snapshot.expected_disk_hash,
+                    )
+                    .map_err(|error| error.to_string());
+                    let _ = sender.send(AppEvent::SaveAsCompleted { plan, result });
                 });
             }
             Effect::RefreshOpenFiles { files, read_only } => {
@@ -418,7 +607,282 @@ fn execute_effects(state: &AppState, effects: Vec<Effect>, sender: &Sender<AppEv
                     let _ = sender.send(AppEvent::RecoveryDiscarded(result));
                 });
             }
+            Effect::RefreshGit => {
+                let root = state.workspace.as_path().to_path_buf();
+                thread::spawn(move || {
+                    let result = GitCliBackend::new(root)
+                        .status()
+                        .map_err(|error| error.to_string());
+                    let _ = sender.send(AppEvent::GitStatusLoaded(result));
+                });
+            }
+            Effect::LoadGitDiff { path, target } => {
+                let root = state.workspace.as_path().to_path_buf();
+                thread::spawn(move || {
+                    let result = GitCliBackend::new(root)
+                        .diff(&path, target)
+                        .map_err(|error| error.to_string());
+                    let _ = sender.send(AppEvent::GitDiffLoaded(result));
+                });
+            }
+            Effect::GitOperation(operation) => {
+                let root = state.workspace.as_path().to_path_buf();
+                thread::spawn(move || {
+                    let backend = GitCliBackend::new(root);
+                    let workspace_changed = matches!(
+                        operation,
+                        GitOperation::SwitchBranch(_) | GitOperation::CreateBranch(_)
+                    );
+                    let result = match operation {
+                        GitOperation::Stage(path) => backend
+                            .stage_file(&path)
+                            .map(|()| format!("Staged {}", path.display())),
+                        GitOperation::Unstage(path) => backend
+                            .unstage_file(&path)
+                            .map(|()| format!("Unstaged {}", path.display())),
+                        GitOperation::Restore(path) => backend
+                            .restore_file(&path)
+                            .map(|()| format!("Restored {}", path.display())),
+                        GitOperation::StageHunk(patch) => backend
+                            .stage_hunk(&patch)
+                            .map(|()| "Staged hunk".to_owned()),
+                        GitOperation::UnstageHunk(patch) => backend
+                            .unstage_hunk(&patch)
+                            .map(|()| "Unstaged hunk".to_owned()),
+                        GitOperation::RestoreHunk(patch) => backend
+                            .restore_hunk(&patch)
+                            .map(|()| "Restored hunk".to_owned()),
+                        GitOperation::Commit(message) => backend
+                            .commit(&message)
+                            .map(|()| "Commit created".to_owned()),
+                        GitOperation::SwitchBranch(branch) => backend
+                            .switch_branch(&branch)
+                            .map(|()| format!("Switched to {branch}")),
+                        GitOperation::CreateBranch(branch) => backend
+                            .create_branch(&branch)
+                            .map(|()| format!("Created and switched to {branch}")),
+                        GitOperation::Fetch => {
+                            backend.fetch().map(|()| "Fetch completed".to_owned())
+                        }
+                        GitOperation::Pull => backend.pull().map(|()| "Pull completed".to_owned()),
+                        GitOperation::Push => backend.push().map(|()| "Push completed".to_owned()),
+                    }
+                    .map_err(|error| error.to_string());
+                    let _ = sender.send(AppEvent::GitOperationCompleted {
+                        result,
+                        workspace_changed,
+                    });
+                });
+            }
+            Effect::LoadGitBranches => {
+                let root = state.workspace.as_path().to_path_buf();
+                thread::spawn(move || {
+                    let result = GitCliBackend::new(root)
+                        .branches()
+                        .map_err(|error| error.to_string());
+                    let _ = sender.send(AppEvent::GitBranchesLoaded(result));
+                });
+            }
+            Effect::SearchWorkspace {
+                generation,
+                options,
+                open_buffers,
+                cancellation,
+            } => {
+                let root = state.workspace.as_path().to_path_buf();
+                thread::spawn(move || {
+                    let batch_sender = sender.clone();
+                    let result = search_workspace(
+                        &root,
+                        &options,
+                        &open_buffers,
+                        &cancellation,
+                        generation,
+                        |matches| {
+                            let _ = batch_sender.send(AppEvent::WorkspaceSearchBatch {
+                                generation,
+                                matches,
+                                done: false,
+                                error: None,
+                            });
+                        },
+                    );
+                    let _ = sender.send(AppEvent::WorkspaceSearchBatch {
+                        generation,
+                        matches: Vec::new(),
+                        done: true,
+                        error: result.err().map(|error| error.to_string()),
+                    });
+                });
+            }
+            Effect::StartTerminal {
+                generation,
+                shell,
+                cwd,
+                rows,
+                cols,
+            } => {
+                let mut config = TerminalConfig::for_workspace(cwd, rows, cols);
+                if let Some(shell) = shell {
+                    config.shell = shell;
+                }
+                runtime.send_terminal(TerminalRuntimeCommand::Start { generation, config });
+            }
+            Effect::TerminalInput(bytes) => {
+                runtime.send_terminal(TerminalRuntimeCommand::Input(bytes));
+            }
+            Effect::ResizeTerminal { rows, cols } => {
+                runtime.send_terminal(TerminalRuntimeCommand::Resize { rows, cols });
+            }
+            Effect::StopTerminal => {
+                runtime.send_terminal(TerminalRuntimeCommand::Stop);
+            }
+            Effect::RunCargoCheck { generation } => {
+                let root = state.workspace.as_path().to_path_buf();
+                thread::spawn(move || {
+                    let output = std::process::Command::new("cargo")
+                        .current_dir(&root)
+                        .args(["check", "--message-format=json"])
+                        .env("CARGO_TERM_COLOR", "never")
+                        .output();
+                    match output {
+                        Ok(output) => {
+                            let diagnostics =
+                                mica::diagnostics::parse_cargo_messages(&root, &output.stdout);
+                            if !output.stderr.is_empty() {
+                                let _ = sender.send(AppEvent::OutputMessage {
+                                    source: "cargo".to_owned(),
+                                    message: String::from_utf8_lossy(&output.stderr).into_owned(),
+                                });
+                            }
+                            if output.status.success() || !diagnostics.is_empty() {
+                                let _ = sender.send(AppEvent::DiagnosticsReplaced {
+                                    source: mica::diagnostics::DiagnosticSource::Compiler,
+                                    generation,
+                                    diagnostics,
+                                });
+                            } else {
+                                let _ = sender.send(AppEvent::DiagnosticsFailed {
+                                    source: mica::diagnostics::DiagnosticSource::Compiler,
+                                    generation,
+                                    error: format!("cargo check failed: {}", output.status),
+                                });
+                            }
+                        }
+                        Err(error) => {
+                            let _ = sender.send(AppEvent::DiagnosticsFailed {
+                                source: mica::diagnostics::DiagnosticSource::Compiler,
+                                generation,
+                                error: format!("cannot run cargo check: {error}"),
+                            });
+                        }
+                    }
+                });
+            }
+            Effect::StartLsp {
+                language,
+                settings,
+                workspace,
+            } => {
+                if runtime.lsp.contains_key(&language) {
+                    continue;
+                }
+                let event_sender = sender.clone();
+                let event_language = language.clone();
+                let client = LspClient::spawn(
+                    LspClientConfig {
+                        command: settings.command,
+                        args: settings.args,
+                        root: workspace,
+                        root_markers: settings.root_markers,
+                        language_id: language.clone(),
+                    },
+                    move |event| {
+                        let _ = event_sender.send(AppEvent::LspClient {
+                            language: event_language.clone(),
+                            event,
+                        });
+                    },
+                );
+                runtime.lsp.insert(language, client);
+            }
+            Effect::SendLsp { language, message } => {
+                if let Some(client) = runtime.lsp.get(&language)
+                    && let Err(error) = client.send(message)
+                {
+                    let _ = sender.send(AppEvent::LspClient {
+                        language,
+                        event: mica::lsp::LspClientEvent::Error(error),
+                    });
+                }
+            }
+            Effect::StopLsp { language } => {
+                if let Some(client) = runtime.lsp.remove(&language) {
+                    thread::spawn(move || drop(client));
+                }
+            }
         }
+    }
+}
+
+fn inspect_save_as(
+    root: &WorkspaceRoot,
+    destination: std::path::PathBuf,
+    tab: usize,
+    snapshot: &mut SaveSnapshot,
+) -> Result<SaveAsInspection, String> {
+    let lexical = root
+        .resolve_lexical(&destination)
+        .map_err(|error| error.to_string())?;
+    if lexical == root.as_path() {
+        return Err("cannot save over the workspace root".to_owned());
+    }
+    if lexical.is_symlink() {
+        return Err(format!(
+            "refusing Save As through symlink: {}",
+            lexical.display()
+        ));
+    }
+    let resolved = root
+        .resolve(&destination)
+        .map_err(|error| error.to_string())?
+        .absolute();
+    let parent = resolved
+        .parent()
+        .ok_or_else(|| "save destination has no parent".to_owned())?;
+    if !parent.is_dir() {
+        return Err(format!(
+            "save destination directory does not exist: {}",
+            parent.display()
+        ));
+    }
+    if resolved.is_dir() {
+        return Err(format!(
+            "save destination is a directory: {}",
+            resolved.display()
+        ));
+    }
+    let original = snapshot.path.clone();
+    snapshot.path = resolved.clone();
+    if resolved.exists() {
+        let bytes = std::fs::read(&resolved)
+            .map_err(|error| format!("cannot inspect destination: {error}"))?;
+        snapshot.expected_disk_hash = Some(disk_content_hash(&bytes));
+        let plan = SaveAsPlan {
+            tab,
+            snapshot: snapshot.clone(),
+        };
+        if original == resolved {
+            Ok(SaveAsInspection::Ready(plan))
+        } else {
+            Ok(SaveAsInspection::ConfirmOverwrite(plan))
+        }
+    } else {
+        snapshot.expected_disk_hash = None;
+        Ok(SaveAsInspection::Ready(SaveAsPlan {
+            tab,
+            snapshot: snapshot.clone(),
+        }))
     }
 }
 
@@ -470,5 +934,58 @@ fn detect_color_mode() -> ColorMode {
         ColorMode::TrueColor
     } else {
         ColorMode::Ansi256
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn save_snapshot(root: &std::path::Path) -> SaveSnapshot {
+        let mut buffer = TextBuffer::empty(Some(root.join("original.rs")), false);
+        buffer.insert("fn main() {}").unwrap();
+        buffer.prepare_save().unwrap()
+    }
+
+    #[test]
+    fn save_as_inspection_distinguishes_new_and_existing_targets() {
+        let directory = std::env::temp_dir().join(format!("mica-save-as-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let root = WorkspaceRoot::new(&directory).unwrap();
+
+        let mut snapshot = save_snapshot(&directory);
+        let new = inspect_save_as(&root, "new.rs".into(), 0, &mut snapshot).unwrap();
+        assert!(matches!(new, SaveAsInspection::Ready(_)));
+
+        std::fs::write(directory.join("existing.rs"), b"existing").unwrap();
+        let mut snapshot = save_snapshot(&directory);
+        let existing = inspect_save_as(&root, "existing.rs".into(), 0, &mut snapshot).unwrap();
+        let SaveAsInspection::ConfirmOverwrite(plan) = existing else {
+            panic!("existing target must require confirmation");
+        };
+        assert_eq!(
+            plan.snapshot.expected_disk_hash,
+            Some(disk_content_hash(b"existing"))
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_as_rejects_symlink_destination() {
+        use std::os::unix::fs::symlink;
+
+        let directory =
+            std::env::temp_dir().join(format!("mica-save-as-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("target"), b"keep").unwrap();
+        symlink(directory.join("target"), directory.join("link")).unwrap();
+        let root = WorkspaceRoot::new(&directory).unwrap();
+        let mut snapshot = save_snapshot(&directory);
+        assert!(inspect_save_as(&root, "link".into(), 0, &mut snapshot).is_err());
+        assert_eq!(std::fs::read(directory.join("target")).unwrap(), b"keep");
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

@@ -18,6 +18,7 @@ UTF-8・grapheme対応バッファ、Undo/Redo、安全な置換保存、ワー�
 階層Explorer、プレビュー付きファジーファイル検索、バッファ検索、Unicode範囲選択、
 内部/OSC 52クリップボード、Rust用Tree-sitterハイライト、クラッシュ復旧ジャーナル、
 セッション復元、タブ操作、設定・CLI、基本TUIを備える。
+保存とSave Asは外部変更を再検証し、既存ファイルの置換前に確認する。
 
 ```bash
 cargo run -- .
