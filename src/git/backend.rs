@@ -141,10 +141,17 @@ impl GitCliBackend {
         {
             Ok(output)
         } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            tracing::warn!(
+                args = ?display_args(&args),
+                exit_code = ?output.status.code(),
+                stderr = %stderr,
+                "git command failed"
+            );
             Err(GitError {
                 args: display_args(&args),
                 exit_code: output.status.code(),
-                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                stderr,
             })
         }
     }

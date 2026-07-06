@@ -8,13 +8,30 @@ use crate::{
     workspace::{DeletePlan, FileTree},
 };
 
+/// Distinguishes the unit a requested cursor column is expressed in.
+///
+/// Callers that already work in Unicode scalar (char) offsets — the CLI
+/// `--column` flag, workspace search matches, git hunk line numbers — use
+/// [`ColumnHint::Chars`]. Positions that originate from an LSP response
+/// (`range.start.character`) are UTF-16 code units per the LSP spec and must
+/// use [`ColumnHint::Utf16`] so `AppEvent::FileOpened` can convert them
+/// against the actual loaded line content instead of assuming 1 unit == 1
+/// char, which is wrong for any non-BMP character preceding the target.
+#[derive(Debug, Clone, Copy)]
+pub enum ColumnHint {
+    /// A 1-based Unicode scalar (char) column.
+    Chars(usize),
+    /// A 1-based UTF-16 code-unit column, as returned by the LSP.
+    Utf16(usize),
+}
+
 #[derive(Debug)]
 pub enum AppEvent {
     Command(Command),
     FileOpened {
         path: PathBuf,
         line: Option<usize>,
-        column: Option<usize>,
+        column: Option<ColumnHint>,
         result: Result<TextBuffer, String>,
     },
     TreeLoaded(Result<FileTree, String>),
@@ -118,7 +135,7 @@ pub enum Effect {
         path: PathBuf,
         read_only: bool,
         line: Option<usize>,
-        column: Option<usize>,
+        column: Option<ColumnHint>,
     },
     ScanWorkspace,
     Save {
@@ -202,6 +219,17 @@ pub enum Effect {
     SendLsp {
         language: String,
         message: serde_json::Value,
+    },
+    /// A `textDocument/didChange` full-document sync. Carries a `Rope`
+    /// (cloning it is O(1)) rather than a pre-built JSON message so the
+    /// per-edit cost of stringifying the whole document and constructing
+    /// its JSON payload runs on the LSP client's writer thread, not the UI
+    /// thread that produces this effect on every keystroke.
+    SendLspChange {
+        language: String,
+        uri: String,
+        version: i32,
+        text: ropey::Rope,
     },
     StopLsp {
         language: String,

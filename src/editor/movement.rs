@@ -2,22 +2,36 @@ use ropey::Rope;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+/// How far to look back/forward from the cursor when finding the adjacent
+/// grapheme boundary. Comfortably larger than any real grapheme cluster
+/// (even long ZWJ emoji sequences), so segmentation within the window agrees
+/// with segmenting the whole buffer, while keeping `move_left`/`move_right`
+/// O(window) instead of O(buffer length) per keypress.
+const GRAPHEME_SCAN_WINDOW: usize = 256;
+
 pub fn move_left(text: &Rope, char_offset: usize) -> usize {
     if char_offset == 0 {
         return 0;
     }
-    let prefix = text.slice(..char_offset).to_string();
+    let window_start = char_offset.saturating_sub(GRAPHEME_SCAN_WINDOW);
+    let prefix = text.slice(window_start..char_offset).to_string();
     prefix
         .grapheme_indices(true)
         .next_back()
-        .map_or(0, |(byte, _)| prefix[..byte].chars().count())
+        .map_or(window_start, |(byte, _)| {
+            window_start + prefix[..byte].chars().count()
+        })
 }
 
 pub fn move_right(text: &Rope, char_offset: usize) -> usize {
-    if char_offset >= text.len_chars() {
-        return text.len_chars();
+    let len_chars = text.len_chars();
+    if char_offset >= len_chars {
+        return len_chars;
     }
-    let suffix = text.slice(char_offset..).to_string();
+    let window_end = char_offset
+        .saturating_add(GRAPHEME_SCAN_WINDOW)
+        .min(len_chars);
+    let suffix = text.slice(char_offset..window_end).to_string();
     suffix
         .graphemes(true)
         .next()
@@ -143,5 +157,66 @@ mod tests {
     #[test]
     fn display_width_handles_cjk_and_tabs() {
         assert_eq!(display_column("a\t日本", 4, 4), 8);
+    }
+
+    /// Full-buffer-scan reference implementations mirroring the pre-windowed
+    /// `move_left`/`move_right` logic, kept only in this test so the
+    /// windowed (bounded-slice) implementation can be checked against the
+    /// same semantics on a buffer far larger than `GRAPHEME_SCAN_WINDOW`.
+    fn reference_move_left(text: &Rope, char_offset: usize) -> usize {
+        if char_offset == 0 {
+            return 0;
+        }
+        let prefix = text.slice(..char_offset).to_string();
+        prefix
+            .grapheme_indices(true)
+            .next_back()
+            .map_or(0, |(byte, _)| prefix[..byte].chars().count())
+    }
+
+    fn reference_move_right(text: &Rope, char_offset: usize) -> usize {
+        if char_offset >= text.len_chars() {
+            return text.len_chars();
+        }
+        let suffix = text.slice(char_offset..).to_string();
+        suffix
+            .graphemes(true)
+            .next()
+            .map_or(char_offset, |grapheme| {
+                char_offset + grapheme.chars().count()
+            })
+    }
+
+    #[test]
+    fn windowed_movement_matches_full_scan_reference_on_a_large_buffer() {
+        // Bigger than GRAPHEME_SCAN_WINDOW so the windowed implementation
+        // must slice a bounded region rather than the whole buffer, and mixed
+        // with multi-char graphemes so a window boundary landing mid-cluster
+        // is actually exercised.
+        let mut content = "line of plain ascii text ".repeat(200);
+        content.push_str("日本語 emoji 👩‍💻 more 日本語 ");
+        content.push_str(&"x".repeat(50));
+        let rope = Rope::from_str(&content);
+        let len = rope.len_chars();
+
+        // Check near both ends and around the multi-byte cluster in the
+        // middle, since that is where a naive window could misbehave.
+        let mut probes: Vec<usize> = (0..=20).collect();
+        probes.extend((len.saturating_sub(20)..=len).collect::<Vec<_>>());
+        let middle = len / 2;
+        probes.extend((middle.saturating_sub(20)..=(middle + 20).min(len)).collect::<Vec<_>>());
+
+        for offset in probes {
+            assert_eq!(
+                move_left(&rope, offset),
+                reference_move_left(&rope, offset),
+                "move_left mismatch at offset {offset}"
+            );
+            assert_eq!(
+                move_right(&rope, offset),
+                reference_move_right(&rope, offset),
+                "move_right mismatch at offset {offset}"
+            );
+        }
     }
 }

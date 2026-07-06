@@ -2,7 +2,7 @@ use std::{path::PathBuf, sync::atomic::Ordering};
 
 use crate::{
     app::{
-        AppEvent, AppState, BottomPanelView, BufferTab, Effect, FileOperationRequest,
+        AppEvent, AppState, BottomPanelView, BufferTab, ColumnHint, Effect, FileOperationRequest,
         FileOperationResult, Focus, Overlay, PathAction, SaveAsInspection, SaveAsPlan, SidebarView,
     },
     buffer::{CharOffset, ExternalChangeOutcome, Selection},
@@ -31,12 +31,7 @@ impl AppState {
                         {
                             self.active_tab = Some(existing);
                         } else {
-                            self.tabs.push(BufferTab {
-                                buffer,
-                                view: Default::default(),
-                                highlights: Vec::new(),
-                                syntax_generation: 0,
-                            });
+                            self.tabs.push(BufferTab::new(buffer));
                             self.active_tab = Some(self.tabs.len() - 1);
                         }
                         if let Some(tab) =
@@ -48,9 +43,21 @@ impl AppState {
                                     .saturating_sub(1)
                                     .min(tab.buffer.text().len_lines().saturating_sub(1));
                                 let line_start = tab.buffer.text().line_to_char(target_line);
-                                let line_len = tab.buffer.text().line(target_line).len_chars();
-                                let target_column =
-                                    column.unwrap_or(1).saturating_sub(1).min(line_len);
+                                let line_text = tab.buffer.text().line(target_line).to_string();
+                                let line_len = line_text.chars().count();
+                                let target_column = match column {
+                                    Some(ColumnHint::Chars(value)) => {
+                                        value.saturating_sub(1).min(line_len)
+                                    }
+                                    Some(ColumnHint::Utf16(value)) => {
+                                        crate::lsp::utf16_column_to_char(
+                                            &line_text,
+                                            value.saturating_sub(1),
+                                        )
+                                        .min(line_len)
+                                    }
+                                    None => 0,
+                                };
                                 line_start + target_column
                             });
                             tab.buffer
@@ -716,7 +723,7 @@ impl AppState {
                     path,
                     read_only: self.force_read_only,
                     line: Some(hunk.new_start.max(1)),
-                    column: Some(1),
+                    column: Some(ColumnHint::Chars(1)),
                 }]
             }
             Command::WorkspaceSearchInput(character) => {
@@ -747,7 +754,7 @@ impl AppState {
                     path: self.workspace.as_path().join(matched.path),
                     read_only: self.force_read_only,
                     line: Some(matched.line),
-                    column: Some(matched.column),
+                    column: Some(ColumnHint::Chars(matched.column)),
                 }]
             }
             Command::WorkspaceSearchOpen => {
@@ -763,7 +770,7 @@ impl AppState {
                     path: self.workspace.as_path().join(matched.path),
                     read_only: self.force_read_only,
                     line: Some(matched.line),
-                    column: Some(matched.column),
+                    column: Some(ColumnHint::Chars(matched.column)),
                 }]
             }
             Command::WorkspaceSearchToggleCase => {
@@ -878,7 +885,12 @@ impl AppState {
                     path: diagnostic.file,
                     read_only: self.force_read_only,
                     line: Some(diagnostic.range.start.line + 1),
-                    column: Some(diagnostic.range.start.column + 1),
+                    // Note: `range.start.column` here is itself UTF-16-derived
+                    // (see `lsp_diagnostic`'s `position` closure), so this
+                    // inherits the same latent non-BMP-column bug that Fix 1
+                    // addresses for definition jumps. Left as `Chars` to keep
+                    // this change scoped to `PendingLspRequest::Definition`.
+                    column: Some(ColumnHint::Chars(diagnostic.range.start.column + 1)),
                 }]
             }
             Command::DiagnosticCycleFilter => {
@@ -1194,7 +1206,7 @@ impl AppState {
                         else {
                             return Vec::new();
                         };
-                        self.edit(|tab| tab.buffer.insert(&completion.insert_text));
+                        self.apply_completion(&completion);
                         return self.active_post_edit_effects();
                     }
                     None => {}
@@ -1599,6 +1611,32 @@ impl AppState {
         }
     }
 
+    /// Accepts a completion, replacing `replace_range` (when the server gave
+    /// one via `textEdit`) instead of always inserting at the cursor — a
+    /// plain cursor insert would duplicate whatever prefix the user already
+    /// typed (e.g. completing `ver` -> `version` would yield `verversion`).
+    fn apply_completion(&mut self, completion: &crate::app::CompletionCandidate) {
+        let insert_text = completion.insert_text.clone();
+        let replace_range = completion.replace_range;
+        self.edit(|tab| {
+            if let Some((start, end)) = replace_range {
+                let text = tab.buffer.text().to_string();
+                let len_chars = tab.buffer.text().len_chars();
+                let mut start_offset =
+                    crate::lsp::position_to_char_offset(&text, start).min(len_chars);
+                let mut end_offset = crate::lsp::position_to_char_offset(&text, end).min(len_chars);
+                if start_offset > end_offset {
+                    std::mem::swap(&mut start_offset, &mut end_offset);
+                }
+                tab.buffer.set_selection(Selection {
+                    anchor: CharOffset(start_offset),
+                    head: CharOffset(end_offset),
+                });
+            }
+            tab.buffer.insert(&insert_text)
+        });
+    }
+
     fn selected_git_operation(&mut self, stage: bool) -> Vec<Effect> {
         let Some((path, target)) = self.git_entries().get(self.git_selected).cloned() else {
             return Vec::new();
@@ -1722,23 +1760,23 @@ impl AppState {
     fn active_lsp_change_effect(&mut self) -> Option<Effect> {
         let tab = self.active_tab()?;
         let path = tab.buffer.path()?.to_path_buf();
-        let text = tab.buffer.text().to_string();
+        // `Rope::clone` is O(1) (structural sharing), unlike the
+        // `.to_string()` this replaced, so cloning it here — ahead of the
+        // mutable borrow below — is not the "heavy work on the UI thread"
+        // Fix 5 is about; the actual document stringification now happens
+        // on the LSP client's writer thread, right before the write.
+        let text = tab.buffer.text().clone();
         let (language, _) = self.language_for_path(&path)?;
         if !self.lsp_started.contains(&language) {
             return None;
         }
         let version = self.lsp_versions.entry(path.clone()).or_insert(1);
         *version = version.saturating_add(1);
-        Some(Effect::SendLsp {
+        Some(Effect::SendLspChange {
             language,
-            message: serde_json::json!({
-                "jsonrpc":"2.0",
-                "method":"textDocument/didChange",
-                "params": {
-                    "textDocument": {"uri": file_uri(&path), "version": *version},
-                    "contentChanges": [{"text": text}]
-                }
-            }),
+            uri: file_uri(&path),
+            version: *version,
+            text,
         })
     }
 
@@ -1817,6 +1855,7 @@ impl AppState {
                     self.lsp_diagnostic_generation,
                 );
                 let message = format!("LSP {language} exited ({code:?})");
+                tracing::warn!(language = %language, ?code, "LSP process exited");
                 self.append_output("lsp", &message);
                 self.notification = Some(message);
                 self.lsp_restart_effects(&language)
@@ -1824,6 +1863,7 @@ impl AppState {
             crate::lsp::LspClientEvent::Error(error) => {
                 self.lsp_started.remove(&language);
                 self.lsp_starting.remove(&language);
+                tracing::warn!(language = %language, error = %error, "LSP client error");
                 if self.lsp_warned.insert(language.clone()) {
                     self.notification = Some(format!("LSP {language}: {error}"));
                 }
@@ -1839,6 +1879,7 @@ impl AppState {
         }];
         let restarts = self.lsp_restarts.entry(language.to_owned()).or_default();
         if *restarts >= 3 {
+            tracing::warn!(language = %language, "LSP restart limit reached; giving up");
             self.append_output("lsp", format!("{language}: restart limit reached"));
             return effects;
         }
@@ -1899,7 +1940,7 @@ impl AppState {
     fn lsp_request_effect(
         &mut self,
         method: &str,
-        request: crate::app::PendingLspRequest,
+        make_request: impl FnOnce(PathBuf) -> crate::app::PendingLspRequest,
     ) -> Vec<Effect> {
         let Some(tab) = self.active_tab() else {
             return Vec::new();
@@ -1918,7 +1959,10 @@ impl AppState {
         }
         let id = self.lsp_next_request_id;
         self.lsp_next_request_id = self.lsp_next_request_id.saturating_add(1);
-        self.lsp_pending.insert(id, request);
+        // Tag the pending request with the file it was made against, so a
+        // response that arrives after the user has switched tabs can be
+        // recognized as stale (Fix 7; see `PendingLspRequest`).
+        self.lsp_pending.insert(id, make_request(path.clone()));
         let position = crate::lsp::char_offset_to_position(&text, cursor);
         vec![Effect::SendLsp {
             language,
@@ -1941,7 +1985,11 @@ impl AppState {
             return Vec::new();
         };
         match request {
-            crate::app::PendingLspRequest::Hover => {
+            crate::app::PendingLspRequest::Hover(path) => {
+                if !self.is_active_path(&path) {
+                    self.notification = Some("Stale LSP response discarded".to_owned());
+                    return Vec::new();
+                }
                 self.lsp_hover = hover_lines(result);
                 if self.lsp_hover.is_empty() {
                     self.notification = Some("No hover information".to_owned());
@@ -1951,7 +1999,11 @@ impl AppState {
                 }
                 Vec::new()
             }
-            crate::app::PendingLspRequest::Definition => {
+            // `Definition` is intentionally not guarded: it jumps by opening
+            // the target file explicitly out of the response, which is
+            // correct regardless of which tab happens to be active when the
+            // response arrives.
+            crate::app::PendingLspRequest::Definition(_) => {
                 let location = if result.is_array() {
                     result.as_array().and_then(|items| items.first())
                 } else {
@@ -1985,10 +2037,18 @@ impl AppState {
                     path,
                     read_only: self.force_read_only,
                     line: Some(line),
-                    column: Some(column),
+                    // `character` is UTF-16 code units per the LSP spec (Fix
+                    // 1); `AppEvent::FileOpened` converts it against the
+                    // loaded line's real content instead of treating it as a
+                    // char column.
+                    column: Some(ColumnHint::Utf16(column)),
                 }]
             }
-            crate::app::PendingLspRequest::Completion => {
+            crate::app::PendingLspRequest::Completion(path) => {
+                if !self.is_active_path(&path) {
+                    self.notification = Some("Stale LSP response discarded".to_owned());
+                    return Vec::new();
+                }
                 let items = result
                     .as_array()
                     .or_else(|| result.get("items").and_then(serde_json::Value::as_array));
@@ -2114,13 +2174,27 @@ impl AppState {
 
     fn active_syntax_effect(&mut self) -> Option<Effect> {
         let tab_index = self.active_tab?;
-        let tab = self.tabs.get_mut(tab_index)?;
-        let language = tab
+        // Resolve the language before taking a mutable borrow of the tab
+        // below: `language_for_path` is settings-driven (the same mapping
+        // LSP uses) and takes precedence, so syntax highlighting and LSP
+        // language detection agree; `from_extension` is only a fallback for
+        // extensions with no entry in `settings.languages` (Fix 8).
+        let path = self
+            .tabs
+            .get(tab_index)?
             .buffer
             .path()
-            .and_then(|path| path.extension())
-            .and_then(|extension| extension.to_str())
-            .and_then(editor::SyntaxLanguage::from_extension);
+            .map(std::path::Path::to_path_buf);
+        let language = path.as_deref().and_then(|path| {
+            self.language_for_path(path)
+                .and_then(|(name, _)| editor::SyntaxLanguage::from_language_name(&name))
+                .or_else(|| {
+                    path.extension()
+                        .and_then(|extension| extension.to_str())
+                        .and_then(editor::SyntaxLanguage::from_extension)
+                })
+        });
+        let tab = self.tabs.get_mut(tab_index)?;
         let threshold = self
             .settings
             .editor
@@ -2184,12 +2258,7 @@ impl AppState {
                 self.force_read_only,
             );
             buffer.set_selection(Selection::caret(CharOffset(recovered.cursor_char)));
-            let recovered_tab = BufferTab {
-                buffer,
-                view: Default::default(),
-                highlights: Vec::new(),
-                syntax_generation: 0,
-            };
+            let recovered_tab = BufferTab::new(buffer);
             if let Some(index) = recovered.path.as_deref().and_then(|path| {
                 self.tabs
                     .iter()
@@ -2487,7 +2556,29 @@ fn completion_candidate(value: &serde_json::Value) -> Option<crate::app::Complet
             .get("detail")
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned),
+        replace_range: completion_replace_range(value),
     })
+}
+
+/// Parses the range `textEdit` says the completion's `newText` should
+/// replace. Handles both a plain LSP `TextEdit` (`range`) and an
+/// `InsertReplaceEdit` (`insert`/`replace`), preferring `insert` for the
+/// latter since that is the range that covers what the user already typed.
+fn completion_replace_range(
+    value: &serde_json::Value,
+) -> Option<(lsp_types::Position, lsp_types::Position)> {
+    let edit = value.get("textEdit")?;
+    let range = edit.get("range").or_else(|| edit.get("insert"))?;
+    let start = completion_position(range.get("start")?)?;
+    let end = completion_position(range.get("end")?)?;
+    Some((start, end))
+}
+
+fn completion_position(value: &serde_json::Value) -> Option<lsp_types::Position> {
+    Some(lsp_types::Position::new(
+        value.get("line")?.as_u64()? as u32,
+        value.get("character")?.as_u64()? as u32,
+    ))
 }
 
 #[cfg(test)]
@@ -2515,12 +2606,7 @@ mod tests {
         let mut state = state();
         let mut buffer = TextBuffer::empty(None, false);
         buffer.insert("unsaved").unwrap();
-        state.tabs.push(BufferTab {
-            buffer,
-            view: Default::default(),
-            highlights: Vec::new(),
-            syntax_generation: 0,
-        });
+        state.tabs.push(BufferTab::new(buffer));
         state.active_tab = Some(0);
 
         state.update(AppEvent::Command(Command::CloseTab(0)));
@@ -2544,12 +2630,7 @@ mod tests {
             anchor: CharOffset(0),
             head: CharOffset(2),
         });
-        state.tabs.push(BufferTab {
-            buffer,
-            view: Default::default(),
-            highlights: Vec::new(),
-            syntax_generation: 0,
-        });
+        state.tabs.push(BufferTab::new(buffer));
         state.active_tab = Some(0);
 
         let effects = state.update(AppEvent::Command(Command::Invoke(
@@ -2571,12 +2652,7 @@ mod tests {
         let mut buffer = TextBuffer::empty(None, false);
         buffer.insert("a日 a日").unwrap();
         buffer.set_selection(Selection::caret(CharOffset(0)));
-        state.tabs.push(BufferTab {
-            buffer,
-            view: Default::default(),
-            highlights: Vec::new(),
-            syntax_generation: 0,
-        });
+        state.tabs.push(BufferTab::new(buffer));
         state.active_tab = Some(0);
         state.update(AppEvent::Command(Command::Invoke(
             command::EDITOR_FIND.to_owned(),
@@ -2729,12 +2805,9 @@ mod tests {
     fn branch_completion_refreshes_tree_and_open_buffers() {
         let mut state = state();
         let path = state.workspace.as_path().join("open.rs");
-        state.tabs.push(BufferTab {
-            buffer: TextBuffer::empty(Some(path.clone()), false),
-            view: Default::default(),
-            highlights: Vec::new(),
-            syntax_generation: 0,
-        });
+        state
+            .tabs
+            .push(BufferTab::new(TextBuffer::empty(Some(path.clone()), false)));
         let effects = state.update(AppEvent::GitOperationCompleted {
             result: Ok("Switched".to_owned()),
             workspace_changed: true,
@@ -2795,12 +2868,7 @@ mod tests {
         let path = state.workspace.as_path().join("live.rs");
         let mut buffer = TextBuffer::empty(Some(path.clone()), false);
         buffer.insert("unsaved needle").unwrap();
-        state.tabs.push(BufferTab {
-            buffer,
-            view: Default::default(),
-            highlights: Vec::new(),
-            syntax_generation: 0,
-        });
+        state.tabs.push(BufferTab::new(buffer));
         state.sidebar_view = SidebarView::Search;
 
         let effects = state.update(AppEvent::Command(Command::WorkspaceSearchInput('n')));
@@ -2944,6 +3012,203 @@ mod tests {
     }
 
     #[test]
+    fn utf16_column_hint_lands_past_non_bmp_characters_on_the_target_line() {
+        let mut state = state();
+        let path = state.workspace.as_path().join("unicode_definition.rs");
+        let mut buffer = TextBuffer::empty(Some(path.clone()), false);
+        // Line 2 (1-based) contains two non-BMP emoji before `foo`; a naive
+        // "1 UTF-16 unit == 1 char" conversion would land inside the string
+        // literal instead of at `foo`.
+        buffer.insert("a\nlet s = \"😀😀\"; foo();\n").unwrap();
+        // `character` 16 (0-based UTF-16 units) is where `foo` starts on that
+        // line; requests are carried 1-based, so the hint is 17.
+        state.update(AppEvent::FileOpened {
+            path: path.clone(),
+            line: Some(2),
+            column: Some(ColumnHint::Utf16(17)),
+            result: Ok(buffer),
+        });
+        let tab = &state.tabs[state.active_tab.unwrap()];
+        let line_start = tab.buffer.text().line_to_char(1);
+        let cursor = tab.buffer.selection().head.0;
+        assert_eq!(cursor - line_start, 14, "cursor should land right at `foo`");
+        let rest_of_line = tab.buffer.text().slice(cursor..).to_string();
+        assert!(
+            rest_of_line.starts_with("foo"),
+            "expected cursor at `foo`, got: {rest_of_line:?}"
+        );
+    }
+
+    #[test]
+    fn completion_candidate_parses_insert_replace_edit_using_the_insert_range() {
+        let item = serde_json::json!({
+            "label": "version",
+            "textEdit": {
+                "insert": {"start": {"line": 1, "character": 2}, "end": {"line": 1, "character": 5}},
+                "replace": {"start": {"line": 1, "character": 2}, "end": {"line": 1, "character": 9}},
+                "newText": "version"
+            }
+        });
+        let candidate = completion_candidate(&item).expect("valid completion item");
+        assert_eq!(candidate.insert_text, "version");
+        assert_eq!(
+            candidate.replace_range,
+            Some((
+                lsp_types::Position::new(1, 2),
+                lsp_types::Position::new(1, 5)
+            ))
+        );
+    }
+
+    #[test]
+    fn accepting_a_completion_replaces_the_textedit_range_instead_of_duplicating_the_prefix() {
+        let mut state = state();
+        let path = state.workspace.as_path().join("main.rs");
+        let mut buffer = TextBuffer::empty(Some(path.clone()), false);
+        buffer.insert("ver").unwrap();
+        state.tabs.push(BufferTab::new(buffer));
+        state.active_tab = Some(0);
+        state.lsp_started.insert("rust".to_owned());
+
+        let effects = state.update(AppEvent::Command(Command::Invoke(
+            command::LSP_COMPLETION.to_owned(),
+        )));
+        let id = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::SendLsp { message, .. } => message.get("id")?.as_u64(),
+                _ => None,
+            })
+            .unwrap();
+        state.update(AppEvent::LspClient {
+            language: "rust".to_owned(),
+            event: crate::lsp::LspClientEvent::Message(serde_json::json!({
+                "jsonrpc":"2.0","id":id,"result":{"items":[{
+                    "label":"version",
+                    "textEdit": {
+                        "range": {"start":{"line":0,"character":0},"end":{"line":0,"character":3}},
+                        "newText": "version"
+                    }
+                }]}
+            })),
+        });
+        assert!(matches!(state.overlay, Some(Overlay::LspCompletion)));
+
+        state.update(AppEvent::Command(Command::PaletteAccept));
+        assert_eq!(
+            state.tabs[0].buffer.text_string(),
+            "version",
+            "accepting the completion must replace `ver`, not append to it"
+        );
+    }
+
+    #[test]
+    fn stale_hover_and_completion_responses_are_discarded_after_switching_tabs() {
+        let mut state = state();
+        let path_a = state.workspace.as_path().join("a.rs");
+        let path_b = state.workspace.as_path().join("b.rs");
+        for path in [&path_a, &path_b] {
+            let mut buffer = TextBuffer::empty(Some(path.clone()), false);
+            buffer.insert("fn main() {}").unwrap();
+            state.tabs.push(BufferTab::new(buffer));
+        }
+        state.active_tab = Some(0);
+        state.lsp_started.insert("rust".to_owned());
+
+        let effects = state.update(AppEvent::Command(Command::Invoke(
+            command::LSP_HOVER.to_owned(),
+        )));
+        let hover_id = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::SendLsp { message, .. } => message.get("id")?.as_u64(),
+                _ => None,
+            })
+            .unwrap();
+
+        // The user switches to another tab before the response arrives.
+        state.active_tab = Some(1);
+        state.update(AppEvent::LspClient {
+            language: "rust".to_owned(),
+            event: crate::lsp::LspClientEvent::Message(serde_json::json!({
+                "jsonrpc":"2.0","id":hover_id,"result":{"contents":"stale hover"}
+            })),
+        });
+        assert!(
+            !matches!(state.overlay, Some(Overlay::LspHover)),
+            "a stale hover response must not open the hover overlay"
+        );
+        assert_eq!(
+            state.notification.as_deref(),
+            Some("Stale LSP response discarded")
+        );
+        assert!(state.lsp_hover.is_empty());
+
+        // Same story for completion: request from tab 0, respond after
+        // switching to tab 1.
+        state.active_tab = Some(0);
+        let effects = state.update(AppEvent::Command(Command::Invoke(
+            command::LSP_COMPLETION.to_owned(),
+        )));
+        let completion_id = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::SendLsp { message, .. } => message.get("id")?.as_u64(),
+                _ => None,
+            })
+            .unwrap();
+        state.active_tab = Some(1);
+        state.update(AppEvent::LspClient {
+            language: "rust".to_owned(),
+            event: crate::lsp::LspClientEvent::Message(serde_json::json!({
+                "jsonrpc":"2.0","id":completion_id,"result":[{"label":"stale"}]
+            })),
+        });
+        assert!(
+            !matches!(state.overlay, Some(Overlay::LspCompletion)),
+            "a stale completion response must not open the completion overlay"
+        );
+        assert!(state.lsp_completions.is_empty());
+    }
+
+    #[test]
+    fn syntax_language_resolves_via_settings_and_falls_back_to_extension() {
+        let mut state = state();
+
+        // "rust" is in `settings.languages` (used for LSP), so this must go
+        // through `SyntaxLanguage::from_language_name`, not `from_extension`.
+        let rust_path = state.workspace.as_path().join("main.rs");
+        let mut rust_buffer = TextBuffer::empty(Some(rust_path.clone()), false);
+        rust_buffer.insert("fn main() {}").unwrap();
+        let effects = state.update(AppEvent::FileOpened {
+            path: rust_path,
+            line: None,
+            column: None,
+            result: Ok(rust_buffer),
+        });
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::HighlightSyntax { language, .. } if *language == editor::SyntaxLanguage::Rust
+        )));
+
+        // TOML has no default entry in `settings.languages` (no LSP server
+        // configured for it), so this must fall back to `from_extension`.
+        let toml_path = state.workspace.as_path().join("Cargo.toml");
+        let mut toml_buffer = TextBuffer::empty(Some(toml_path.clone()), false);
+        toml_buffer.insert("[package]\n").unwrap();
+        let effects = state.update(AppEvent::FileOpened {
+            path: toml_path,
+            line: None,
+            column: None,
+            result: Ok(toml_buffer),
+        });
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::HighlightSyntax { language, .. } if *language == editor::SyntaxLanguage::Toml
+        )));
+    }
+
+    #[test]
     fn rust_file_lazily_starts_lsp_and_sends_full_document_changes() {
         let mut state = state();
         let path = state.workspace.as_path().join("main.rs");
@@ -2971,12 +3236,11 @@ mod tests {
                     == Some("textDocument/didOpen")
         )));
         let effects = state.update(AppEvent::Command(Command::InsertText("x".to_owned())));
-        assert!(effects.iter().any(|effect| matches!(
-            effect,
-            Effect::SendLsp { message, .. }
-                if message.get("method").and_then(serde_json::Value::as_str)
-                    == Some("textDocument/didChange")
-        )));
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::SendLspChange { version: 2, .. }))
+        );
     }
 
     #[test]
@@ -2985,12 +3249,7 @@ mod tests {
         let path = state.workspace.as_path().join("unicode.rs");
         let mut buffer = TextBuffer::empty(Some(path.clone()), false);
         buffer.insert("a😀value").unwrap();
-        state.tabs.push(BufferTab {
-            buffer,
-            view: Default::default(),
-            highlights: Vec::new(),
-            syntax_generation: 0,
-        });
+        state.tabs.push(BufferTab::new(buffer));
         state.active_tab = Some(0);
         state.lsp_started.insert("rust".to_owned());
         state.update(AppEvent::LspClient {

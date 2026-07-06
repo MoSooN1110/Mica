@@ -32,6 +32,20 @@ pub enum LspClientEvent {
 #[derive(Debug)]
 pub enum LspClientCommand {
     Send(Value),
+    /// A `textDocument/didChange` full-document sync, carried as a `Rope`
+    /// instead of a pre-built JSON `Value`. Cloning a `Rope` is O(1)
+    /// (structural sharing), so constructing this effect on the UI thread is
+    /// cheap; the expensive part — stringifying the whole document and
+    /// building the JSON payload — happens here, on this client's dedicated
+    /// writer thread, right before the message is written. Sent over the
+    /// same channel as `Send`, so per-document version ordering is
+    /// preserved: this is a single-consumer FIFO, not a detached spawn per
+    /// edit.
+    SendDidChange {
+        uri: String,
+        version: i32,
+        text: ropey::Rope,
+    },
     Shutdown,
 }
 
@@ -57,6 +71,20 @@ impl LspClient {
     pub fn send(&self, message: Value) -> Result<(), String> {
         self.commands
             .send(LspClientCommand::Send(message))
+            .map_err(|error| error.to_string())
+    }
+
+    /// Queues a `textDocument/didChange` full-document sync without
+    /// stringifying the buffer or building its JSON payload on the caller's
+    /// thread (see [`LspClientCommand::SendDidChange`]).
+    pub fn send_did_change(
+        &self,
+        uri: String,
+        version: i32,
+        text: ropey::Rope,
+    ) -> Result<(), String> {
+        self.commands
+            .send(LspClientCommand::SendDidChange { uri, version, text })
             .map_err(|error| error.to_string())
     }
 
@@ -209,6 +237,24 @@ fn run_client(
         }
         match commands.recv_timeout(Duration::from_millis(20)) {
             Ok(LspClientCommand::Send(message)) if !shutting_down => {
+                if let Err(error) = write_message(&mut writer, &message) {
+                    emit(LspClientEvent::Error(error.to_string()));
+                    shutting_down = true;
+                    shutdown_started = Some(Instant::now());
+                }
+            }
+            Ok(LspClientCommand::SendDidChange { uri, version, text }) if !shutting_down => {
+                // Stringify the document and build the JSON payload here, on
+                // this dedicated writer thread, instead of on the UI thread
+                // that queued it.
+                let message = json!({
+                    "jsonrpc": "2.0",
+                    "method": "textDocument/didChange",
+                    "params": {
+                        "textDocument": {"uri": uri, "version": version},
+                        "contentChanges": [{"text": text.to_string()}]
+                    }
+                });
                 if let Err(error) = write_message(&mut writer, &message) {
                     emit(LspClientEvent::Error(error.to_string()));
                     shutting_down = true;

@@ -2,7 +2,6 @@ use lsp_types::Position;
 
 pub fn position_to_char_offset(text: &str, position: Position) -> usize {
     let target_line = position.line as usize;
-    let target_utf16 = position.character as usize;
     let mut line_start = 0usize;
     let mut current_line = 0usize;
     for (char_offset, character) in text.chars().enumerate() {
@@ -18,13 +17,25 @@ pub fn position_to_char_offset(text: &str, position: Position) -> usize {
     if current_line < target_line {
         return text.chars().count();
     }
-    let mut utf16 = 0usize;
-    let mut offset = line_start;
-    for character in text
+    let line: String = text
         .chars()
         .skip(line_start)
         .take_while(|character| *character != '\n')
-    {
+        .collect();
+    line_start + utf16_column_to_char(&line, position.character as usize)
+}
+
+/// Converts a UTF-16 code-unit column within a single line (no embedded
+/// newline) to a Unicode scalar (char) offset within that line.
+///
+/// Shared by [`position_to_char_offset`] and by the definition-jump path,
+/// which already has a single line's text loaded and only needs the
+/// per-line half of the conversion (see `ColumnHint::Utf16` in
+/// `crate::app::Effect::OpenFile`).
+pub fn utf16_column_to_char(line: &str, target_utf16: usize) -> usize {
+    let mut utf16 = 0usize;
+    let mut offset = 0usize;
+    for character in line.chars() {
         let width = character.len_utf16();
         if utf16 + width > target_utf16 {
             break;

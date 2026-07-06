@@ -38,10 +38,32 @@ impl SyntaxLanguage {
     /// Maps a file extension (without the leading dot) to a supported syntax
     /// language. Returns `None` for unsupported extensions, which callers
     /// treat as plain text.
+    ///
+    /// This is the fallback path for files with no matching entry in
+    /// `settings.languages` (`SPEC/06_diagnostics_lsp.md`'s LSP language
+    /// table) — see [`Self::from_language_name`], which most callers should
+    /// try first so syntax highlighting and LSP language detection agree.
     pub fn from_extension(extension: &str) -> Option<Self> {
         match extension {
             "rs" => Some(Self::Rust),
             "md" | "markdown" => Some(Self::Markdown),
+            "toml" => Some(Self::Toml),
+            _ => None,
+        }
+    }
+
+    /// Maps a `settings.languages` language name (e.g. `"rust"`,
+    /// `"markdown"`) to a supported syntax language. This is the
+    /// settings-driven counterpart to [`Self::from_extension`]: callers that
+    /// already resolved a language name for LSP purposes should use this
+    /// first, so a file's syntax highlighting and its LSP language always
+    /// agree, falling back to `from_extension` only when there is no
+    /// matching language configured in settings (e.g. TOML, which has no
+    /// default LSP entry but is still highlighted by extension).
+    pub fn from_language_name(name: &str) -> Option<Self> {
+        match name {
+            "rust" => Some(Self::Rust),
+            "markdown" => Some(Self::Markdown),
             "toml" => Some(Self::Toml),
             _ => None,
         }

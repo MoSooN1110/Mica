@@ -127,13 +127,29 @@ pub struct CompletionCandidate {
     pub label: String,
     pub insert_text: String,
     pub detail: Option<String>,
+    /// The range `insert_text` should replace, taken from the completion
+    /// item's `textEdit.range` (or `textEdit.insert` for an
+    /// `InsertReplaceEdit`). `None` means the server only gave `insertText` /
+    /// a plain label, so acceptance falls back to inserting at the cursor.
+    /// Positions are LSP (UTF-16) positions; convert with
+    /// `crate::lsp::position_to_char_offset` against the *current* buffer
+    /// text at accept time, since the buffer may have changed since the
+    /// request was sent.
+    pub replace_range: Option<(lsp_types::Position, lsp_types::Position)>,
 }
 
-#[derive(Debug, Clone, Copy)]
+/// A request sent to the LSP server, tagged with the file it was made
+/// against. `handle_lsp_response` uses this to detect and drop stale
+/// responses — ones that arrive after the user has switched to a different
+/// tab — for request kinds where applying them to whatever tab happens to
+/// be active would be wrong (`Hover`, `Completion`). `Definition` is exempt:
+/// it jumps by explicitly opening the target file from the response, so it
+/// is safe regardless of which tab is active when the response arrives.
+#[derive(Debug, Clone)]
 pub enum PendingLspRequest {
-    Hover,
-    Definition,
-    Completion,
+    Hover(PathBuf),
+    Definition(PathBuf),
+    Completion(PathBuf),
 }
 
 #[derive(Debug, Clone)]
@@ -153,6 +169,18 @@ pub struct BufferTab {
 }
 
 impl BufferTab {
+    /// Builds a tab around a freshly loaded/created buffer, with an empty
+    /// view, no highlights, and syntax generation `0` — the state every new
+    /// tab starts in before its first syntax pass runs.
+    pub fn new(buffer: TextBuffer) -> Self {
+        Self {
+            buffer,
+            view: Default::default(),
+            highlights: Vec::new(),
+            syntax_generation: 0,
+        }
+    }
+
     pub fn title(&self) -> String {
         self.buffer.path().and_then(Path::file_name).map_or_else(
             || "Untitled".to_owned(),
@@ -462,6 +490,13 @@ impl AppState {
 
     pub fn active_path(&self) -> Option<&Path> {
         self.active_tab().and_then(|tab| tab.buffer.path())
+    }
+
+    /// Whether `path` is the active tab's file. Used to discard LSP
+    /// responses (hover, completion) that arrive after the user has
+    /// switched away from the tab the request was made against.
+    pub fn is_active_path(&self, path: &Path) -> bool {
+        self.active_path() == Some(path)
     }
 
     pub fn palette_commands(&self) -> Vec<crate::command::CommandMeta> {

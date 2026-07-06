@@ -20,8 +20,8 @@ use crossterm::{
 };
 use mica::{
     app::{
-        AppEvent, AppState, BottomPanelView, Effect, ExternalFileRead, FileOperationRequest,
-        FileOperationResult, GitOperation, SaveAsInspection, SaveAsPlan,
+        AppEvent, AppState, BottomPanelView, ColumnHint, Effect, ExternalFileRead,
+        FileOperationRequest, FileOperationResult, GitOperation, SaveAsInspection, SaveAsPlan,
     },
     buffer::{BufferError, SaveSnapshot, TextBuffer, atomic_save_if_unchanged, disk_content_hash},
     cli::{Cli, CliLocale},
@@ -47,6 +47,7 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
+    init_tracing(cli.log_file.as_deref(), &cli.log_level);
     let current_dir = std::env::current_dir()?;
     let target = cli.resolve_target(&current_dir)?;
     let mut config = ConfigLoad::load(&target.workspace, cli.config.as_deref(), cli.safe_mode);
@@ -127,7 +128,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 path,
                 read_only: cli.readonly,
                 line: target.line,
-                column: target.column,
+                column: target.column.map(ColumnHint::Chars),
             }],
             &sender,
             &mut runtime,
@@ -140,6 +141,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let _watcher = match watcher {
         Ok(watcher) => Some(watcher),
         Err(error) => {
+            tracing::warn!(%error, "file watcher unavailable");
             state.notification = Some(format!("File watcher unavailable: {error}"));
             None
         }
@@ -183,20 +185,32 @@ fn event_loop(
     runtime: &mut Runtime,
 ) -> io::Result<()> {
     let mut regions = Regions::default();
+    // Redraw only when something could have changed what's on screen, rather
+    // than rebuilding every widget on every 50ms poll tick even while idle
+    // (previously a constant ~20fps redraw with no input or background
+    // activity). Starts `true` so the first iteration always draws.
+    // `regions` is only used for mouse hit-testing and is safe to leave
+    // stale between draws: it only goes stale when the screen changes, which
+    // is exactly when `needs_redraw` gets set again before the next draw.
+    let mut needs_redraw = true;
     while !state.should_quit {
         for _ in 0..256 {
             let Ok(event) = receiver.try_recv() else {
                 break;
             };
+            needs_redraw = true;
             let effects = state.update(event);
             execute_effects(state, effects, &sender, runtime);
             if let Some(journal) = session_journal {
                 journal.submit(state.session_snapshot());
             }
         }
-        terminal.draw(|frame| {
-            regions = render(frame, state, theme);
-        })?;
+        if needs_redraw {
+            terminal.draw(|frame| {
+                regions = render(frame, state, theme);
+            })?;
+            needs_redraw = false;
+        }
         if !event::poll(Duration::from_millis(50))? {
             continue;
         }
@@ -205,7 +219,10 @@ fn event_loop(
             Event::Mouse(mouse) if state.settings.editor.mouse => {
                 command_for_mouse(state, regions, mouse)
             }
-            Event::Resize(width, height) => Some(Command::Resize(width, height)),
+            Event::Resize(width, height) => {
+                needs_redraw = true;
+                Some(Command::Resize(width, height))
+            }
             Event::Paste(text)
                 if state.focus == mica::app::Focus::BottomPanel
                     && state.bottom_panel_view == BottomPanelView::Terminal =>
@@ -216,6 +233,7 @@ fn event_loop(
             _ => None,
         };
         if let Some(command) = command {
+            needs_redraw = true;
             let effects = state.update(AppEvent::Command(command));
             execute_effects(state, effects, &sender, runtime);
             if let Some(journal) = session_journal {
@@ -782,6 +800,21 @@ fn execute_effects(
                     });
                 }
             }
+            Effect::SendLspChange {
+                language,
+                uri,
+                version,
+                text,
+            } => {
+                if let Some(client) = runtime.lsp.get(&language)
+                    && let Err(error) = client.send_did_change(uri, version, text)
+                {
+                    let _ = sender.send(AppEvent::LspClient {
+                        language,
+                        event: mica::lsp::LspClientEvent::Error(error),
+                    });
+                }
+            }
             Effect::StopLsp { language } => {
                 if let Some(client) = runtime.lsp.remove(&language) {
                     thread::spawn(move || drop(client));
@@ -972,6 +1005,45 @@ fn install_panic_hook(mouse: bool) {
         let _ = execute!(output, DisableBracketedPaste, LeaveAlternateScreen);
         previous(info);
     }));
+}
+
+/// Initializes `tracing` to write to `log_file`, filtered by `log_level`,
+/// when `--log-file` was given. Installs nothing otherwise: the TUI must
+/// never print to stdout/stderr once it starts (raw mode + alternate
+/// screen), so tracing has no useful destination without an explicit file,
+/// and this must run before `TerminalGuard::enter`.
+///
+/// `log_level` is parsed leniently via `tracing_subscriber::EnvFilter` (it
+/// accepts both bare levels like `debug` and directives like
+/// `mica=debug,warn`); an unparsable value falls back to `info` rather than
+/// failing startup.
+fn init_tracing(log_file: Option<&Path>, log_level: &str) {
+    let Some(log_file) = log_file else {
+        return;
+    };
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_file)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!("mica: cannot open log file {}: {error}", log_file.display());
+            return;
+        }
+    };
+    let filter = tracing_subscriber::EnvFilter::try_new(log_level)
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::sync::Mutex::new(file))
+        .with_ansi(false)
+        .finish();
+    if tracing::subscriber::set_global_default(subscriber).is_err() {
+        eprintln!("mica: tracing subscriber was already installed");
+        return;
+    }
+    tracing::info!(log_file = %log_file.display(), log_level, "tracing initialized");
 }
 
 fn detect_color_mode() -> ColorMode {
