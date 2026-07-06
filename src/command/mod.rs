@@ -37,6 +37,7 @@ pub enum Command {
     GitHunkStageToggle,
     GitHunkRestore,
     GitHunkOpenFile,
+    EditorScroll(i32),
     WorkspaceSearchInput(char),
     WorkspaceSearchBackspace,
     WorkspaceSearchSelect(usize),
@@ -62,6 +63,10 @@ pub enum Command {
     DiagnosticOpen,
     DiagnosticCycleFilter,
     SelectTab(usize),
+    SplitEditor,
+    FocusNextEditorGroup,
+    FocusEditorGroup(bool),
+    CloseEditorSplit,
     CloseTab(usize),
     SetCursor {
         char_offset: usize,

@@ -935,10 +935,53 @@ fn section_rule_line(
 }
 
 fn render_editor(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    if let Some(inactive_tab) = state.split_tab {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(50),
+                Constraint::Length(1),
+                Constraint::Percentage(50),
+            ])
+            .split(area);
+        let active_tab = state.active_tab;
+        let (left_tab, right_tab, left_focused) = if state.split_focus_right {
+            (Some(inactive_tab), active_tab, false)
+        } else {
+            (active_tab, Some(inactive_tab), true)
+        };
+        render_editor_group(frame, columns[0], state, theme, left_tab, left_focused);
+        render_editor_group(frame, columns[2], state, theme, right_tab, !left_focused);
+        frame.render_widget(
+            Paragraph::new(
+                std::iter::repeat_n("│", usize::from(columns[1].height))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .style(Style::default().fg(theme.border).bg(theme.surface)),
+            columns[1],
+        );
+        return;
+    }
+    render_editor_group(frame, area, state, theme, state.active_tab, true);
+}
+
+fn render_editor_group(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    tab_index: Option<usize>,
+    focused: bool,
+) {
     let icon_set = icons(state.settings.ui.icon_mode);
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
         .split(area);
     let mut titles = state
         .tabs
@@ -975,30 +1018,43 @@ fn render_editor(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
     } else {
         titles
     })
-    .select(if state.git_diff_active {
+    .select(if state.git_diff_active && focused {
         state.tabs.len()
     } else {
-        state.active_tab.unwrap_or(0)
+        tab_index.unwrap_or(0)
     })
     .style(Style::default().fg(theme.text_muted).bg(theme.surface))
     .highlight_style(
         Style::default()
-            .fg(theme.accent)
-            .bg(theme.surface_raised)
-            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            .fg(if focused {
+                theme.accent
+            } else {
+                theme.text_muted
+            })
+            .bg(if focused {
+                theme.surface_raised
+            } else {
+                theme.surface
+            })
+            .add_modifier(if focused {
+                Modifier::BOLD | Modifier::UNDERLINED
+            } else {
+                Modifier::empty()
+            }),
     )
     .divider(Span::styled(
         icon_set.separator,
         Style::default().fg(theme.text_faint),
     ));
     frame.render_widget(tabs, rows[0]);
-    if state.git_diff_active {
-        render_git_diff_editor(frame, rows[1], state, theme);
+    render_breadcrumbs(frame, rows[1], state, theme, tab_index, focused);
+    if state.git_diff_active && focused {
+        render_git_diff_editor(frame, rows[2], state, theme);
         return;
     }
-    let Some(tab) = state.active_tab() else {
+    let Some(tab) = tab_index.and_then(|index| state.tabs.get(index)) else {
         frame.render_widget(Paragraph::new("\n  MICA\n  Open a file from Explorer\n\n  Ctrl+Shift+P  Command Palette\n  Ctrl+Q        Quit")
-            .style(Style::default().fg(theme.text_muted).bg(theme.background)), rows[1]);
+            .style(Style::default().fg(theme.text_muted).bg(theme.background)), rows[2]);
         return;
     };
     let selection = tab.buffer.selection();
@@ -1013,7 +1069,7 @@ fn render_editor(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         .path()
         .map(|path| state.diagnostics.for_file(path).collect::<Vec<_>>())
         .unwrap_or_default();
-    let visible_height = usize::from(rows[1].height);
+    let visible_height = usize::from(rows[2].height);
     let lines = tab
         .buffer
         .text()
@@ -1025,7 +1081,8 @@ fn render_editor(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
             let line_index = tab.view.scroll_line + visible;
             let content = line.to_string();
             let content = content.trim_end_matches(['\r', '\n']);
-            let (marker, diagnostic_color) = editor_gutter_marker(state, line_index, theme);
+            let (marker, diagnostic_color) =
+                editor_gutter_marker(state, tab.buffer.path(), line_index, theme);
             let number = format!("{marker} {:>width$} ", line_index + 1, width = gutter_width);
             let active = line_index == cursor_line;
             let mut spans = vec![Span::styled(
@@ -1059,12 +1116,12 @@ fn render_editor(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         .collect::<Vec<_>>();
     frame.render_widget(
         Paragraph::new(lines).style(Style::default().bg(theme.background)),
-        rows[1],
+        rows[2],
     );
-    if state.focus == Focus::Editor && cursor_line >= tab.view.scroll_line {
+    if focused && state.focus == Focus::Editor && cursor_line >= tab.view.scroll_line {
         let line = tab.buffer.text().line(cursor_line).to_string();
         let char_in_line = selection.head.0.saturating_sub(line_start);
-        let x = rows[1].x
+        let x = rows[2].x
             + u16::try_from(
                 gutter_width
                     + 3
@@ -1075,11 +1132,91 @@ fn render_editor(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
                     ),
             )
             .unwrap_or(u16::MAX);
-        let y = rows[1].y + u16::try_from(cursor_line - tab.view.scroll_line).unwrap_or(u16::MAX);
-        if x < rows[1].right() && y < rows[1].bottom() {
+        let y = rows[2].y + u16::try_from(cursor_line - tab.view.scroll_line).unwrap_or(u16::MAX);
+        if x < rows[2].right() && y < rows[2].bottom() {
             frame.set_cursor_position(Position::new(x, y));
         }
     }
+}
+
+fn render_breadcrumbs(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    tab_index: Option<usize>,
+    focused: bool,
+) {
+    let icon_set = icons(state.settings.ui.icon_mode);
+    let breadcrumb_separator = if state.settings.ui.icon_mode == IconMode::Ascii {
+        "/"
+    } else {
+        "›"
+    };
+    let mut spans = vec![Span::styled(
+        if focused {
+            format!("{} ", icon_set.accent_bar)
+        } else {
+            "  ".to_owned()
+        },
+        Style::default()
+            .fg(if focused {
+                theme.accent
+            } else {
+                theme.text_faint
+            })
+            .bg(theme.background),
+    )];
+    let path = if state.git_diff_active && focused {
+        state.git_diff.as_ref().map(|diff| diff.path.as_path())
+    } else {
+        tab_index
+            .and_then(|index| state.tabs.get(index))
+            .and_then(|tab| tab.buffer.path())
+            .map(|path| path.strip_prefix(state.workspace.as_path()).unwrap_or(path))
+    };
+    if let Some(path) = path {
+        let components = path
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        for (index, component) in components.iter().enumerate() {
+            if index > 0 {
+                spans.push(Span::styled(
+                    format!("  {breadcrumb_separator}  "),
+                    Style::default().fg(theme.border).bg(theme.background),
+                ));
+            }
+            spans.push(Span::styled(
+                component.clone(),
+                Style::default()
+                    .fg(if index + 1 == components.len() {
+                        theme.text_muted
+                    } else {
+                        theme.text_faint
+                    })
+                    .bg(theme.background),
+            ));
+        }
+        if state.git_diff_active && focused {
+            spans.push(Span::styled(
+                format!("  {breadcrumb_separator}  DIFF"),
+                Style::default()
+                    .fg(theme.accent)
+                    .bg(theme.background)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+    } else {
+        spans.push(Span::styled(
+            "Mica Workspace",
+            Style::default().fg(theme.text_faint).bg(theme.background),
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.background)),
+        area,
+    );
 }
 
 fn render_git_diff_editor(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -1092,7 +1229,22 @@ fn render_git_diff_editor(frame: &mut Frame, area: Rect, state: &AppState, theme
     };
     let mut lines = vec![Line::from(vec![
         Span::styled(
-            format!(" {} ", diff.path.display()),
+            "  PREV  ",
+            Style::default()
+                .fg(theme.accent)
+                .bg(theme.selection)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  ", Style::default().bg(theme.surface_raised)),
+        Span::styled(
+            "  NEXT  ",
+            Style::default()
+                .fg(theme.accent)
+                .bg(theme.selection)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("   {} ", diff.path.display()),
             Style::default()
                 .fg(theme.text)
                 .bg(theme.surface_raised)
@@ -1118,10 +1270,11 @@ fn render_git_diff_editor(frame: &mut Frame, area: Rect, state: &AppState, theme
 
 fn editor_gutter_marker(
     state: &AppState,
+    active_path: Option<&std::path::Path>,
     line_index: usize,
     theme: &Theme,
 ) -> (&'static str, Option<Color>) {
-    if let Some(path) = state.active_path()
+    if let Some(path) = active_path
         && let Some(diagnostic) = state
             .diagnostics
             .for_file(path)
@@ -1134,7 +1287,7 @@ fn editor_gutter_marker(
     let Some(diff) = &state.git_diff else {
         return (" ", None);
     };
-    let Some(active_path) = state.active_path() else {
+    let Some(active_path) = active_path else {
         return (" ", None);
     };
     let matches_path = active_path == diff.path
@@ -1550,9 +1703,16 @@ fn git_diff_lines(state: &AppState, theme: &Theme, limit: usize) -> Vec<Line<'st
     if diff.binary {
         return vec![Line::from(format!("Binary file: {}", diff.path.display()))];
     }
-    let mut hunk_index: Option<usize> = None;
+    let mut hunk_index = diff
+        .raw
+        .lines()
+        .take(state.git_diff_scroll)
+        .filter(|line| line.starts_with("@@ "))
+        .count()
+        .checked_sub(1);
     diff.raw
         .lines()
+        .skip(state.git_diff_scroll)
         .take(limit)
         .map(|line| {
             let is_hunk_header = line.starts_with("@@ ");
@@ -1695,7 +1855,13 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
 
     // Right: cursor position, language, encoding, RO marker.
     let (position, language, encoding, read_only) = state.active_tab().map_or_else(
-        || (String::new(), String::new(), String::new(), false),
+        || {
+            if state.git_diff_active {
+                (String::new(), "Diff".to_owned(), String::new(), true)
+            } else {
+                (String::new(), String::new(), String::new(), false)
+            }
+        },
         |tab| {
             let selection = tab.buffer.selection();
             let line = tab

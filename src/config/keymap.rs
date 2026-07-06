@@ -64,6 +64,8 @@ impl Default for Keymap {
             ("ctrl-f", "editor.find"),
             ("ctrl-z", "editor.undo"),
             ("ctrl-y", "editor.redo"),
+            ("ctrl-\\", "editor.split"),
+            ("ctrl-shift-\\", "editor.focus_next_group"),
             ("ctrl-p", "workspace.open_file"),
             ("ctrl-shift-p", "command_palette.open"),
             ("ctrl-b", "view.toggle_sidebar"),

@@ -198,6 +198,11 @@ pub struct AppState {
     pub tree_selected: usize,
     pub tabs: Vec<BufferTab>,
     pub active_tab: Option<usize>,
+    /// The inactive editor group's tab. `None` means the editor is not split.
+    pub split_tab: Option<usize>,
+    /// The active group is on the right. The active group's tab remains in
+    /// `active_tab`; switching groups swaps it with `split_tab`.
+    pub split_focus_right: bool,
     pub focus: Focus,
     pub sidebar_view: SidebarView,
     pub sidebar_visible: bool,
@@ -233,6 +238,7 @@ pub struct AppState {
     /// Whether the virtual, read-only Git diff tab is the active editor tab.
     pub git_diff_active: bool,
     pub git_hunk_selected: usize,
+    pub git_diff_scroll: usize,
     pub git_branches: Vec<crate::git::GitBranch>,
     pub git_branch_selected: usize,
     pub workspace_search: crate::search::WorkspaceSearchOptions,
@@ -286,6 +292,8 @@ impl AppState {
             tree_selected: 0,
             tabs: Vec::new(),
             active_tab: None,
+            split_tab: None,
+            split_focus_right: false,
             focus: Focus::Editor,
             sidebar_view: SidebarView::Explorer,
             sidebar_visible: true,
@@ -320,6 +328,7 @@ impl AppState {
             git_diff: None,
             git_diff_active: false,
             git_hunk_selected: 0,
+            git_diff_scroll: 0,
             git_branches: Vec::new(),
             git_branch_selected: 0,
             workspace_search: Default::default(),

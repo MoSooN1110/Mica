@@ -18,6 +18,7 @@
 
 use std::{fs, path::PathBuf};
 
+use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
 use mica::{
     app::{AppState, BottomPanelView, BufferTab, Focus, Overlay, SidebarView},
     buffer::TextBuffer,
@@ -25,7 +26,7 @@ use mica::{
     diagnostics::{Diagnostic, DiagnosticSeverity, DiagnosticSource, TextPosition, TextRange},
     editor::EditorView,
     git::{DiffTarget, FileDiff, GitFileChange, GitFileKind, GitStatus, parse_unified_diff},
-    ui::{ColorMode, Regions, Theme, render},
+    ui::{ColorMode, Regions, Theme, command_for_mouse, render},
     workspace::{FileOperations, FileTree, WorkspaceRoot},
 };
 use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, layout::Rect};
@@ -377,6 +378,48 @@ fn git_diff_panel_renders_unified_hunks() {
     let (regions, terminal) = draw(&state, &theme, 100, 30);
     let text = region_text(terminal.backend().buffer(), regions.editor);
     insta::assert_snapshot!(redact(&text, &state.workspace));
+}
+
+#[test]
+fn split_editor_groups_render_side_by_side() {
+    let mut state = base_state("editor-split");
+    state.sidebar_visible = false;
+    let main = open_main_tab(&state.workspace);
+    let utils_path = state.workspace.as_path().join("src/utils.rs");
+    let utils = BufferTab::new(TextBuffer::open(&utils_path, false).expect("open utils.rs"));
+    state.tabs.push(main);
+    state.tabs.push(utils);
+    state.active_tab = Some(0);
+    state.split_tab = Some(1);
+    state.focus = Focus::Editor;
+
+    let theme = Theme::mica_dark(ColorMode::Ansi256);
+    let (regions, terminal) = draw(&state, &theme, 100, 20);
+    let text = region_text(terminal.backend().buffer(), regions.editor);
+    insta::assert_snapshot!(redact(&text, &state.workspace));
+}
+
+#[test]
+fn editor_mouse_wheel_dispatches_scroll_command() {
+    let mut state = base_state("editor-scroll-input");
+    state.tabs.push(open_main_tab(&state.workspace));
+    state.active_tab = Some(0);
+    let theme = Theme::mica_dark(ColorMode::Ansi256);
+    let (regions, _) = draw(&state, &theme, 100, 24);
+    let command = command_for_mouse(
+        &state,
+        regions,
+        MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: regions.editor.x + 10,
+            row: regions.editor.y + 5,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(matches!(
+        command,
+        Some(mica::command::Command::EditorScroll(3))
+    ));
 }
 
 /// Bullet: Problemsパネル.

@@ -242,6 +242,12 @@ pub fn command_for_key(state: &AppState, event: KeyEvent) -> Option<Command> {
             _ => None,
         };
     }
+    if event.code == KeyCode::PageUp {
+        return Some(Command::EditorScroll(-10));
+    }
+    if event.code == KeyCode::PageDown {
+        return Some(Command::EditorScroll(10));
+    }
     let extend = event.modifiers.contains(KeyModifiers::SHIFT);
     match event.code {
         KeyCode::Left => Some(Command::MoveLeft { extend }),
@@ -301,6 +307,26 @@ pub fn command_for_mouse(state: &AppState, regions: Regions, event: MouseEvent) 
             _ => None,
         };
     }
+    let point = (event.column, event.row);
+    if contains(regions.editor, point)
+        && matches!(
+            event.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        )
+    {
+        let right = state.split_tab.is_some()
+            && event.column >= regions.editor.x + regions.editor.width / 2;
+        if state.split_tab.is_some() && right != state.split_focus_right {
+            return Some(Command::FocusEditorGroup(right));
+        }
+        return Some(Command::EditorScroll(
+            if event.kind == MouseEventKind::ScrollUp {
+                -3
+            } else {
+                3
+            },
+        ));
+    }
     if event.kind == MouseEventKind::Down(MouseButton::Left)
         && contains(regions.bottom, (event.column, event.row))
         && state.bottom_panel_view == BottomPanelView::Problems
@@ -316,7 +342,12 @@ pub fn command_for_mouse(state: &AppState, regions: Regions, event: MouseEvent) 
     if !left_down && !left_drag {
         return None;
     }
-    let point = (event.column, event.row);
+    if state.split_tab.is_some() && contains(regions.editor, point) {
+        let right = event.column >= regions.editor.x + regions.editor.width / 2;
+        if right != state.split_focus_right {
+            return Some(Command::FocusEditorGroup(right));
+        }
+    }
     if left_down && contains(regions.activity, point) {
         let row = event.row.saturating_sub(regions.activity.y);
         let id = match row {
@@ -363,7 +394,12 @@ pub fn command_for_mouse(state: &AppState, regions: Regions, event: MouseEvent) 
         });
     }
     if left_down && contains(regions.tabs, point) {
-        let target = usize::from(event.column.saturating_sub(regions.tabs.x));
+        let group_x = if state.split_tab.is_some() && state.split_focus_right {
+            regions.tabs.x + regions.tabs.width / 2
+        } else {
+            regions.tabs.x
+        };
+        let target = usize::from(event.column.saturating_sub(group_x));
         let mut start = 0usize;
         for (index, tab) in state.tabs.iter().enumerate() {
             let dirty = if tab.buffer.is_dirty() { " ●" } else { "" };
@@ -395,23 +431,45 @@ pub fn command_for_mouse(state: &AppState, regions: Regions, event: MouseEvent) 
             }
         }
     }
-    if state.git_diff_active && contains(regions.editor, point) && event.row > regions.editor.y + 1
+    if left_down && state.git_diff_active && contains(regions.editor, point) {
+        let group_x = if state.split_tab.is_some() && state.split_focus_right {
+            regions.editor.x + regions.editor.width / 2
+        } else {
+            regions.editor.x
+        };
+        if event.row == regions.editor.y + 2 {
+            let column = event.column.saturating_sub(group_x);
+            if column < 8 {
+                return Some(Command::GitHunkPrevious);
+            }
+            if (10..18).contains(&column) {
+                return Some(Command::GitHunkNext);
+            }
+        }
+    }
+    if state.git_diff_active && contains(regions.editor, point) && event.row > regions.editor.y + 2
     {
-        let raw_line = usize::from(event.row.saturating_sub(regions.editor.y + 2));
+        let raw_line =
+            state.git_diff_scroll + usize::from(event.row.saturating_sub(regions.editor.y + 3));
         return state
             .git_hunk_at_diff_line(raw_line)
             .map(Command::SelectGitHunk);
     }
-    if contains(regions.editor, point) && event.row > regions.editor.y {
+    if contains(regions.editor, point) && event.row > regions.editor.y + 1 {
         let tab = state.active_tab()?;
         let line_index =
-            tab.view.scroll_line + usize::from(event.row.saturating_sub(regions.editor.y + 1));
+            tab.view.scroll_line + usize::from(event.row.saturating_sub(regions.editor.y + 2));
         if line_index >= tab.buffer.text().len_lines() {
             return None;
         }
         let gutter_width = tab.buffer.text().len_lines().to_string().len().max(2) + 3;
+        let group_x = if state.split_tab.is_some() && state.split_focus_right {
+            regions.editor.x + regions.editor.width / 2 + 1
+        } else {
+            regions.editor.x
+        };
         let display_column =
-            usize::from(event.column.saturating_sub(regions.editor.x)).saturating_sub(gutter_width);
+            usize::from(event.column.saturating_sub(group_x)).saturating_sub(gutter_width);
         let line = tab.buffer.text().line(line_index).to_string();
         let content = line.trim_end_matches(['\r', '\n']);
         let char_in_line = char_offset_at_display_column(

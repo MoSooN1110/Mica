@@ -3,13 +3,13 @@ source: tests/snapshots.rs
 expression: "redact(&text, &state.workspace)"
 ---
 ▎E  EXPLORER                    │  main.rs ×                                    
- G ▎▾ src •  E1                 │   1 fn main() {                               
- S  │ ◆ main.rs M  E1           │W  2     let unused = 1;                       
-    │ ◆ utils.rs M              │   3     println!("value");                    
-    ≡ README.md                 │E  4     let missing_semi = 2                  
-    ≡ 設 計 .md U                 │   5 }                                         
+ G ▎▾ src •  E1                 │▎ src  ›  main.rs                              
+ S  │ ◆ main.rs M  E1           │   1 fn main() {                               
+    │ ◆ utils.rs M              │W  2     let unused = 1;                       
+    ≡ README.md                 │   3     println!("value");                    
+    ≡ 設 計 .md U                 │E  4     let missing_semi = 2                  
+                                │   5 }                                         
                                 │   6                                           
-                                │                                               
                                 │                                               
                                 │                                               
                                 │                                               

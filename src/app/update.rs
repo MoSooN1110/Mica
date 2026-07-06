@@ -425,6 +425,7 @@ impl AppState {
                         self.git_diff = Some(diff);
                         self.git_diff_active = true;
                         self.git_hunk_selected = 0;
+                        self.git_diff_scroll = 0;
                         self.focus = Focus::Editor;
                     }
                     Err(error) => {
@@ -670,11 +671,44 @@ impl AppState {
             }
             Command::GitHunkPrevious => {
                 self.git_hunk_selected = self.git_hunk_selected.saturating_sub(1);
+                self.reveal_selected_git_hunk();
                 Vec::new()
             }
             Command::GitHunkNext => {
                 let count = self.git_diff.as_ref().map_or(0, |diff| diff.hunks.len());
                 self.git_hunk_selected = (self.git_hunk_selected + 1).min(count.saturating_sub(1));
+                self.reveal_selected_git_hunk();
+                Vec::new()
+            }
+            Command::EditorScroll(delta) => {
+                if self.git_diff_active {
+                    self.git_diff_scroll = if delta < 0 {
+                        self.git_diff_scroll
+                            .saturating_sub(delta.unsigned_abs() as usize)
+                    } else {
+                        let max = self
+                            .git_diff
+                            .as_ref()
+                            .map_or(0, |diff| diff.raw.lines().count());
+                        self.git_diff_scroll
+                            .saturating_add(delta as usize)
+                            .min(max.saturating_sub(1))
+                    };
+                } else {
+                    let visible_height = self.editor_visible_height();
+                    let Some(tab) = self.active_tab.and_then(|index| self.tabs.get_mut(index))
+                    else {
+                        return Vec::new();
+                    };
+                    let max = tab.buffer.text().len_lines().saturating_sub(visible_height);
+                    tab.view.scroll_line = if delta < 0 {
+                        tab.view
+                            .scroll_line
+                            .saturating_sub(delta.unsigned_abs() as usize)
+                    } else {
+                        tab.view.scroll_line.saturating_add(delta as usize).min(max)
+                    };
+                }
                 Vec::new()
             }
             Command::GitHunkStageToggle => {
@@ -915,6 +949,36 @@ impl AppState {
                     self.focus = Focus::Editor;
                 }
                 self.active_syntax_effect().into_iter().collect()
+            }
+            Command::SplitEditor => {
+                if self.split_tab.is_none() {
+                    self.split_tab = self.active_tab;
+                    self.split_focus_right = false;
+                }
+                Vec::new()
+            }
+            Command::FocusNextEditorGroup => {
+                if self.split_tab.is_some() {
+                    std::mem::swap(&mut self.active_tab, &mut self.split_tab);
+                    self.split_focus_right = !self.split_focus_right;
+                    self.git_diff_active = false;
+                    self.focus = Focus::Editor;
+                }
+                Vec::new()
+            }
+            Command::FocusEditorGroup(right) => {
+                if self.split_tab.is_some() && self.split_focus_right != right {
+                    std::mem::swap(&mut self.active_tab, &mut self.split_tab);
+                    self.split_focus_right = right;
+                    self.git_diff_active = false;
+                }
+                self.focus = Focus::Editor;
+                Vec::new()
+            }
+            Command::CloseEditorSplit => {
+                self.split_tab = None;
+                self.split_focus_right = false;
+                Vec::new()
             }
             Command::CloseTab(index) => {
                 if index == self.tabs.len() && self.git_diff.is_some() {
@@ -1295,6 +1359,13 @@ impl AppState {
                     }
                 }
             }
+            command::EDITOR_SCROLL_UP => self.execute(Command::EditorScroll(-3)),
+            command::EDITOR_SCROLL_DOWN => self.execute(Command::EditorScroll(3)),
+            command::EDITOR_SPLIT => self.execute(Command::SplitEditor),
+            command::EDITOR_FOCUS_NEXT_GROUP => self.execute(Command::FocusNextEditorGroup),
+            command::EDITOR_CLOSE_SPLIT => self.execute(Command::CloseEditorSplit),
+            command::GIT_DIFF_PREVIOUS => self.execute(Command::GitHunkPrevious),
+            command::GIT_DIFF_NEXT => self.execute(Command::GitHunkNext),
             command::EDITOR_SAVE_AS => {
                 if self.git_diff_active {
                     self.notification = Some("Git diff tabs are read-only".to_owned());
@@ -2397,6 +2468,14 @@ impl AppState {
                 }),
             });
         self.tabs.remove(index);
+        self.split_tab = self.split_tab.and_then(|split| match split.cmp(&index) {
+            std::cmp::Ordering::Less => Some(split),
+            std::cmp::Ordering::Equal => None,
+            std::cmp::Ordering::Greater => Some(split - 1),
+        });
+        if self.split_tab.is_none() {
+            self.split_focus_right = false;
+        }
         self.active_tab = match self.active_tab {
             None => None,
             Some(_) if self.tabs.is_empty() => None,
@@ -2408,21 +2487,7 @@ impl AppState {
     }
 
     fn reveal_cursor(&mut self, tab_index: usize) {
-        let (_, terminal_height) = self.terminal_size;
-        let panel_height = if self.bottom_panel_visible {
-            self.settings
-                .ui
-                .bottom_panel_height
-                .min(terminal_height.saturating_sub(2) / 2)
-        } else {
-            0
-        };
-        let visible_height = usize::from(
-            terminal_height
-                .saturating_sub(2)
-                .saturating_sub(panel_height)
-                .max(1),
-        );
+        let visible_height = self.editor_visible_height();
         let Some(tab) = self.tabs.get_mut(tab_index) else {
             return;
         };
@@ -2437,6 +2502,40 @@ impl AppState {
             tab.view.scroll_line = cursor_line;
         } else if cursor_line >= tab.view.scroll_line + visible_height {
             tab.view.scroll_line = cursor_line.saturating_sub(visible_height - 1);
+        }
+    }
+
+    fn editor_visible_height(&self) -> usize {
+        let (_, terminal_height) = self.terminal_size;
+        let panel_height = if self.bottom_panel_visible {
+            self.settings
+                .ui
+                .bottom_panel_height
+                .min(terminal_height.saturating_sub(2) / 2)
+        } else {
+            0
+        };
+        usize::from(
+            terminal_height
+                .saturating_sub(3)
+                .saturating_sub(panel_height)
+                .max(1),
+        )
+    }
+
+    fn reveal_selected_git_hunk(&mut self) {
+        let Some(diff) = &self.git_diff else {
+            return;
+        };
+        let mut hunk = 0usize;
+        for (line, text) in diff.raw.lines().enumerate() {
+            if text.starts_with("@@ ") {
+                if hunk == self.git_hunk_selected {
+                    self.git_diff_scroll = line;
+                    return;
+                }
+                hunk = hunk.saturating_add(1);
+            }
         }
     }
 }
@@ -2930,6 +3029,47 @@ mod tests {
         assert!(!state.git_diff_active);
         assert_eq!(state.tabs.len(), 1);
         assert_eq!(state.active_tab, Some(0));
+    }
+
+    #[test]
+    fn editor_scroll_and_split_groups_keep_independent_active_tabs() {
+        let mut state = state();
+        for name in ["left.rs", "right.rs"] {
+            let mut buffer = TextBuffer::empty(Some(state.workspace.as_path().join(name)), false);
+            buffer.insert(&format!("{name}\n").repeat(40)).unwrap();
+            state.tabs.push(BufferTab::new(buffer));
+        }
+        state.active_tab = Some(0);
+        state.update(AppEvent::Command(Command::EditorScroll(8)));
+        assert_eq!(state.tabs[0].view.scroll_line, 8);
+
+        state.update(AppEvent::Command(Command::SplitEditor));
+        state.update(AppEvent::Command(Command::SelectTab(1)));
+        assert_eq!(state.active_tab, Some(1));
+        assert_eq!(state.split_tab, Some(0));
+
+        state.update(AppEvent::Command(Command::FocusNextEditorGroup));
+        assert_eq!(state.active_tab, Some(0));
+        assert_eq!(state.split_tab, Some(1));
+        assert!(state.split_focus_right);
+        assert_eq!(state.tabs[0].view.scroll_line, 8);
+    }
+
+    #[test]
+    fn diff_next_previous_reveal_the_selected_hunk() {
+        let mut state = state();
+        let diff = crate::git::parse_unified_diff(
+            PathBuf::from("src/a.rs"),
+            crate::git::DiffTarget::WorkingTree,
+            "@@ -1 +1 @@\n-old\n+new\n@@ -20 +20 @@\n-before\n+after\n".to_owned(),
+        );
+        state.update(AppEvent::GitDiffLoaded(Ok(diff)));
+        state.update(AppEvent::Command(Command::GitHunkNext));
+        assert_eq!(state.git_hunk_selected, 1);
+        assert_eq!(state.git_diff_scroll, 3);
+        state.update(AppEvent::Command(Command::GitHunkPrevious));
+        assert_eq!(state.git_hunk_selected, 0);
+        assert_eq!(state.git_diff_scroll, 0);
     }
 
     #[test]

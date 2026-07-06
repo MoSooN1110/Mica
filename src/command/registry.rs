@@ -140,6 +140,34 @@ impl CommandRegistry {
                     title: "Git: Push",
                 },
                 CommandMeta {
+                    id: GIT_DIFF_PREVIOUS,
+                    title: "Git Diff: Previous Change",
+                },
+                CommandMeta {
+                    id: GIT_DIFF_NEXT,
+                    title: "Git Diff: Next Change",
+                },
+                CommandMeta {
+                    id: EDITOR_SPLIT,
+                    title: "Editor: Split Right",
+                },
+                CommandMeta {
+                    id: EDITOR_FOCUS_NEXT_GROUP,
+                    title: "Editor: Focus Next Group",
+                },
+                CommandMeta {
+                    id: EDITOR_CLOSE_SPLIT,
+                    title: "Editor: Close Split",
+                },
+                CommandMeta {
+                    id: EDITOR_SCROLL_UP,
+                    title: "Editor: Scroll Up",
+                },
+                CommandMeta {
+                    id: EDITOR_SCROLL_DOWN,
+                    title: "Editor: Scroll Down",
+                },
+                CommandMeta {
                     id: SEARCH_INCLUDE_GLOBS,
                     title: "Search: Set Include Globs",
                 },

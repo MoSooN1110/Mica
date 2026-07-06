@@ -3,7 +3,8 @@ source: tests/snapshots.rs
 expression: "redact(&text, &state.workspace)"
 ---
   main.rs (Diff) ×                                                 
- src/main.rs Working Tree ↔ Index  READ-ONLY                       
+▎ src  ›  main.rs  ›  DIFF                                         
+  PREV      NEXT     src/main.rs Working Tree ↔ Index  READ-ONLY   
 diff --git a/src/main.rs b/src/main.rs                             
 --- a/src/main.rs                                                  
 +++ b/src/main.rs                                                  

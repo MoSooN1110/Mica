@@ -1,0 +1,23 @@
+---
+source: tests/snapshots.rs
+expression: "redact(&text, &state.workspace)"
+---
+  main.rs ×  │  utils.rs ×                      │  main.rs ×  │  utils.rs ×                      
+▎ src  ›  main.rs                               │  src  ›  utils.rs                              
+   1 fn main() {                                │   1 pub fn helper() {}                         
+   2     let unused = 1;                        │   2                                            
+   3     println!("value");                     │                                                
+   4     let missing_semi = 2                   │                                                
+   5 }                                          │                                                
+   6                                            │                                                
+                                                │                                                
+                                                │                                                
+                                                │                                                
+                                                │                                                
+                                                │                                                
+                                                │                                                
+                                                │                                                
+                                                │                                                
+                                                │                                                
+                                                │                                                
+                                                │

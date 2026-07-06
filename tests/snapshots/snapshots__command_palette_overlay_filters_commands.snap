@@ -3,7 +3,7 @@ source: tests/snapshots.rs
 expression: "redact(&text, &state.workspace)"
 ---
 ▎E  EXPLORER                    │  Welcome                                      
- G ▎▾ src                       │                                               
+ G ▎▾ src                       │▎ Mica Workspace                               
  S  ╭ COMMAND PALETTE ─────────────────────────────────────────────────────╮    
     │❯ save                                                                │    
     │▎Save File  editor.save                                               │    
