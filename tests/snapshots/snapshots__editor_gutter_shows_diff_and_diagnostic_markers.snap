@@ -2,7 +2,7 @@
 source: tests/snapshots.rs
 expression: "redact(&text, &state.workspace)"
 ---
-  main.rs ×                                              
+  main.rs ×  │  main.rs (Diff) ×                         
 +  1 fn main() {                                         
 W  2     let unused = 1;                                 
 ~  3     println!("value");                              

@@ -160,10 +160,6 @@ impl CommandRegistry {
                     title: "Show Output Panel",
                 },
                 CommandMeta {
-                    id: VIEW_DIFF,
-                    title: "Show Diff Panel",
-                },
-                CommandMeta {
                     id: VIEW_TERMINAL,
                     title: "Show Terminal Panel",
                 },

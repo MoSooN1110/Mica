@@ -2,16 +2,16 @@
 source: tests/snapshots.rs
 expression: "redact(&text, &state.workspace)"
 ---
- E  EXPLORER                    │  Welcome                                      
- G ▾ src                        │                                               
- S   · main.rs                  │  MICA                                         
-    ┌ CONFIRM DELETE ──────────────────────────────────────────────────────┐    
-   ·│  Delete src/utils.rs?                                                │    
-   ·│  0 entries                                                           │    
+▎E  EXPLORER                    │  Welcome                                      
+ G ▎▾ src                       │                                               
+ S  │ ◆ main.rs                 │  MICA                                         
+    ╭ CONFIRM DELETE ──────────────────────────────────────────────────────╮    
+    │  Delete src/utils.rs?                                                │    
+    │  0 entries                                                           │    
     │  WARNING: 1 unsaved buffer(s) will remain open                       │    
     │                                                                      │    
     │  Enter: confirm    Esc: cancel                                       │    
-    └──────────────────────────────────────────────────────────────────────┘    
+    ╰──────────────────────────────────────────────────────────────────────╯    
                                 │                                               
                                 │                                               
                                 │                                               
@@ -25,4 +25,4 @@ expression: "redact(&text, &state.workspace)"
                                 │                                               
                                 │                                               
                                 │                                               
- No file         E 0  W 0
+ OVERLAY

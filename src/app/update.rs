@@ -24,6 +24,7 @@ impl AppState {
                 let restored_cursor = self.restore_cursors.remove(&path);
                 match result {
                     Ok(buffer) => {
+                        self.git_diff_active = false;
                         if let Some(existing) = self
                             .tabs
                             .iter()
@@ -422,10 +423,9 @@ impl AppState {
                 match result {
                     Ok(diff) => {
                         self.git_diff = Some(diff);
+                        self.git_diff_active = true;
                         self.git_hunk_selected = 0;
-                        self.bottom_panel_visible = true;
-                        self.bottom_panel_view = BottomPanelView::Diff;
-                        self.focus = Focus::BottomPanel;
+                        self.focus = Focus::Editor;
                     }
                     Err(error) => {
                         self.append_output("git", &error);
@@ -448,6 +448,7 @@ impl AppState {
                 }
                 if succeeded {
                     self.git_diff = None;
+                    self.git_diff_active = false;
                 }
                 self.git_loading = true;
                 let mut effects = vec![Effect::RefreshGit];
@@ -664,7 +665,7 @@ impl AppState {
             Command::SelectGitHunk(index) => {
                 let count = self.git_diff.as_ref().map_or(0, |diff| diff.hunks.len());
                 self.git_hunk_selected = index.min(count.saturating_sub(1));
-                self.focus = Focus::BottomPanel;
+                self.focus = Focus::Editor;
                 Vec::new()
             }
             Command::GitHunkPrevious => {
@@ -907,11 +908,24 @@ impl AppState {
             Command::SelectTab(index) => {
                 if index < self.tabs.len() {
                     self.active_tab = Some(index);
+                    self.git_diff_active = false;
+                    self.focus = Focus::Editor;
+                } else if index == self.tabs.len() && self.git_diff.is_some() {
+                    self.git_diff_active = true;
                     self.focus = Focus::Editor;
                 }
                 self.active_syntax_effect().into_iter().collect()
             }
-            Command::CloseTab(index) => self.request_close_tab(index),
+            Command::CloseTab(index) => {
+                if index == self.tabs.len() && self.git_diff.is_some() {
+                    self.git_diff = None;
+                    self.git_diff_active = false;
+                    self.focus = Focus::Editor;
+                    Vec::new()
+                } else {
+                    self.request_close_tab(index)
+                }
+            }
             Command::SetCursor {
                 char_offset,
                 extend,
@@ -1250,6 +1264,10 @@ impl AppState {
                 Vec::new()
             }
             command::EDITOR_SAVE => {
+                if self.git_diff_active {
+                    self.notification = Some("Git diff tabs are read-only".to_owned());
+                    return Vec::new();
+                }
                 let Some(index) = self.active_tab else {
                     return Vec::new();
                 };
@@ -1278,6 +1296,10 @@ impl AppState {
                 }
             }
             command::EDITOR_SAVE_AS => {
+                if self.git_diff_active {
+                    self.notification = Some("Git diff tabs are read-only".to_owned());
+                    return Vec::new();
+                }
                 let Some(tab) = self.active_tab else {
                     return Vec::new();
                 };
@@ -1294,6 +1316,11 @@ impl AppState {
                 Vec::new()
             }
             command::EDITOR_CLOSE => {
+                if self.git_diff_active && self.git_diff.is_some() {
+                    self.git_diff = None;
+                    self.git_diff_active = false;
+                    return Vec::new();
+                }
                 if let Some(index) = self.active_tab {
                     return self.request_close_tab(index);
                 }
@@ -1310,6 +1337,10 @@ impl AppState {
                 vec![Effect::CopyToClipboard(text)]
             }
             command::EDITOR_CUT => {
+                if self.git_diff_active {
+                    self.notification = Some("Git diff tabs are read-only".to_owned());
+                    return Vec::new();
+                }
                 let Some(index) = self.active_tab else {
                     return Vec::new();
                 };
@@ -1424,12 +1455,6 @@ impl AppState {
             command::VIEW_OUTPUT => {
                 self.bottom_panel_visible = true;
                 self.bottom_panel_view = BottomPanelView::Output;
-                self.focus = Focus::BottomPanel;
-                Vec::new()
-            }
-            command::VIEW_DIFF => {
-                self.bottom_panel_visible = true;
-                self.bottom_panel_view = BottomPanelView::Diff;
                 self.focus = Focus::BottomPanel;
                 Vec::new()
             }
@@ -1596,6 +1621,10 @@ impl AppState {
         &mut self,
         operation: impl FnOnce(&mut BufferTab) -> Result<(), crate::buffer::BufferError>,
     ) -> bool {
+        if self.git_diff_active {
+            self.notification = Some("Git diff tabs are read-only".to_owned());
+            return false;
+        }
         let Some(tab) = self.active_tab.and_then(|index| self.tabs.get_mut(index)) else {
             return false;
         };
@@ -2834,6 +2863,10 @@ mod tests {
         );
         state.update(AppEvent::GitDiffLoaded(Ok(diff)));
 
+        assert!(state.git_diff_active);
+        assert_eq!(state.focus, Focus::Editor);
+        assert!(state.active_tab().is_none());
+
         let effects = state.update(AppEvent::Command(Command::GitHunkStageToggle));
         assert!(matches!(
             effects.as_slice(),
@@ -2860,6 +2893,43 @@ mod tests {
             [Effect::OpenFile { path, line: Some(3), .. }]
                 if path == &state.workspace.as_path().join("src/a.rs")
         ));
+    }
+
+    #[test]
+    fn diff_tab_is_read_only_and_closes_without_touching_file_tabs() {
+        let mut state = state();
+        let path = state.workspace.as_path().join("src/a.rs");
+        let mut buffer = TextBuffer::empty(Some(path), false);
+        buffer.insert("kept").unwrap();
+        state.tabs.push(BufferTab::new(buffer));
+        state.active_tab = Some(0);
+        let diff = crate::git::parse_unified_diff(
+            PathBuf::from("src/a.rs"),
+            crate::git::DiffTarget::WorkingTree,
+            "@@ -1 +1 @@\n-old\n+new\n".to_owned(),
+        );
+        state.update(AppEvent::GitDiffLoaded(Ok(diff)));
+
+        state.update(AppEvent::Command(Command::InsertText("blocked".to_owned())));
+        assert_eq!(state.tabs[0].buffer.text().to_string(), "kept");
+        assert_eq!(
+            state.notification.as_deref(),
+            Some("Git diff tabs are read-only")
+        );
+        state.tabs[0].buffer.set_selection(Selection {
+            anchor: CharOffset(0),
+            head: CharOffset(4),
+        });
+        state.update(AppEvent::Command(Command::Invoke(
+            command::EDITOR_CUT.to_owned(),
+        )));
+        assert_eq!(state.tabs[0].buffer.text().to_string(), "kept");
+
+        state.update(AppEvent::Command(Command::CloseTab(1)));
+        assert!(state.git_diff.is_none());
+        assert!(!state.git_diff_active);
+        assert_eq!(state.tabs.len(), 1);
+        assert_eq!(state.active_tab, Some(0));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 source: tests/snapshots.rs
 expression: "redact(&text, &state.workspace)"
 ---
- PROBLEMS  DIFF  OUTPUT  TERMINAL   [Problems: All] F filter ───────────────────────────────────────
+ PROBLEMS  OUTPUT  TERMINAL   [Problems: All] F filter ─────────────────────────────────────────────
 ▾ <WORKSPACE>/src/main.rs                                                   
   W unused variable: `unused` [unused_variables] — compiler  2:9                                    
   E expected `;`, found `}` [E0308] — compiler  4:9                                                 

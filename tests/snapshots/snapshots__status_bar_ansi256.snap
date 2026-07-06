@@ -2,4 +2,4 @@
 source: tests/snapshots.rs
 expression: indexed
 ---
-(1,23) symbol="N" fg=Indexed(254) bg=Indexed(235) modifier=NONE
+(1,23) symbol="E" fg=Indexed(111) bg=Indexed(235) modifier=BOLD

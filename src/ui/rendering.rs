@@ -3,8 +3,9 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Margin, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Tabs},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Tabs},
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     app::{
@@ -12,12 +13,13 @@ use crate::{
         SidebarView, WorkspaceSearchRow,
     },
     buffer::LineEnding,
+    config::IconMode,
     workspace::{TreeEntry, TreeEntryKind},
 };
 
 use super::{
     Theme,
-    icons::{IconSet, icons},
+    icons::{FileIcon, FileIconColor, IconSet, file_icon, folder_icon, icons},
 };
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -107,22 +109,33 @@ pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) -> Regions {
             Overlay::ConfirmDelete {
                 plan,
                 dirty_buffers,
-            } => render_delete_confirmation(frame, area, plan, *dirty_buffers, theme),
+            } => render_delete_confirmation(
+                frame,
+                area,
+                plan,
+                *dirty_buffers,
+                theme,
+                state.settings.ui.icon_mode,
+            ),
             Overlay::ConfirmClose { tab } => {
                 render_close_confirmation(frame, area, state, *tab, theme);
             }
             Overlay::ConfirmSaveAs { plan } => {
-                render_save_as_confirmation(frame, area, plan, theme);
+                render_save_as_confirmation(frame, area, plan, theme, state.settings.ui.icon_mode);
             }
             Overlay::RecoveryPrompt => render_recovery_prompt(frame, area, state, theme),
             Overlay::GitCommitInput => {
                 render_text_prompt(frame, area, " COMMIT MESSAGE ", state, theme)
             }
-            Overlay::ConfirmGitRestore { path } => {
-                render_git_restore_confirmation(frame, area, path, theme)
-            }
+            Overlay::ConfirmGitRestore { path } => render_git_restore_confirmation(
+                frame,
+                area,
+                path,
+                theme,
+                state.settings.ui.icon_mode,
+            ),
             Overlay::ConfirmGitHunkRestore { .. } => {
-                render_hunk_restore_confirmation(frame, area, theme)
+                render_hunk_restore_confirmation(frame, area, theme, state.settings.ui.icon_mode)
             }
             Overlay::GitBranchPicker => render_branch_picker(frame, area, state, theme),
             Overlay::GitBranchCreate => {
@@ -134,7 +147,9 @@ pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) -> Regions {
             Overlay::SearchExcludeGlobs => {
                 render_text_prompt(frame, area, " SEARCH EXCLUDE GLOBS ", state, theme)
             }
-            Overlay::ConfirmQuitTerminal => render_terminal_quit_confirmation(frame, area, theme),
+            Overlay::ConfirmQuitTerminal => {
+                render_terminal_quit_confirmation(frame, area, theme, state.settings.ui.icon_mode)
+            }
             Overlay::LspHover => render_lsp_hover(frame, area, state, theme),
             Overlay::LspCompletion => render_lsp_completion(frame, area, state, theme),
         }
@@ -142,31 +157,283 @@ pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) -> Regions {
     regions
 }
 
+/// Maps a [`FileIconColor`] role onto the active theme (SPEC/01_ui.md §6.3:
+/// never hard-code a `Color` in the render layer). Mirrors the existing
+/// `git_status_color`/`syntax_color` helpers below.
+fn file_icon_color(color: FileIconColor, theme: &Theme) -> Color {
+    match color {
+        FileIconColor::Number => theme.syntax_number,
+        FileIconColor::Function => theme.syntax_function,
+        FileIconColor::Type => theme.syntax_type,
+        FileIconColor::Keyword => theme.syntax_keyword,
+        FileIconColor::Str => theme.syntax_string,
+        FileIconColor::Muted => theme.text_muted,
+        FileIconColor::Constant => theme.syntax_constant,
+        FileIconColor::GitModified => theme.git_modified,
+        FileIconColor::Accent => theme.accent,
+        FileIconColor::Faint => theme.text_faint,
+    }
+}
+
+fn file_icon_span(icon: FileIcon, theme: &Theme, background: Color) -> Span<'static> {
+    Span::styled(
+        icon.glyph.to_owned(),
+        Style::default()
+            .fg(file_icon_color(icon.color, theme))
+            .bg(background),
+    )
+}
+
+/// Builds a consistently-styled overlay `Block` (palette, pickers, prompts,
+/// hover, completion, confirmations, ...): `surface_raised` background,
+/// `border` token, accent+bold title, rounded corners in Unicode/NerdFont
+/// mode (Ascii mode keeps plain corners — rounded corners are drawn with
+/// non-ASCII box-drawing glyphs).
+fn overlay_block(title: impl Into<String>, theme: &Theme, icon_mode: IconMode) -> Block<'static> {
+    overlay_block_bordered(title, theme.border, theme, icon_mode)
+}
+
+/// Like [`overlay_block`], but with an explicit border color — used by
+/// destructive/warning confirmations that signal severity through the
+/// border (`diagnostic_error`/`diagnostic_warning`) as well as by
+/// focus-driven overlays that want an accent border.
+fn overlay_block_bordered(
+    title: impl Into<String>,
+    border_color: Color,
+    theme: &Theme,
+    icon_mode: IconMode,
+) -> Block<'static> {
+    let border_type = if icon_mode == IconMode::Ascii {
+        BorderType::Plain
+    } else {
+        BorderType::Rounded
+    };
+    Block::default()
+        .title(title.into())
+        .title_style(
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        )
+        .borders(Borders::ALL)
+        .border_type(border_type)
+        .border_style(Style::default().fg(border_color))
+        .style(Style::default().bg(theme.surface_raised))
+}
+
+/// Splits a workspace-relative path display string at its last `/` so
+/// callers can render the directory part faint and the file name bright
+/// (Source Control file rows, file picker results).
+fn split_dirname_basename(display: &str) -> (&str, &str) {
+    display
+        .rsplit_once('/')
+        .map_or(("", display), |(dir, base)| (dir, base))
+}
+
+/// Case-insensitive first-occurrence substring match, returning the
+/// *character* range in `text` that matches `query`. Used to highlight the
+/// command palette's substring filter (see `AppState::palette_commands`)
+/// without threading match indices through the command registry.
+fn substring_match_range(text: &str, query: &str) -> Option<(usize, usize)> {
+    if query.is_empty() {
+        return None;
+    }
+    let lower_text = text.to_ascii_lowercase();
+    let lower_query = query.to_ascii_lowercase();
+    let byte_start = lower_text.find(&lower_query)?;
+    let char_start = lower_text[..byte_start].chars().count();
+    let char_len = lower_query.chars().count();
+    Some((char_start, char_start + char_len))
+}
+
+/// Cheap case-insensitive subsequence scan approximating which characters
+/// of `text` matched `query` (greedy first-match), for highlighting fuzzy
+/// file-picker results. `nucleo_matcher` doesn't expose match indices
+/// through `FileMatch` (`src/search/files.rs`), and re-running its scorer
+/// here just for indices would duplicate a non-trivial matcher; a greedy
+/// subsequence scan is O(len) and visually matches nucleo's subsequence
+/// semantics closely enough for a highlight, not a correctness-critical
+/// path.
+fn subsequence_match_chars(text: &str, query: &str) -> Vec<bool> {
+    let lower_query = query.to_ascii_lowercase().chars().collect::<Vec<_>>();
+    let mut result = vec![false; text.chars().count()];
+    if lower_query.is_empty() {
+        return result;
+    }
+    let mut query_index = 0usize;
+    for (index, character) in text.chars().enumerate() {
+        if query_index < lower_query.len()
+            && character.to_ascii_lowercase() == lower_query[query_index]
+        {
+            result[index] = true;
+            query_index += 1;
+        }
+    }
+    result
+}
+
+/// Renders `text` as spans with subsequence-matched characters highlighted
+/// in `theme.accent` + bold, per [`subsequence_match_chars`].
+fn highlighted_spans(text: &str, query: &str, theme: &Theme, base: Style) -> Vec<Span<'static>> {
+    let matches = subsequence_match_chars(text, query);
+    let mut spans = Vec::new();
+    let mut current = String::new();
+    let mut current_matched = false;
+    let mut first = true;
+    for (character, matched) in text.chars().zip(matches) {
+        if first {
+            current_matched = matched;
+            first = false;
+        }
+        if matched != current_matched {
+            spans.push(Span::styled(
+                std::mem::take(&mut current),
+                if current_matched {
+                    base.fg(theme.accent).add_modifier(Modifier::BOLD)
+                } else {
+                    base
+                },
+            ));
+            current_matched = matched;
+        }
+        current.push(character);
+    }
+    if !current.is_empty() {
+        spans.push(Span::styled(
+            current,
+            if current_matched {
+                base.fg(theme.accent).add_modifier(Modifier::BOLD)
+            } else {
+                base
+            },
+        ));
+    }
+    spans
+}
+
+/// Renders `text` as spans with the first case-insensitive substring match
+/// of `query` highlighted in `theme.accent` + bold, per
+/// [`substring_match_range`]. Used for the command palette, whose filter
+/// (`AppState::palette_commands`) is a substring `.contains()` check rather
+/// than a fuzzy subsequence match, so highlighting should reflect that
+/// exactly rather than approximate it.
+fn substring_highlighted_spans(
+    text: &str,
+    query: &str,
+    theme: &Theme,
+    base: Style,
+) -> Vec<Span<'static>> {
+    let Some((match_start, match_end)) = substring_match_range(text, query) else {
+        return vec![Span::styled(text.to_owned(), base)];
+    };
+    let chars = text.chars().collect::<Vec<_>>();
+    let before: String = chars[..match_start].iter().collect();
+    let matched: String = chars[match_start..match_end].iter().collect();
+    let after: String = chars[match_end..].iter().collect();
+    let mut spans = Vec::new();
+    if !before.is_empty() {
+        spans.push(Span::styled(before, base));
+    }
+    spans.push(Span::styled(
+        matched,
+        base.fg(theme.accent).add_modifier(Modifier::BOLD),
+    ));
+    if !after.is_empty() {
+        spans.push(Span::styled(after, base));
+    }
+    spans
+}
+
+/// Pads `spans` with trailing filler spaces styled with `background` so the
+/// rendered line's background covers the full row width, not just the
+/// glyphs it draws (`List`/`Paragraph` only paint the background behind the
+/// characters a `Span` actually contains). Used for selected-row
+/// highlighting so the selection color reads as a full-row bar rather than
+/// a text-width smear (SPEC/01_ui.md §6.4).
+fn pad_to_width(
+    mut spans: Vec<Span<'static>>,
+    width: usize,
+    background: Color,
+) -> Vec<Span<'static>> {
+    let used: usize = spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum();
+    if used < width {
+        spans.push(Span::styled(
+            " ".repeat(width - used),
+            Style::default().bg(background),
+        ));
+    }
+    spans
+}
+
+/// Builds a query-input row: `❯ {query}` (ascii: `> {query}`), prompt glyph
+/// in `theme.accent`. Shared by the palette, file picker, path input, text
+/// prompt, branch picker, and buffer search overlays (SPEC brief §6:
+/// "prompt row starts with accent ❯"). The prompt-plus-space is always 2
+/// columns wide in every mode, matching the previous hard-coded `"> "` so
+/// existing cursor-column math (`+2`) stays correct.
+fn prompt_line(query: &str, theme: &Theme, icon_set: &IconSet, background: Color) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("{} ", icon_set.prompt),
+            Style::default().fg(theme.accent).bg(background),
+        ),
+        Span::styled(
+            query.to_owned(),
+            Style::default().fg(theme.text).bg(background),
+        ),
+    ])
+}
+
 fn render_activity(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let icon_set = icons(state.settings.ui.icon_mode);
+    let changed_files = state
+        .git_status
+        .as_ref()
+        .map_or(0, |status| status.files.len());
     let entries = [
-        ("E", SidebarView::Explorer),
-        ("G", SidebarView::SourceControl),
-        ("S", SidebarView::Search),
+        ("E", SidebarView::Explorer, 0usize),
+        ("G", SidebarView::SourceControl, changed_files),
+        ("S", SidebarView::Search, 0usize),
     ];
     let lines = entries
         .into_iter()
-        .map(|(label, view)| {
+        .map(|(label, view, badge)| {
             let selected = state.sidebar_view == view;
-            Line::from(Span::styled(
-                format!(" {label} "),
-                Style::default()
-                    .fg(if selected {
-                        theme.accent
-                    } else {
-                        theme.text_muted
-                    })
-                    .bg(theme.surface)
-                    .add_modifier(if selected {
-                        Modifier::BOLD | Modifier::UNDERLINED
-                    } else {
-                        Modifier::empty()
-                    }),
-            ))
+            let bar = if selected && !state.settings.ui.reduced_decoration {
+                icon_set.accent_bar
+            } else {
+                " "
+            };
+            let badge_text = if badge > 0 {
+                format!(" {badge}")
+            } else {
+                String::new()
+            };
+            Line::from(vec![
+                Span::styled(bar, Style::default().fg(theme.accent).bg(theme.surface)),
+                Span::styled(
+                    format!("{label} "),
+                    Style::default()
+                        .fg(if selected {
+                            theme.accent
+                        } else {
+                            theme.text_faint
+                        })
+                        .bg(theme.surface)
+                        .add_modifier(if selected {
+                            Modifier::BOLD | Modifier::UNDERLINED
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+                Span::styled(
+                    badge_text,
+                    Style::default().fg(theme.git_modified).bg(theme.surface),
+                ),
+            ])
         })
         .collect::<Vec<_>>();
     frame.render_widget(
@@ -188,7 +455,12 @@ fn render_sidebar(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme
         .border_style(Style::default().fg(if focused { theme.accent } else { theme.border }))
         .style(Style::default().bg(theme.surface).fg(theme.text));
     if state.sidebar_view == SidebarView::SourceControl {
-        let content = git_sidebar_lines(state, theme);
+        let content = git_sidebar_lines(
+            state,
+            theme,
+            usize::from(area.width.saturating_sub(1)),
+            focused,
+        );
         frame.render_widget(
             Paragraph::new(content)
                 .block(block)
@@ -207,26 +479,30 @@ fn render_sidebar(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme
         return;
     }
     let max = usize::from(area.height.saturating_sub(1));
-    let icon_set = icons(state.settings.ui.icon_mode);
+    let icon_mode = state.settings.ui.icon_mode;
+    let icon_set = icons(icon_mode);
+    // Row width inside the sidebar, minus the 1-column right border drawn
+    // by `block`. Used to pad selection backgrounds to a full-row bar.
+    let row_width = usize::from(area.width.saturating_sub(1));
     let items = state
         .tree
         .visible_entries()
         .take(max)
         .enumerate()
         .map(|(index, entry)| {
-            let icon = match entry.kind {
-                TreeEntryKind::Directory if state.tree.is_expanded(&entry.relative_path) => {
-                    icon_set.dir_expanded
-                }
-                TreeEntryKind::Directory => icon_set.dir_collapsed,
-                TreeEntryKind::File => icon_set.file,
-                TreeEntryKind::Symlink => icon_set.symlink,
-            };
+            let expanded = state.tree.is_expanded(&entry.relative_path);
             let name = entry.relative_path.file_name().map_or_else(
                 || entry.relative_path.to_string_lossy(),
                 |name| name.to_string_lossy(),
             );
-            let prefix = "  ".repeat(entry.depth);
+            let icon = match entry.kind {
+                TreeEntryKind::Directory => folder_icon(expanded, icon_mode),
+                TreeEntryKind::File => file_icon(&name, icon_mode),
+                TreeEntryKind::Symlink => FileIcon {
+                    glyph: icon_set.symlink,
+                    color: FileIconColor::Accent,
+                },
+            };
             let diagnostic_root = state.workspace.as_path().join(&entry.relative_path);
             let (errors, warnings) = state
                 .diagnostics
@@ -247,30 +523,70 @@ fn render_sidebar(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme
                         _ => (errors, warnings),
                     },
                 );
-            let badge = if errors > 0 {
-                format!("  E{errors}")
-            } else if warnings > 0 {
-                format!("  W{warnings}")
+            let selected = index == state.tree_selected;
+            let background = if selected {
+                if focused {
+                    theme.selection
+                } else {
+                    theme.surface
+                }
             } else {
-                String::new()
+                theme.surface
             };
-            let style = if index == state.tree_selected {
-                Style::default()
-                    .fg(theme.text)
-                    .bg(theme.selection)
-                    .add_modifier(Modifier::BOLD)
+            let name_color = if entry.kind == TreeEntryKind::Directory || selected {
+                theme.text
             } else {
-                Style::default().fg(theme.text_muted).bg(theme.surface)
+                theme.text_muted
             };
-            let mut spans = vec![Span::styled(format!("{prefix}{icon} {name}"), style)];
+            let base = Style::default().fg(name_color).bg(background).add_modifier(
+                if selected && focused {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                },
+            );
+            let mut spans = Vec::new();
+            let bar = if selected { icon_set.accent_bar } else { " " };
+            let bar_color = if focused {
+                theme.accent
+            } else {
+                theme.text_faint
+            };
+            spans.push(Span::styled(
+                bar,
+                Style::default().fg(bar_color).bg(background),
+            ));
+            if !state.settings.ui.reduced_decoration && !icon_set.indent_guide.is_empty() {
+                for _ in 0..entry.depth {
+                    spans.push(Span::styled(
+                        format!("{} ", icon_set.indent_guide),
+                        Style::default().fg(theme.text_faint).bg(background),
+                    ));
+                }
+            } else {
+                spans.push(Span::styled("  ".repeat(entry.depth), base));
+            }
+            spans.push(file_icon_span(icon, theme, background));
+            spans.push(Span::styled(format!(" {name}"), base));
             if let Some(marker) = tree_git_marker(entry, state.git_status.as_ref()) {
                 let (symbol, color) = tree_git_marker_glyph(marker, icon_set, theme);
-                spans.push(Span::styled(format!(" {symbol}"), style.fg(color)));
+                spans.push(Span::styled(
+                    format!(" {symbol}"),
+                    Style::default().fg(color).bg(background),
+                ));
             }
-            if !badge.is_empty() {
-                spans.push(Span::styled(badge, style));
+            if errors > 0 {
+                spans.push(Span::styled(
+                    format!("  E{errors}"),
+                    Style::default().fg(theme.diagnostic_error).bg(background),
+                ));
+            } else if warnings > 0 {
+                spans.push(Span::styled(
+                    format!("  W{warnings}"),
+                    Style::default().fg(theme.diagnostic_warning).bg(background),
+                ));
             }
-            ListItem::new(Line::from(spans))
+            ListItem::new(Line::from(pad_to_width(spans, row_width, background)))
         })
         .collect::<Vec<_>>();
     frame.render_widget(List::new(items).block(block), area);
@@ -451,8 +767,14 @@ fn search_sidebar_lines(state: &AppState, theme: &Theme, height: usize) -> Vec<L
     lines
 }
 
-fn git_sidebar_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
-    let icon_set = icons(state.settings.ui.icon_mode);
+fn git_sidebar_lines(
+    state: &AppState,
+    theme: &Theme,
+    width: usize,
+    focused: bool,
+) -> Vec<Line<'static>> {
+    let icon_mode = state.settings.ui.icon_mode;
+    let icon_set = icons(icon_mode);
     if state.git_loading {
         return vec![Line::from(format!(" Refreshing{}", icon_set.ellipsis))];
     }
@@ -466,19 +788,32 @@ fn git_sidebar_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
         )];
     };
     let branch = status.branch.as_deref().unwrap_or("detached HEAD");
-    let tracking = match (status.ahead, status.behind) {
-        (0, 0) => String::new(),
-        (ahead, 0) => format!(" {}{ahead}", icon_set.arrow_up),
-        (0, behind) => format!(" {}{behind}", icon_set.arrow_down),
-        (ahead, behind) => format!(
-            " {}{ahead} {}{behind}",
-            icon_set.arrow_up, icon_set.arrow_down
+    let mut branch_spans = vec![
+        Span::styled(
+            format!(" {} ", icon_set.branch),
+            Style::default().fg(theme.accent).bg(theme.surface),
         ),
-    };
-    let mut lines = vec![Line::from(format!(
-        " {} {branch}{tracking}",
-        icon_set.branch
-    ))];
+        Span::styled(
+            branch.to_owned(),
+            Style::default()
+                .fg(theme.accent)
+                .bg(theme.surface)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if status.ahead > 0 {
+        branch_spans.push(Span::styled(
+            format!("  {}{}", icon_set.arrow_up, status.ahead),
+            Style::default().fg(theme.git_added).bg(theme.surface),
+        ));
+    }
+    if status.behind > 0 {
+        branch_spans.push(Span::styled(
+            format!("  {}{}", icon_set.arrow_down, status.behind),
+            Style::default().fg(theme.git_modified).bg(theme.surface),
+        ));
+    }
+    let mut lines = vec![Line::from(branch_spans)];
     let mut selection_index = 0usize;
     for section in GitSection::ALL {
         let files = status
@@ -490,48 +825,72 @@ fn git_sidebar_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
             continue;
         }
         lines.push(Line::from(""));
-        lines.push(Line::from(format!(
-            " {} ({})",
+        lines.push(section_rule_line(
             section.title(),
-            files.len()
-        )));
+            files.len(),
+            width,
+            theme,
+            icon_set,
+        ));
         for file in files {
-            let marker = if file.conflicted {
-                "!"
-            } else if file.untracked {
-                "?"
-            } else {
-                match file.kind {
-                    crate::git::GitFileKind::Added => "A",
-                    crate::git::GitFileKind::Deleted => "D",
-                    crate::git::GitFileKind::Renamed => "R",
-                    crate::git::GitFileKind::Copied => "C",
-                    crate::git::GitFileKind::TypeChanged => "T",
-                    crate::git::GitFileKind::Unmerged => "!",
-                    crate::git::GitFileKind::Untracked => "?",
-                    crate::git::GitFileKind::Modified => "M",
-                }
-            };
+            let marker = crate::git::status_symbol(file);
+            let marker_color = git_status_color(file, theme);
             let selected = selection_index == state.git_selected;
-            lines.push(Line::from(Span::styled(
-                format!("  {marker} {}", file.path.display()),
-                Style::default()
-                    .fg(if selected {
-                        theme.text
-                    } else {
-                        theme.text_muted
-                    })
-                    .bg(if selected {
-                        theme.selection
-                    } else {
-                        theme.surface
-                    })
-                    .add_modifier(if selected {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    }),
-            )));
+            let background = if selected {
+                if focused {
+                    theme.selection
+                } else {
+                    theme.surface
+                }
+            } else {
+                theme.surface
+            };
+            let display = file.path.to_string_lossy();
+            let (dirname, basename) = split_dirname_basename(&display);
+            let dir_prefix = if dirname.is_empty() {
+                String::new()
+            } else {
+                format!("{dirname}/")
+            };
+            let icon = file_icon(basename, icon_mode);
+            let mut spans = vec![
+                Span::styled(
+                    if selected { icon_set.accent_bar } else { " " },
+                    Style::default()
+                        .fg(if focused {
+                            theme.accent
+                        } else {
+                            theme.text_faint
+                        })
+                        .bg(background),
+                ),
+                Span::styled(
+                    format!(" {marker} "),
+                    Style::default().fg(marker_color).bg(background),
+                ),
+                file_icon_span(icon, theme, background),
+                Span::styled(
+                    format!(" {dir_prefix}"),
+                    Style::default().fg(theme.text_faint).bg(background),
+                ),
+                Span::styled(
+                    basename.to_owned(),
+                    Style::default()
+                        .fg(if selected {
+                            theme.text
+                        } else {
+                            theme.text_muted
+                        })
+                        .bg(background)
+                        .add_modifier(if selected {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+            ];
+            spans = pad_to_width(spans, width, background);
+            lines.push(Line::from(spans));
             selection_index = selection_index.saturating_add(1);
         }
     }
@@ -542,42 +901,101 @@ fn git_sidebar_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
     lines
 }
 
+/// Builds the `─ STAGED (3) ─────` Source Control section-header pattern:
+/// a leading rule glyph, the uppercase title, the count in accent, then
+/// rule fill to `width` in `border`/`text_faint`.
+fn section_rule_line(
+    title: &str,
+    count: usize,
+    width: usize,
+    theme: &Theme,
+    icon_set: &IconSet,
+) -> Line<'static> {
+    let prefix = format!("{} {title} (", icon_set.rule);
+    let count_text = count.to_string();
+    let used =
+        UnicodeWidthStr::width(prefix.as_str()) + UnicodeWidthStr::width(count_text.as_str()) + 2; // ") " suffix before the rule fill
+    let fill_width = width.saturating_sub(used).max(1);
+    let fill = icon_set.rule.repeat(fill_width);
+    Line::from(vec![
+        Span::styled(
+            prefix,
+            Style::default().fg(theme.text_faint).bg(theme.surface),
+        ),
+        Span::styled(
+            count_text,
+            Style::default().fg(theme.accent).bg(theme.surface),
+        ),
+        Span::styled(
+            ") ",
+            Style::default().fg(theme.text_faint).bg(theme.surface),
+        ),
+        Span::styled(fill, Style::default().fg(theme.border).bg(theme.surface)),
+    ])
+}
+
 fn render_editor(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let icon_set = icons(state.settings.ui.icon_mode);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(1)])
         .split(area);
-    let titles = state
+    let mut titles = state
         .tabs
         .iter()
         .map(|tab| {
-            let dirty = if tab.buffer.is_dirty() {
-                format!(" {}", icon_set.dirty)
-            } else {
-                String::new()
-            };
-            Line::from(format!(" {}{dirty} {} ", tab.title(), icon_set.close))
+            let dirty_style = Style::default().fg(theme.git_modified).bg(theme.surface);
+            let text_style = Style::default().fg(theme.text_muted).bg(theme.surface);
+            let mut spans = vec![Span::styled(format!(" {}", tab.title()), text_style)];
+            if tab.buffer.is_dirty() {
+                spans.push(Span::styled(format!(" {}", icon_set.dirty), dirty_style));
+            }
+            spans.push(Span::styled(format!(" {} ", icon_set.close), text_style));
+            Line::from(spans)
         })
         .collect::<Vec<_>>();
+    if let Some(diff) = &state.git_diff {
+        let name = diff.path.file_name().map_or_else(
+            || diff.path.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        titles.push(Line::from(vec![
+            Span::styled(
+                format!(" {name} (Diff) "),
+                Style::default().fg(theme.text_muted).bg(theme.surface),
+            ),
+            Span::styled(
+                format!("{} ", icon_set.close),
+                Style::default().fg(theme.text_muted).bg(theme.surface),
+            ),
+        ]));
+    }
     let tabs = Tabs::new(if titles.is_empty() {
         vec![Line::from(" Welcome ")]
     } else {
         titles
     })
-    .select(state.active_tab.unwrap_or(0))
-    .style(
-        Style::default()
-            .fg(theme.text_muted)
-            .bg(theme.surface_raised),
-    )
+    .select(if state.git_diff_active {
+        state.tabs.len()
+    } else {
+        state.active_tab.unwrap_or(0)
+    })
+    .style(Style::default().fg(theme.text_muted).bg(theme.surface))
     .highlight_style(
         Style::default()
             .fg(theme.accent)
-            .bg(theme.background)
+            .bg(theme.surface_raised)
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-    );
+    )
+    .divider(Span::styled(
+        icon_set.separator,
+        Style::default().fg(theme.text_faint),
+    ));
     frame.render_widget(tabs, rows[0]);
+    if state.git_diff_active {
+        render_git_diff_editor(frame, rows[1], state, theme);
+        return;
+    }
     let Some(tab) = state.active_tab() else {
         frame.render_widget(Paragraph::new("\n  MICA\n  Open a file from Explorer\n\n  Ctrl+Shift+P  Command Palette\n  Ctrl+Q        Quit")
             .style(Style::default().fg(theme.text_muted).bg(theme.background)), rows[1]);
@@ -614,7 +1032,7 @@ fn render_editor(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
                 number,
                 Style::default()
                     .fg(diagnostic_color.unwrap_or(if active {
-                        theme.accent
+                        theme.text
                     } else {
                         theme.text_faint
                     }))
@@ -662,6 +1080,40 @@ fn render_editor(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
             frame.set_cursor_position(Position::new(x, y));
         }
     }
+}
+
+fn render_git_diff_editor(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let Some(diff) = &state.git_diff else {
+        return;
+    };
+    let target = match diff.target {
+        crate::git::DiffTarget::WorkingTree => "Working Tree ↔ Index",
+        crate::git::DiffTarget::Staged => "Index ↔ HEAD",
+    };
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            format!(" {} ", diff.path.display()),
+            Style::default()
+                .fg(theme.text)
+                .bg(theme.surface_raised)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{target}  READ-ONLY"),
+            Style::default()
+                .fg(theme.text_faint)
+                .bg(theme.surface_raised),
+        ),
+    ])];
+    lines.extend(git_diff_lines(
+        state,
+        theme,
+        usize::from(area.height.saturating_sub(1)),
+    ));
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().fg(theme.text_muted).bg(theme.background)),
+        area,
+    );
 }
 
 fn editor_gutter_marker(
@@ -863,33 +1315,14 @@ fn render_bottom(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
             Paragraph::new(output)
                 .block(
                     Block::default()
-                        .title(" PROBLEMS  DIFF  OUTPUT  TERMINAL   [Output] ")
+                        .title(" PROBLEMS  OUTPUT  TERMINAL   [Output] ")
                         .borders(Borders::TOP)
                         .border_style(Style::default().fg(theme.border)),
                 )
                 .style(Style::default().fg(theme.text_muted).bg(theme.surface)),
             area,
         );
-        return;
     }
-    let icon_set = icons(state.settings.ui.icon_mode);
-    let block = Block::default()
-        .title(format!(
-            " PROBLEMS  DIFF  OUTPUT  TERMINAL   [Diff] {}/{} hunk ",
-            icon_set.arrow_up, icon_set.arrow_down
-        ))
-        .borders(Borders::TOP)
-        .border_style(Style::default().fg(theme.border));
-    frame.render_widget(
-        Paragraph::new(git_diff_lines(
-            state,
-            theme,
-            usize::from(area.height.saturating_sub(1)),
-        ))
-        .block(block)
-        .style(Style::default().fg(theme.text_muted).bg(theme.surface)),
-        area,
-    );
 }
 
 fn render_problems(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -968,7 +1401,7 @@ fn render_problems(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         .block(
             Block::default()
                 .title(format!(
-                    " PROBLEMS  DIFF  OUTPUT  TERMINAL   [Problems: {filter}] F filter "
+                    " PROBLEMS  OUTPUT  TERMINAL   [Problems: {filter}] F filter "
                 ))
                 .borders(Borders::TOP)
                 .border_style(Style::default().fg(if state.focus == Focus::BottomPanel {
@@ -989,8 +1422,8 @@ fn diagnostic_style(
     match severity {
         crate::diagnostics::DiagnosticSeverity::Error => ("E", theme.diagnostic_error),
         crate::diagnostics::DiagnosticSeverity::Warning => ("W", theme.diagnostic_warning),
-        crate::diagnostics::DiagnosticSeverity::Information => ("I", theme.accent),
-        crate::diagnostics::DiagnosticSeverity::Hint => ("H", theme.text_faint),
+        crate::diagnostics::DiagnosticSeverity::Information => ("I", theme.diagnostic_info),
+        crate::diagnostics::DiagnosticSeverity::Hint => ("H", theme.diagnostic_hint),
     }
 }
 
@@ -1022,7 +1455,7 @@ fn render_terminal(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
             .block(
                 Block::default()
                     .title(format!(
-                        " PROBLEMS  DIFF  OUTPUT  TERMINAL   [Terminal] {title} [{status}]{scroll} "
+                        " PROBLEMS  OUTPUT  TERMINAL   [Terminal] {title} [{status}]{scroll} "
                     ))
                     .borders(Borders::TOP)
                     .border_style(Style::default().fg(if state.focus == Focus::BottomPanel {
@@ -1122,17 +1555,22 @@ fn git_diff_lines(state: &AppState, theme: &Theme, limit: usize) -> Vec<Line<'st
         .lines()
         .take(limit)
         .map(|line| {
-            if line.starts_with("@@ ") {
+            let is_hunk_header = line.starts_with("@@ ");
+            if is_hunk_header {
                 hunk_index = Some(hunk_index.map_or(0usize, |index| index.saturating_add(1)));
             }
-            let color = if line.starts_with('+') && !line.starts_with("+++") {
-                theme.git_added
-            } else if line.starts_with('-') && !line.starts_with("---") {
-                theme.git_deleted
-            } else {
-                theme.text_muted
-            };
             let selected = hunk_index == Some(state.git_hunk_selected);
+            let is_added = line.starts_with('+') && !line.starts_with("+++");
+            let is_deleted = line.starts_with('-') && !line.starts_with("---");
+            let (color, base_background) = if is_hunk_header {
+                (theme.accent, theme.surface_raised)
+            } else if is_added {
+                (theme.git_added, theme.diff_add_bg)
+            } else if is_deleted {
+                (theme.git_deleted, theme.diff_delete_bg)
+            } else {
+                (theme.text_muted, theme.surface)
+            };
             Line::from(Span::styled(
                 line.to_owned(),
                 Style::default()
@@ -1140,9 +1578,9 @@ fn git_diff_lines(state: &AppState, theme: &Theme, limit: usize) -> Vec<Line<'st
                     .bg(if selected {
                         theme.active_line
                     } else {
-                        theme.surface
+                        base_background
                     })
-                    .add_modifier(if line.starts_with("@@ ") && selected {
+                    .add_modifier(if is_hunk_header {
                         Modifier::BOLD
                     } else {
                         Modifier::empty()
@@ -1152,9 +1590,112 @@ fn git_diff_lines(state: &AppState, theme: &Theme, limit: usize) -> Vec<Line<'st
         .collect()
 }
 
+/// Joins pre-built segment spans with a single-cell gap and a `text_faint`
+/// separator glyph (SPEC brief §5: "single-cell gaps and text_faint │
+/// separators, no powerline triangles"). Empty segments are dropped rather
+/// than leaving a dangling separator.
+fn join_segments(
+    segments: Vec<Vec<Span<'static>>>,
+    separator: &str,
+    theme: &Theme,
+    background: Color,
+) -> Vec<Span<'static>> {
+    let separator_style = Style::default().fg(theme.text_faint).bg(background);
+    let mut spans = Vec::new();
+    for segment in segments {
+        if segment.is_empty() {
+            continue;
+        }
+        if !spans.is_empty() {
+            spans.push(Span::styled(format!(" {separator} "), separator_style));
+        }
+        spans.extend(segment);
+    }
+    spans
+}
+
 fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let (file, position, encoding) = state.active_tab().map_or_else(
-        || ("No file".to_owned(), String::new(), String::new()),
+    let background = theme.surface_raised;
+    let icon_set = icons(state.settings.ui.icon_mode);
+    let base = Style::default().fg(theme.text).bg(background);
+    let faint = Style::default().fg(theme.text_faint).bg(background);
+
+    // Left: focus/pane indicator.
+    let pane_label = match state.focus {
+        Focus::Sidebar => match state.sidebar_view {
+            SidebarView::Explorer => "EXPLORER",
+            SidebarView::SourceControl => "SOURCE CONTROL",
+            SidebarView::Search => "SEARCH",
+        },
+        Focus::Editor => "EDITOR",
+        Focus::BottomPanel => match state.bottom_panel_view {
+            BottomPanelView::Problems => "PROBLEMS",
+            BottomPanelView::Output => "OUTPUT",
+            BottomPanelView::Terminal => "TERMINAL",
+        },
+        Focus::Overlay => "OVERLAY",
+    };
+    let pane_segment = vec![Span::styled(
+        format!(" {pane_label}"),
+        Style::default()
+            .fg(theme.accent)
+            .bg(background)
+            .add_modifier(Modifier::BOLD),
+    )];
+
+    // Left: Git branch segment.
+    let git_segment = state.git_status.as_ref().map_or_else(Vec::new, |git| {
+        let branch = git.branch.as_deref().unwrap_or("detached");
+        let mut spans = vec![
+            Span::styled(format!("{} ", icon_set.branch), base),
+            Span::styled(
+                branch.to_owned(),
+                Style::default().fg(theme.accent).bg(background),
+            ),
+        ];
+        if git.ahead > 0 {
+            spans.push(Span::styled(
+                format!(" {}{}", icon_set.arrow_up, git.ahead),
+                Style::default().fg(theme.git_added).bg(background),
+            ));
+        }
+        if git.behind > 0 {
+            spans.push(Span::styled(
+                format!(" {}{}", icon_set.arrow_down, git.behind),
+                Style::default().fg(theme.git_modified).bg(background),
+            ));
+        }
+        if !git.files.is_empty() {
+            spans.push(Span::styled(
+                format!(" {}{}", icon_set.delta, git.files.len()),
+                Style::default().fg(theme.git_modified).bg(background),
+            ));
+        }
+        spans
+    });
+
+    // Right: diagnostics summary.
+    let (errors, warnings) = state.diagnostics.counts();
+    let mut diagnostics_segment = Vec::new();
+    if errors > 0 {
+        diagnostics_segment.push(Span::styled(
+            format!("{} {errors}", icon_set.error_icon),
+            Style::default().fg(theme.diagnostic_error).bg(background),
+        ));
+    }
+    if warnings > 0 {
+        if !diagnostics_segment.is_empty() {
+            diagnostics_segment.push(Span::styled("  ", base));
+        }
+        diagnostics_segment.push(Span::styled(
+            format!("{} {warnings}", icon_set.warning_icon),
+            Style::default().fg(theme.diagnostic_warning).bg(background),
+        ));
+    }
+
+    // Right: cursor position, language, encoding, RO marker.
+    let (position, language, encoding, read_only) = state.active_tab().map_or_else(
+        || (String::new(), String::new(), String::new(), false),
         |tab| {
             let selection = tab.buffer.selection();
             let line = tab
@@ -1173,39 +1714,94 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
                 LineEnding::CrLf => "CRLF",
                 LineEnding::Mixed => "Mixed",
             };
+            let language = tab
+                .buffer
+                .path()
+                .and_then(|path| state.language_for_path(path))
+                .map_or_else(String::new, |(name, _)| name);
             (
-                tab.title(),
                 format!("Ln {}, Col {}", line + 1, column + 1),
-                format!("UTF-8  {ending}"),
+                language,
+                format!("UTF-8 {ending}"),
+                tab.buffer.is_read_only(),
             )
         },
     );
-    let icon_set = icons(state.settings.ui.icon_mode);
-    let message = state.notification.as_deref().unwrap_or("");
-    let git = state.git_status.as_ref().map_or_else(String::new, |git| {
-        let branch = git.branch.as_deref().unwrap_or("detached");
-        let count = git.files.len();
-        let tracking = match (git.ahead, git.behind) {
-            (0, 0) => String::new(),
-            (ahead, 0) => format!(" {}{ahead}", icon_set.arrow_up),
-            (0, behind) => format!(" {}{behind}", icon_set.arrow_down),
-            (ahead, behind) => format!(
-                " {}{ahead}{}{behind}",
-                icon_set.arrow_up, icon_set.arrow_down
-            ),
-        };
-        format!("Git {branch}{tracking} {}{count}", icon_set.delta)
-    });
-    let (errors, warnings) = state.diagnostics.counts();
-    let problems = format!("E {errors}  W {warnings}");
-    let status = format!(" {file}   {message}   {git}   {problems}   {encoding}   {position} ");
-    frame.render_widget(
-        Paragraph::new(status).style(Style::default().fg(theme.text).bg(theme.surface_raised)),
-        area,
+    let position_segment = if position.is_empty() {
+        Vec::new()
+    } else {
+        vec![Span::styled(position, faint)]
+    };
+    let language_segment = if language.is_empty() {
+        Vec::new()
+    } else {
+        vec![Span::styled(language, faint)]
+    };
+    let encoding_segment = if encoding.is_empty() {
+        Vec::new()
+    } else {
+        vec![Span::styled(encoding, faint)]
+    };
+    let ro_segment = if read_only {
+        vec![Span::styled(
+            "RO",
+            Style::default()
+                .fg(theme.diagnostic_warning)
+                .bg(background)
+                .add_modifier(Modifier::BOLD),
+        )]
+    } else {
+        Vec::new()
+    };
+
+    let left = join_segments(
+        vec![pane_segment, git_segment],
+        icon_set.separator,
+        theme,
+        background,
     );
+    let right = join_segments(
+        vec![
+            diagnostics_segment,
+            ro_segment,
+            language_segment,
+            encoding_segment,
+            position_segment,
+        ],
+        icon_set.separator,
+        theme,
+        background,
+    );
+    let left_width = left
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum::<usize>();
+    let right_width = right
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum::<usize>()
+        + 1; // trailing gap before the right edge
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(u16::try_from(left_width).unwrap_or(u16::MAX)),
+            Constraint::Min(0),
+            Constraint::Length(u16::try_from(right_width).unwrap_or(u16::MAX)),
+        ])
+        .split(area);
+    frame.render_widget(Paragraph::new(Line::from(left)).style(base), columns[0]);
+    let message = state.notification.as_deref().unwrap_or("");
+    frame.render_widget(
+        Paragraph::new(format!(" {message}"))
+            .style(Style::default().fg(theme.text_muted).bg(background)),
+        columns[1],
+    );
+    frame.render_widget(Paragraph::new(Line::from(right)).style(base), columns[2]);
 }
 
 fn render_palette(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let icon_mode = state.settings.ui.icon_mode;
+    let icon_set = icons(icon_mode);
     let width = area.width.saturating_sub(8).min(72);
     let height = area.height.saturating_sub(4).min(14);
     let popup = Rect::new(area.x + (area.width - width) / 2, area.y + 2, width, height);
@@ -1218,36 +1814,54 @@ fn render_palette(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(1)])
         .split(inner);
-    let block = Block::default()
-        .title(" COMMAND PALETTE ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.accent))
-        .style(Style::default().bg(theme.surface_raised));
-    frame.render_widget(block, popup);
+    frame.render_widget(overlay_block(" COMMAND PALETTE ", theme, icon_mode), popup);
     frame.render_widget(
-        Paragraph::new(format!("> {}", state.palette_query))
-            .style(Style::default().fg(theme.text).bg(theme.selection)),
+        Paragraph::new(prompt_line(
+            &state.palette_query,
+            theme,
+            icon_set,
+            theme.selection,
+        ))
+        .style(Style::default().bg(theme.selection)),
         rows[0],
     );
+    let row_width = usize::from(rows[1].width);
     let commands = state
         .palette_commands()
         .into_iter()
         .take(usize::from(rows[1].height))
         .enumerate()
         .map(|(index, command)| {
-            ListItem::new(format!("{}  {}", command.title, command.id)).style(
-                Style::default()
-                    .fg(if index == 0 {
-                        theme.text
-                    } else {
-                        theme.text_muted
-                    })
-                    .bg(if index == 0 {
-                        theme.selection
-                    } else {
-                        theme.surface_raised
-                    }),
-            )
+            let selected = index == 0;
+            let background = if selected {
+                theme.selection
+            } else {
+                theme.surface_raised
+            };
+            let base = Style::default()
+                .fg(if selected {
+                    theme.text
+                } else {
+                    theme.text_muted
+                })
+                .bg(background);
+            let bar = if selected { icon_set.accent_bar } else { " " };
+            let mut spans = vec![Span::styled(
+                bar,
+                Style::default().fg(theme.accent).bg(background),
+            )];
+            spans.extend(substring_highlighted_spans(
+                command.title,
+                &state.palette_query,
+                theme,
+                base,
+            ));
+            spans.push(Span::styled(
+                format!("  {}", command.id),
+                Style::default().fg(theme.text_faint).bg(background),
+            ));
+            let spans = pad_to_width(spans, row_width, background);
+            ListItem::new(Line::from(spans)).style(base)
         })
         .collect::<Vec<_>>();
     frame.render_widget(List::new(commands), rows[1]);
@@ -1274,15 +1888,16 @@ fn render_path_input(
         7.min(area.height.saturating_sub(4)),
     );
     frame.render_widget(Clear, popup);
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.accent))
-        .style(Style::default().bg(theme.surface_raised));
+    let icon_mode = state.settings.ui.icon_mode;
     frame.render_widget(
-        Paragraph::new(format!("> {}", state.palette_query))
-            .block(block)
-            .style(Style::default().fg(theme.text).bg(theme.surface_raised)),
+        Paragraph::new(prompt_line(
+            &state.palette_query,
+            theme,
+            icons(icon_mode),
+            theme.surface_raised,
+        ))
+        .block(overlay_block(title.to_owned(), theme, icon_mode))
+        .style(Style::default().fg(theme.text).bg(theme.surface_raised)),
         popup,
     );
     let query_column = crate::editor::display_column(
@@ -1303,15 +1918,16 @@ fn render_text_prompt(frame: &mut Frame, area: Rect, title: &str, state: &AppSta
     let width = area.width.saturating_sub(8).min(72);
     let popup = Rect::new(area.x + (area.width - width) / 2, area.y + 3, width, 3);
     frame.render_widget(Clear, popup);
+    let icon_mode = state.settings.ui.icon_mode;
     frame.render_widget(
-        Paragraph::new(format!("> {}", state.palette_query))
-            .block(
-                Block::default()
-                    .title(title)
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(theme.accent)),
-            )
-            .style(Style::default().fg(theme.text).bg(theme.surface_raised)),
+        Paragraph::new(prompt_line(
+            &state.palette_query,
+            theme,
+            icons(icon_mode),
+            theme.surface_raised,
+        ))
+        .block(overlay_block(title.to_owned(), theme, icon_mode))
+        .style(Style::default().fg(theme.text).bg(theme.surface_raised)),
         popup,
     );
 }
@@ -1321,6 +1937,7 @@ fn render_git_restore_confirmation(
     area: Rect,
     path: &std::path::Path,
     theme: &Theme,
+    icon_mode: IconMode,
 ) {
     let width = area.width.saturating_sub(8).min(72);
     let popup = Rect::new(area.x + (area.width - width) / 2, area.y + 3, width, 6);
@@ -1331,18 +1948,23 @@ fn render_git_restore_confirmation(
     );
     frame.render_widget(
         Paragraph::new(text)
-            .block(
-                Block::default()
-                    .title(" CONFIRM RESTORE ")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(theme.diagnostic_error)),
-            )
+            .block(overlay_block_bordered(
+                " CONFIRM RESTORE ",
+                theme.diagnostic_error,
+                theme,
+                icon_mode,
+            ))
             .style(Style::default().fg(theme.text).bg(theme.surface_raised)),
         popup,
     );
 }
 
-fn render_hunk_restore_confirmation(frame: &mut Frame, area: Rect, theme: &Theme) {
+fn render_hunk_restore_confirmation(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    icon_mode: IconMode,
+) {
     let width = area.width.saturating_sub(8).min(68);
     let popup = Rect::new(area.x + (area.width - width) / 2, area.y + 3, width, 6);
     frame.render_widget(Clear, popup);
@@ -1350,18 +1972,23 @@ fn render_hunk_restore_confirmation(frame: &mut Frame, area: Rect, theme: &Theme
         Paragraph::new(
             "Discard the selected working-tree hunk?\n\nEnter: restore permanently   Esc: cancel",
         )
-        .block(
-            Block::default()
-                .title(" CONFIRM HUNK RESTORE ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme.diagnostic_error)),
-        )
+        .block(overlay_block_bordered(
+            " CONFIRM HUNK RESTORE ",
+            theme.diagnostic_error,
+            theme,
+            icon_mode,
+        ))
         .style(Style::default().fg(theme.text).bg(theme.surface_raised)),
         popup,
     );
 }
 
-fn render_terminal_quit_confirmation(frame: &mut Frame, area: Rect, theme: &Theme) {
+fn render_terminal_quit_confirmation(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    icon_mode: IconMode,
+) {
     let width = area.width.saturating_sub(8).min(68);
     let popup = Rect::new(area.x + (area.width - width) / 2, area.y + 3, width, 6);
     frame.render_widget(Clear, popup);
@@ -1369,12 +1996,12 @@ fn render_terminal_quit_confirmation(frame: &mut Frame, area: Rect, theme: &Them
         Paragraph::new(
             "A process is still running in the integrated terminal.\n\nEnter: terminate and quit   Esc: cancel",
         )
-        .block(
-            Block::default()
-                .title(" TERMINATE TERMINAL? ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme.diagnostic_warning)),
-        )
+        .block(overlay_block_bordered(
+            " TERMINATE TERMINAL? ",
+            theme.diagnostic_warning,
+            theme,
+            icon_mode,
+        ))
         .style(Style::default().fg(theme.text).bg(theme.surface_raised)),
         popup,
     );
@@ -1390,12 +2017,11 @@ fn render_lsp_hover(frame: &mut Frame, area: Rect, state: &AppState, theme: &The
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(state.lsp_hover.join("\n"))
-            .block(
-                Block::default()
-                    .title(" HOVER  Enter/Esc close ")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(theme.accent)),
-            )
+            .block(overlay_block(
+                " HOVER  Enter/Esc close ",
+                theme,
+                state.settings.ui.icon_mode,
+            ))
             .style(Style::default().fg(theme.text).bg(theme.surface_raised)),
         popup,
     );
@@ -1411,6 +2037,9 @@ fn render_lsp_completion(frame: &mut Frame, area: Rect, state: &AppState, theme:
         height,
     );
     frame.render_widget(Clear, popup);
+    let icon_mode = state.settings.ui.icon_mode;
+    let icon_set = icons(icon_mode);
+    let row_width = usize::from(popup.width.saturating_sub(2));
     let items = state
         .lsp_completions
         .iter()
@@ -1418,29 +2047,36 @@ fn render_lsp_completion(frame: &mut Frame, area: Rect, state: &AppState, theme:
         .enumerate()
         .map(|(index, completion)| {
             let selected = index == state.lsp_completion_selected;
-            let detail = completion.detail.as_deref().unwrap_or("");
-            ListItem::new(format!("{}  {detail}", completion.label)).style(
-                Style::default()
-                    .fg(if selected {
-                        theme.text
-                    } else {
-                        theme.text_muted
-                    })
-                    .bg(if selected {
-                        theme.selection
-                    } else {
-                        theme.surface_raised
-                    }),
-            )
+            let background = if selected {
+                theme.selection
+            } else {
+                theme.surface_raised
+            };
+            let bar = if selected { icon_set.accent_bar } else { " " };
+            let mut spans = vec![
+                Span::styled(bar, Style::default().fg(theme.accent).bg(background)),
+                Span::styled(
+                    completion.label.clone(),
+                    Style::default()
+                        .fg(if selected {
+                            theme.text
+                        } else {
+                            theme.text_muted
+                        })
+                        .bg(background),
+                ),
+            ];
+            if let Some(detail) = completion.detail.as_deref() {
+                spans.push(Span::styled(
+                    format!("  {detail}"),
+                    Style::default().fg(theme.text_faint).bg(background),
+                ));
+            }
+            ListItem::new(Line::from(pad_to_width(spans, row_width, background)))
         })
         .collect::<Vec<_>>();
     frame.render_widget(
-        List::new(items).block(
-            Block::default()
-                .title(" COMPLETION ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme.accent)),
-        ),
+        List::new(items).block(overlay_block(" COMPLETION ", theme, icon_mode)),
         popup,
     );
 }
@@ -1458,20 +2094,20 @@ fn render_branch_picker(frame: &mut Frame, area: Rect, state: &AppState, theme: 
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(1)])
         .split(inner);
+    let icon_mode = state.settings.ui.icon_mode;
+    let icon_set = icons(icon_mode);
+    frame.render_widget(overlay_block(" SWITCH BRANCH ", theme, icon_mode), popup);
     frame.render_widget(
-        Block::default()
-            .title(" SWITCH BRANCH ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.accent))
-            .style(Style::default().bg(theme.surface_raised)),
-        popup,
-    );
-    frame.render_widget(
-        Paragraph::new(format!("> {}", state.palette_query))
-            .style(Style::default().fg(theme.text).bg(theme.selection)),
+        Paragraph::new(prompt_line(
+            &state.palette_query,
+            theme,
+            icon_set,
+            theme.selection,
+        ))
+        .style(Style::default().bg(theme.selection)),
         rows[0],
     );
-    let icon_set = icons(state.settings.ui.icon_mode);
+    let row_width = usize::from(rows[1].width);
     let branches = state
         .visible_git_branches()
         .into_iter()
@@ -1479,21 +2115,30 @@ fn render_branch_picker(frame: &mut Frame, area: Rect, state: &AppState, theme: 
         .enumerate()
         .map(|(index, branch)| {
             let selected = index == state.git_branch_selected;
+            let background = if selected {
+                theme.selection
+            } else {
+                theme.surface_raised
+            };
+            let bar = if selected { icon_set.accent_bar } else { " " };
             let marker = if branch.current { icon_set.dirty } else { " " };
             let remote = if branch.remote { "  remote" } else { "" };
-            ListItem::new(format!("{marker} {}{remote}", branch.name)).style(
-                Style::default()
-                    .fg(if selected {
-                        theme.text
-                    } else {
-                        theme.text_muted
-                    })
-                    .bg(if selected {
-                        theme.selection
-                    } else {
-                        theme.surface_raised
-                    }),
-            )
+            let base = Style::default()
+                .fg(if selected {
+                    theme.text
+                } else {
+                    theme.text_muted
+                })
+                .bg(background);
+            let spans = vec![
+                Span::styled(bar, Style::default().fg(theme.accent).bg(background)),
+                Span::styled(
+                    format!("{marker} "),
+                    Style::default().fg(theme.accent).bg(background),
+                ),
+                Span::styled(format!("{}{remote}", branch.name), base),
+            ];
+            ListItem::new(Line::from(pad_to_width(spans, row_width, background))).style(base)
         })
         .collect::<Vec<_>>();
     frame.render_widget(List::new(branches), rows[1]);
@@ -1513,15 +2158,17 @@ fn render_buffer_search(
         let total = tab.view.search.matches.len();
         (usize::from(total > 0) + tab.view.search.current, total)
     });
-    let block = Block::default()
-        .title(format!(" FIND  {current}/{total} "))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.accent))
-        .style(Style::default().bg(theme.surface_raised));
+    let icon_mode = state.settings.ui.icon_mode;
+    let block = overlay_block(format!(" FIND  {current}/{total} "), theme, icon_mode);
     frame.render_widget(
-        Paragraph::new(format!("> {}", state.palette_query))
-            .block(block)
-            .style(Style::default().fg(theme.text).bg(theme.surface_raised)),
+        Paragraph::new(prompt_line(
+            &state.palette_query,
+            theme,
+            icons(icon_mode),
+            theme.surface_raised,
+        ))
+        .block(block)
+        .style(Style::default().fg(theme.text).bg(theme.surface_raised)),
         popup,
     );
     let query_column = crate::editor::display_column(
@@ -1551,15 +2198,17 @@ fn render_file_picker(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(1)])
         .split(inner);
-    let block = Block::default()
-        .title(" OPEN FILE ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.accent))
-        .style(Style::default().bg(theme.surface_raised));
-    frame.render_widget(block, popup);
+    let icon_mode = state.settings.ui.icon_mode;
+    let icon_set = icons(icon_mode);
+    frame.render_widget(overlay_block(" OPEN FILE ", theme, icon_mode), popup);
     frame.render_widget(
-        Paragraph::new(format!("> {}", state.palette_query))
-            .style(Style::default().fg(theme.text).bg(theme.selection)),
+        Paragraph::new(prompt_line(
+            &state.palette_query,
+            theme,
+            icon_set,
+            theme.selection,
+        ))
+        .style(Style::default().bg(theme.selection)),
         rows[0],
     );
     let columns = Layout::default()
@@ -1567,6 +2216,7 @@ fn render_file_picker(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(rows[1]);
     let visible_height = usize::from(columns[0].height);
+    let row_width = usize::from(columns[0].width);
     let offset = state
         .file_picker_selected
         .saturating_sub(visible_height.saturating_sub(1));
@@ -1578,19 +2228,42 @@ fn render_file_picker(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
         .enumerate()
         .map(|(index, matched)| {
             let selected = offset + index == state.file_picker_selected;
-            ListItem::new(matched.path.to_string_lossy().into_owned()).style(
-                Style::default()
-                    .fg(if selected {
-                        theme.text
-                    } else {
-                        theme.text_muted
-                    })
-                    .bg(if selected {
-                        theme.selection
-                    } else {
-                        theme.surface_raised
-                    }),
-            )
+            let background = if selected {
+                theme.selection
+            } else {
+                theme.surface_raised
+            };
+            let base = Style::default()
+                .fg(if selected {
+                    theme.text
+                } else {
+                    theme.text_muted
+                })
+                .bg(background);
+            let display = matched.path.to_string_lossy().into_owned();
+            let (dirname, basename) = split_dirname_basename(&display);
+            let icon = file_icon(basename, icon_mode);
+            let bar = if selected { icon_set.accent_bar } else { " " };
+            let mut spans = vec![Span::styled(
+                bar,
+                Style::default().fg(theme.accent).bg(background),
+            )];
+            spans.push(file_icon_span(icon, theme, background));
+            spans.push(Span::styled(" ", Style::default().bg(background)));
+            if !dirname.is_empty() {
+                spans.push(Span::styled(
+                    format!("{dirname}/"),
+                    Style::default().fg(theme.text_faint).bg(background),
+                ));
+            }
+            spans.extend(highlighted_spans(
+                basename,
+                &state.palette_query,
+                theme,
+                base,
+            ));
+            let spans = pad_to_width(spans, row_width, background);
+            ListItem::new(Line::from(spans)).style(base)
         })
         .collect::<Vec<_>>();
     frame.render_widget(List::new(matches), columns[0]);
@@ -1627,6 +2300,7 @@ fn render_delete_confirmation(
     plan: &crate::workspace::DeletePlan,
     dirty_buffers: usize,
     theme: &Theme,
+    icon_mode: IconMode,
 ) {
     let width = area.width.saturating_sub(8).min(72);
     let popup = Rect::new(area.x + (area.width - width) / 2, area.y + 3, width, 7);
@@ -1643,11 +2317,8 @@ fn render_delete_confirmation(
         if plan.entry_count() == 1 { "y" } else { "ies" },
         warning,
     );
-    let block = Block::default()
-        .title(" CONFIRM DELETE ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.diagnostic_error))
-        .style(Style::default().bg(theme.surface_raised));
+    let block =
+        overlay_block_bordered(" CONFIRM DELETE ", theme.diagnostic_error, theme, icon_mode);
     frame.render_widget(
         Paragraph::new(text)
             .block(block)
@@ -1673,11 +2344,12 @@ fn render_close_confirmation(
     let text = format!(
         "  {title} has unsaved changes.\n  Close and discard them?\n\n  Enter: discard and close    Esc: cancel"
     );
-    let block = Block::default()
-        .title(" UNSAVED CHANGES ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.diagnostic_warning))
-        .style(Style::default().bg(theme.surface_raised));
+    let block = overlay_block_bordered(
+        " UNSAVED CHANGES ",
+        theme.diagnostic_warning,
+        theme,
+        state.settings.ui.icon_mode,
+    );
     frame.render_widget(
         Paragraph::new(text)
             .block(block)
@@ -1691,6 +2363,7 @@ fn render_save_as_confirmation(
     area: Rect,
     plan: &crate::app::SaveAsPlan,
     theme: &Theme,
+    icon_mode: IconMode,
 ) {
     let width = area.width.saturating_sub(8).min(72);
     let popup = Rect::new(area.x + (area.width - width) / 2, area.y + 3, width, 6);
@@ -1699,11 +2372,12 @@ fn render_save_as_confirmation(
         "  {} already exists.\n  Replace it with the current buffer?\n\n  Enter: replace    Esc: cancel",
         plan.snapshot.path.display()
     );
-    let block = Block::default()
-        .title(" CONFIRM SAVE AS ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.diagnostic_warning))
-        .style(Style::default().bg(theme.surface_raised));
+    let block = overlay_block_bordered(
+        " CONFIRM SAVE AS ",
+        theme.diagnostic_warning,
+        theme,
+        icon_mode,
+    );
     frame.render_widget(
         Paragraph::new(text)
             .block(block)
@@ -1735,11 +2409,12 @@ fn render_recovery_prompt(frame: &mut Frame, area: Rect, state: &AppState, theme
         state.pending_recovery.len(),
         names,
     );
-    let block = Block::default()
-        .title(" CRASH RECOVERY ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.diagnostic_warning))
-        .style(Style::default().bg(theme.surface_raised));
+    let block = overlay_block_bordered(
+        " CRASH RECOVERY ",
+        theme.diagnostic_warning,
+        theme,
+        state.settings.ui.icon_mode,
+    );
     frame.render_widget(
         Paragraph::new(text)
             .block(block)

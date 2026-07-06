@@ -28,7 +28,6 @@ pub enum Focus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BottomPanelView {
     Problems,
-    Diff,
     Output,
     Terminal,
 }
@@ -231,6 +230,8 @@ pub struct AppState {
     pub git_error: Option<String>,
     pub git_selected: usize,
     pub git_diff: Option<crate::git::FileDiff>,
+    /// Whether the virtual, read-only Git diff tab is the active editor tab.
+    pub git_diff_active: bool,
     pub git_hunk_selected: usize,
     pub git_branches: Vec<crate::git::GitBranch>,
     pub git_branch_selected: usize,
@@ -317,6 +318,7 @@ impl AppState {
             git_error: None,
             git_selected: 0,
             git_diff: None,
+            git_diff_active: false,
             git_hunk_selected: 0,
             git_branches: Vec::new(),
             git_branch_selected: 0,
@@ -437,7 +439,11 @@ impl AppState {
     }
 
     pub fn active_tab(&self) -> Option<&BufferTab> {
-        self.active_tab.and_then(|index| self.tabs.get(index))
+        if self.git_diff_active {
+            None
+        } else {
+            self.active_tab.and_then(|index| self.tabs.get(index))
+        }
     }
 
     pub fn append_output(&mut self, source: &str, message: impl AsRef<str>) {

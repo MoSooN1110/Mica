@@ -2,12 +2,12 @@
 source: tests/snapshots.rs
 expression: "redact(&text, &state.workspace)"
 ---
- E  EXPLORER                    │  Welcome                                      
- G ▾ src                        │                                               
- S  ┌ COMMAND PALETTE ─────────────────────────────────────────────────────┐    
-    │> save                                                                │    
-   ·│Save File  editor.save                                                │    
-   ·│Save As  editor.save_as                                               │    
+▎E  EXPLORER                    │  Welcome                                      
+ G ▎▾ src                       │                                               
+ S  ╭ COMMAND PALETTE ─────────────────────────────────────────────────────╮    
+    │❯ save                                                                │    
+    │▎Save File  editor.save                                               │    
+    │ Save As  editor.save_as                                              │    
     │                                                                      │    
     │                                                                      │    
     │                                                                      │    
@@ -17,7 +17,7 @@ expression: "redact(&text, &state.workspace)"
     │                                                                      │    
     │                                                                      │    
     │                                                                      │    
-    └──────────────────────────────────────────────────────────────────────┘    
+    ╰──────────────────────────────────────────────────────────────────────╯    
                                 │                                               
                                 │                                               
                                 │                                               
@@ -25,4 +25,4 @@ expression: "redact(&text, &state.workspace)"
                                 │                                               
                                 │                                               
                                 │                                               
- No file         E 0  W 0
+ OVERLAY

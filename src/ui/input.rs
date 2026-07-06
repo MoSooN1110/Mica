@@ -232,6 +232,16 @@ pub fn command_for_key(state: &AppState, event: KeyEvent) -> Option<Command> {
             _ => None,
         };
     }
+    if state.git_diff_active {
+        return match event.code {
+            KeyCode::Up | KeyCode::Char('k') => Some(Command::GitHunkPrevious),
+            KeyCode::Down | KeyCode::Char('j') => Some(Command::GitHunkNext),
+            KeyCode::Char('s' | 'S') => Some(Command::GitHunkStageToggle),
+            KeyCode::Char('d' | 'D') | KeyCode::Delete => Some(Command::GitHunkRestore),
+            KeyCode::Enter | KeyCode::Char('o' | 'O') => Some(Command::GitHunkOpenFile),
+            _ => None,
+        };
+    }
     let extend = event.modifiers.contains(KeyModifiers::SHIFT);
     match event.code {
         KeyCode::Left => Some(Command::MoveLeft { extend }),
@@ -266,9 +276,7 @@ pub fn command_for_mouse(state: &AppState, regions: Regions, event: MouseEvent) 
         let column = event.column.saturating_sub(regions.bottom.x);
         let id = if column < 11 {
             "diagnostics.open_problems"
-        } else if column < 18 {
-            "view.diff"
-        } else if column < 27 {
+        } else if column < 20 {
             "view.output"
         } else {
             "view.terminal"
@@ -370,11 +378,28 @@ pub fn command_for_mouse(state: &AppState, regions: Regions, event: MouseEvent) 
             }
             start += width;
         }
+        if let Some(diff) = &state.git_diff {
+            let name = diff.path.file_name().map_or_else(
+                || diff.path.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            );
+            let label = format!(" {name} (Diff) × ");
+            let width =
+                UnicodeWidthStr::width(label.as_str()) + usize::from(!state.tabs.is_empty());
+            if target < start + width {
+                return Some(if target + 3 >= start + width {
+                    Command::CloseTab(state.tabs.len())
+                } else {
+                    Command::SelectTab(state.tabs.len())
+                });
+            }
+        }
     }
-    if left_down && contains(regions.bottom, point) {
-        let line = usize::from(event.row.saturating_sub(regions.bottom.y + 1));
+    if state.git_diff_active && contains(regions.editor, point) && event.row > regions.editor.y + 1
+    {
+        let raw_line = usize::from(event.row.saturating_sub(regions.editor.y + 2));
         return state
-            .git_hunk_at_diff_line(line)
+            .git_hunk_at_diff_line(raw_line)
             .map(Command::SelectGitHunk);
     }
     if contains(regions.editor, point) && event.row > regions.editor.y {

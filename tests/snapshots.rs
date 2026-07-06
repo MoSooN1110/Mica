@@ -364,18 +364,18 @@ fn source_control_sidebar_shows_git_sections() {
     insta::assert_snapshot!(redact(&text, &state.workspace));
 }
 
-/// Bullet: Source Controlビュー、差分表示 (diff half of the pair).
+/// Bullet: Source Controlビュー、差分表示 (read-only editor tab half).
 #[test]
 fn git_diff_panel_renders_unified_hunks() {
     let mut state = base_state("git-diff");
-    state.bottom_panel_visible = true;
-    state.bottom_panel_view = BottomPanelView::Diff;
     state.git_diff = Some(main_rs_diff());
+    state.git_diff_active = true;
     state.git_hunk_selected = 1;
+    state.focus = Focus::Editor;
 
     let theme = Theme::mica_dark(ColorMode::Ansi256);
     let (regions, terminal) = draw(&state, &theme, 100, 30);
-    let text = region_text(terminal.backend().buffer(), regions.bottom);
+    let text = region_text(terminal.backend().buffer(), regions.editor);
     insta::assert_snapshot!(redact(&text, &state.workspace));
 }
 
@@ -508,4 +508,48 @@ fn status_bar_color_mode_fallback_uses_indexed_colors() {
         regions.status.y,
     );
     insta::assert_snapshot!("status_bar_ansi256", indexed);
+}
+
+/// Bullet: ファイルツリー(Nerd Fontアイコンモード) (SPEC/01_ui.md §6.5,
+/// visual-refresh brief §1). Same tree/Git fixture as the ASCII snapshot
+/// above, but with `UiSettings::icon_mode` set to `NerdFont`: file rows use
+/// the Devicons-family codepoints from `icons::file_icon` (`.rs` ->
+/// nf-dev-rust, `.md` -> nf-dev-markdown) and directories use the Font
+/// Awesome folder glyphs, rather than the Unicode shape glyphs.
+#[test]
+fn file_tree_renders_nerd_font_icon_mode() {
+    let mut state = base_state("tree-nerd-font");
+    state.settings.ui.icon_mode = IconMode::NerdFont;
+    state.git_status = Some(sample_git_status());
+
+    let theme = Theme::mica_dark(ColorMode::Ansi256);
+    let (regions, terminal) = draw(&state, &theme, 80, 24);
+    let text = region_text(terminal.backend().buffer(), regions.sidebar);
+    insta::assert_snapshot!(redact(&text, &state.workspace));
+}
+
+/// Bullet: ステータスバー(診断+Gitセグメント) (visual-refresh brief §5).
+/// A wide terminal (120 cols) so every segment — pane label, branch with
+/// ahead/behind/changed-count, the notification, the diagnostics summary,
+/// language, encoding, and cursor position — fits without the narrow-
+/// terminal truncation exercised by
+/// `file_tree_status_bar_and_editor_at_small_terminal`.
+#[test]
+fn status_bar_shows_diagnostics_and_git_segments() {
+    let mut state = base_state("status-full");
+    let tab = open_main_tab(&state.workspace);
+    let diagnostics = main_rs_diagnostics(&tab);
+    state
+        .diagnostics
+        .replace_source(DiagnosticSource::Compiler, 1, diagnostics);
+    state.tabs.push(tab);
+    state.active_tab = Some(0);
+    state.focus = Focus::Editor;
+    state.notification = Some("Saved src/main.rs".to_owned());
+    state.git_status = Some(sample_git_status());
+
+    let theme = Theme::mica_dark(ColorMode::Ansi256);
+    let (regions, terminal) = draw(&state, &theme, 120, 24);
+    let text = region_text(terminal.backend().buffer(), regions.status);
+    insta::assert_snapshot!(redact(&text, &state.workspace));
 }

@@ -33,6 +33,16 @@ pub struct Theme {
     pub git_conflict: Color,
     pub diagnostic_error: Color,
     pub diagnostic_warning: Color,
+    pub diagnostic_info: Color,
+    pub diagnostic_hint: Color,
+    /// Subtle background tint behind added diff lines (SPEC/01_ui.md §6.2
+    /// extension). Dark enough to keep `syntax_*`/`text` foreground colors
+    /// readable on top; distinct from `background`/`surface` in both
+    /// TrueColor and the 256-color approximation.
+    pub diff_add_bg: Color,
+    /// Subtle background tint behind deleted diff lines. See
+    /// [`Theme::diff_add_bg`].
+    pub diff_delete_bg: Color,
 }
 
 impl Theme {
@@ -72,6 +82,17 @@ impl Theme {
             git_conflict: color(0xFF9E64),
             diagnostic_error: color(0xFF6B81),
             diagnostic_warning: color(0xEBCB8B),
+            diagnostic_info: color(0x7AA2F7),
+            diagnostic_hint: color(0x73DACA),
+            // Chosen (rather than the spec brief's illustrative #16211A /
+            // #251A1E) because those values alias to the same 256-color
+            // index as `surface`/`surface_raised` under `nearest_xterm`'s
+            // Euclidean quantization: they're too close to neutral gray to
+            // land on a color-cube entry instead of the grayscale ramp.
+            // These stay dark (readable text on top) while landing on
+            // distinct green/red cube entries in Ansi256 (see theme tests).
+            diff_add_bg: color(0x124612),
+            diff_delete_bg: color(0x461212),
         }
     }
 }
@@ -112,5 +133,23 @@ mod tests {
         let theme = Theme::mica_dark(ColorMode::Ansi256);
         assert!(matches!(theme.background, Color::Indexed(_)));
         assert!(matches!(theme.accent, Color::Indexed(_)));
+    }
+
+    #[test]
+    fn diff_backgrounds_stay_distinct_from_background_and_surface_in_ansi256() {
+        let theme = Theme::mica_dark(ColorMode::Ansi256);
+        assert_ne!(theme.diff_add_bg, theme.background);
+        assert_ne!(theme.diff_add_bg, theme.surface);
+        assert_ne!(theme.diff_delete_bg, theme.background);
+        assert_ne!(theme.diff_delete_bg, theme.surface);
+        assert_ne!(theme.diff_add_bg, theme.diff_delete_bg);
+    }
+
+    #[test]
+    fn diagnostic_info_and_hint_tokens_are_present_and_distinct() {
+        let theme = Theme::mica_dark(ColorMode::TrueColor);
+        assert_ne!(theme.diagnostic_info, theme.diagnostic_error);
+        assert_ne!(theme.diagnostic_hint, theme.diagnostic_warning);
+        assert_ne!(theme.diagnostic_info, theme.diagnostic_hint);
     }
 }

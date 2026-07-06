@@ -36,7 +36,6 @@ pub const SEARCH_EXCLUDE_GLOBS: &str = "search.exclude_globs";
 pub const TERMINAL_TOGGLE: &str = "terminal.toggle";
 pub const TERMINAL_NEW_SESSION: &str = "terminal.new_session";
 pub const VIEW_OUTPUT: &str = "view.output";
-pub const VIEW_DIFF: &str = "view.diff";
 pub const VIEW_TERMINAL: &str = "view.terminal";
 pub const DIAGNOSTICS_OPEN_PROBLEMS: &str = "diagnostics.open_problems";
 pub const DIAGNOSTICS_REFRESH: &str = "diagnostics.refresh";
