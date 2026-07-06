@@ -12,17 +12,32 @@ Rust製のターミナルネイティブIDE。VS Code風の画面構成(Explorer
 
 ## ステータス
 
-M1(コアエディタ)を実装中。現在はRustプロジェクト、単方向イベント/コマンド層、
-UTF-8・grapheme対応バッファ、Undo/Redo、安全な置換保存、ワークスペース境界検証、
-非同期ファイル走査/ロード/保存、外部変更監視と競合保護、確認付きファイル操作、
-階層Explorer、プレビュー付きファジーファイル検索、バッファ検索、Unicode範囲選択、
-内部/OSC 52クリップボード、Rust用Tree-sitterハイライト、クラッシュ復旧ジャーナル、
-セッション復元、タブ操作、設定・CLI、基本TUIを備える。
-保存とSave Asは外部変更を再検証し、既存ファイルの置換前に確認する。
+M1〜M4の主要機能を実装済み。
+
+- **コアエディタ(M1)**: UTF-8・grapheme対応バッファ、Undo/Redo、安全な置換保存、
+  外部変更監視と競合保護、確認付きファイル操作、階層Explorer、
+  プレビュー付きファジーファイル検索、バッファ検索、Unicode範囲選択、
+  内部/OSC 52クリップボード、Tree-sitterハイライト(Rust / Markdown / TOML)、
+  コマンドパレット、キーマップ、設定・CLI
+- **Gitと検索(M2)**: 状態表示、ファイル/ハンク差分、stage / unstage / restore、
+  commit、branch一覧・切り替え・作成、push / pull / fetch、ワークスペース全文検索、
+  クラッシュ復旧ジャーナルとセッション復元
+- **統合ターミナル(M3)**: 実PTY、VT解釈、リサイズ、スクロールバック、
+  フルスクリーンTUI対応
+- **診断とLSP(M4)**: cargo check / clippy とLSP診断の統合、Problemsパネル、
+  エディタ下線・ガター・ツリーバッジ、最小LSPクライアント
+  (diagnostics / hover / 定義ジャンプ / 補完。C/C++, Rust, Python, JSON, Markdown)
 
 ```bash
 cargo run -- .
 ```
 
-Source Control、全文検索、PTY、診断/LSP、構文ハイライト、セッション復旧などは未実装。
 進捗の基準と最終的な受け入れ条件は`SPEC/SPEC.md`を正とする。
+
+## 開発
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all
+```

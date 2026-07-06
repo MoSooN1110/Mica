@@ -12,10 +12,13 @@ use crate::{
         SidebarView, WorkspaceSearchRow,
     },
     buffer::LineEnding,
-    workspace::TreeEntryKind,
+    workspace::{TreeEntry, TreeEntryKind},
 };
 
-use super::Theme;
+use super::{
+    Theme,
+    icons::{IconSet, icons},
+};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Regions {
@@ -204,6 +207,7 @@ fn render_sidebar(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme
         return;
     }
     let max = usize::from(area.height.saturating_sub(1));
+    let icon_set = icons(state.settings.ui.icon_mode);
     let items = state
         .tree
         .visible_entries()
@@ -211,10 +215,12 @@ fn render_sidebar(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme
         .enumerate()
         .map(|(index, entry)| {
             let icon = match entry.kind {
-                TreeEntryKind::Directory if state.tree.is_expanded(&entry.relative_path) => "▾",
-                TreeEntryKind::Directory => "▸",
-                TreeEntryKind::File => "·",
-                TreeEntryKind::Symlink => "↗",
+                TreeEntryKind::Directory if state.tree.is_expanded(&entry.relative_path) => {
+                    icon_set.dir_expanded
+                }
+                TreeEntryKind::Directory => icon_set.dir_collapsed,
+                TreeEntryKind::File => icon_set.file,
+                TreeEntryKind::Symlink => icon_set.symlink,
             };
             let name = entry.relative_path.file_name().map_or_else(
                 || entry.relative_path.to_string_lossy(),
@@ -256,17 +262,92 @@ fn render_sidebar(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme
             } else {
                 Style::default().fg(theme.text_muted).bg(theme.surface)
             };
-            ListItem::new(format!("{prefix}{icon} {name}{badge}")).style(style)
+            let mut spans = vec![Span::styled(format!("{prefix}{icon} {name}"), style)];
+            if let Some(marker) = tree_git_marker(entry, state.git_status.as_ref()) {
+                let (symbol, color) = tree_git_marker_glyph(marker, icon_set, theme);
+                spans.push(Span::styled(format!(" {symbol}"), style.fg(color)));
+            }
+            if !badge.is_empty() {
+                spans.push(Span::styled(badge, style));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect::<Vec<_>>();
     frame.render_widget(List::new(items).block(block), area);
 }
 
+/// Per-entry Git status marker for the Explorer tree
+/// (SPEC/03_workspace.md §2.1). A file/symlink resolves to its exact Git
+/// change, if any; a directory resolves to [`TreeGitMarker::Directory`] as
+/// soon as *any* descendant path has a change.
+enum TreeGitMarker<'a> {
+    File(&'a crate::git::GitFileChange),
+    Directory,
+}
+
+fn tree_git_marker<'a>(
+    entry: &TreeEntry,
+    status: Option<&'a crate::git::GitStatus>,
+) -> Option<TreeGitMarker<'a>> {
+    let status = status?;
+    match entry.kind {
+        TreeEntryKind::Directory => status
+            .files
+            .iter()
+            .any(|file| file.path.starts_with(&entry.relative_path))
+            .then_some(TreeGitMarker::Directory),
+        TreeEntryKind::File | TreeEntryKind::Symlink => status
+            .files
+            .iter()
+            .find(|file| file.path == entry.relative_path)
+            .map(TreeGitMarker::File),
+    }
+}
+
+/// Resolves a [`TreeGitMarker`] to a (symbol, color) pair. Directories
+/// intentionally collapse every descendant state to a single "has changes"
+/// dot in the `git_modified` color rather than prioritizing among
+/// heterogeneous child states (added/deleted/conflicted/...) for one glyph;
+/// the symbol still satisfies the "not color alone" accessibility rule
+/// (SPEC/01_ui.md §6.6) since it is present regardless of color perception.
+fn tree_git_marker_glyph(
+    marker: TreeGitMarker<'_>,
+    icons: &IconSet,
+    theme: &Theme,
+) -> (String, Color) {
+    match marker {
+        TreeGitMarker::File(change) => (
+            crate::git::status_symbol(change).to_string(),
+            git_status_color(change, theme),
+        ),
+        TreeGitMarker::Directory => (icons.bullet.to_owned(), theme.git_modified),
+    }
+}
+
+fn git_status_color(change: &crate::git::GitFileChange, theme: &Theme) -> Color {
+    if change.conflicted {
+        return theme.git_conflict;
+    }
+    if change.untracked {
+        return theme.git_added;
+    }
+    match change.kind {
+        crate::git::GitFileKind::Added | crate::git::GitFileKind::Untracked => theme.git_added,
+        crate::git::GitFileKind::Deleted => theme.git_deleted,
+        crate::git::GitFileKind::Unmerged => theme.git_conflict,
+        crate::git::GitFileKind::Modified
+        | crate::git::GitFileKind::Renamed
+        | crate::git::GitFileKind::Copied
+        | crate::git::GitFileKind::TypeChanged => theme.git_modified,
+    }
+}
+
 fn search_sidebar_lines(state: &AppState, theme: &Theme, height: usize) -> Vec<Line<'static>> {
+    let icon_set = icons(state.settings.ui.icon_mode);
     let running = if state.workspace_search_running {
-        " …"
+        format!(" {}", icon_set.ellipsis)
     } else {
-        ""
+        String::new()
     };
     let mut lines = vec![
         Line::from(Span::styled(
@@ -321,7 +402,11 @@ fn search_sidebar_lines(state: &AppState, theme: &Theme, height: usize) -> Vec<L
             lines.push(Line::from(Span::styled(
                 format!(
                     "{} {} ({count})",
-                    if collapsed { "▸" } else { "▾" },
+                    if collapsed {
+                        icon_set.dir_collapsed
+                    } else {
+                        icon_set.dir_expanded
+                    },
                     path.display()
                 ),
                 Style::default()
@@ -367,8 +452,9 @@ fn search_sidebar_lines(state: &AppState, theme: &Theme, height: usize) -> Vec<L
 }
 
 fn git_sidebar_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
+    let icon_set = icons(state.settings.ui.icon_mode);
     if state.git_loading {
-        return vec![Line::from(" Refreshing…")];
+        return vec![Line::from(format!(" Refreshing{}", icon_set.ellipsis))];
     }
     let Some(status) = &state.git_status else {
         return vec![Line::from(
@@ -382,11 +468,17 @@ fn git_sidebar_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
     let branch = status.branch.as_deref().unwrap_or("detached HEAD");
     let tracking = match (status.ahead, status.behind) {
         (0, 0) => String::new(),
-        (ahead, 0) => format!(" ↑{ahead}"),
-        (0, behind) => format!(" ↓{behind}"),
-        (ahead, behind) => format!(" ↑{ahead} ↓{behind}"),
+        (ahead, 0) => format!(" {}{ahead}", icon_set.arrow_up),
+        (0, behind) => format!(" {}{behind}", icon_set.arrow_down),
+        (ahead, behind) => format!(
+            " {}{ahead} {}{behind}",
+            icon_set.arrow_up, icon_set.arrow_down
+        ),
     };
-    let mut lines = vec![Line::from(format!(" ◉ {branch}{tracking}"))];
+    let mut lines = vec![Line::from(format!(
+        " {} {branch}{tracking}",
+        icon_set.branch
+    ))];
     let mut selection_index = 0usize;
     for section in GitSection::ALL {
         let files = status
@@ -451,6 +543,7 @@ fn git_sidebar_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
 }
 
 fn render_editor(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let icon_set = icons(state.settings.ui.icon_mode);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(1)])
@@ -459,8 +552,12 @@ fn render_editor(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         .tabs
         .iter()
         .map(|tab| {
-            let dirty = if tab.buffer.is_dirty() { " ●" } else { "" };
-            Line::from(format!(" {}{dirty} × ", tab.title()))
+            let dirty = if tab.buffer.is_dirty() {
+                format!(" {}", icon_set.dirty)
+            } else {
+                String::new()
+            };
+            Line::from(format!(" {}{dirty} {} ", tab.title(), icon_set.close))
         })
         .collect::<Vec<_>>();
     let tabs = Tabs::new(if titles.is_empty() {
@@ -775,8 +872,12 @@ fn render_bottom(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         );
         return;
     }
+    let icon_set = icons(state.settings.ui.icon_mode);
     let block = Block::default()
-        .title(" PROBLEMS  DIFF  OUTPUT  TERMINAL   [Diff] ↑/↓ hunk ")
+        .title(format!(
+            " PROBLEMS  DIFF  OUTPUT  TERMINAL   [Diff] {}/{} hunk ",
+            icon_set.arrow_up, icon_set.arrow_down
+        ))
         .borders(Borders::TOP)
         .border_style(Style::default().fg(theme.border));
     frame.render_widget(
@@ -792,6 +893,7 @@ fn render_bottom(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
 }
 
 fn render_problems(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let icon_set = icons(state.settings.ui.icon_mode);
     let diagnostics = state.visible_diagnostics();
     let filter = state
         .diagnostic_filter
@@ -807,7 +909,7 @@ fn render_problems(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         .take(usize::from(area.height.saturating_sub(1)))
         .filter_map(|row| match row {
             DiagnosticRow::File(path) => Some(Line::from(Span::styled(
-                format!("▾ {}", path.display()),
+                format!("{} {}", icon_set.dir_expanded, path.display()),
                 Style::default()
                     .fg(theme.text)
                     .bg(theme.surface)
@@ -1078,17 +1180,21 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
             )
         },
     );
+    let icon_set = icons(state.settings.ui.icon_mode);
     let message = state.notification.as_deref().unwrap_or("");
     let git = state.git_status.as_ref().map_or_else(String::new, |git| {
         let branch = git.branch.as_deref().unwrap_or("detached");
         let count = git.files.len();
         let tracking = match (git.ahead, git.behind) {
             (0, 0) => String::new(),
-            (ahead, 0) => format!(" ↑{ahead}"),
-            (0, behind) => format!(" ↓{behind}"),
-            (ahead, behind) => format!(" ↑{ahead}↓{behind}"),
+            (ahead, 0) => format!(" {}{ahead}", icon_set.arrow_up),
+            (0, behind) => format!(" {}{behind}", icon_set.arrow_down),
+            (ahead, behind) => format!(
+                " {}{ahead}{}{behind}",
+                icon_set.arrow_up, icon_set.arrow_down
+            ),
         };
-        format!("Git {branch}{tracking} ±{count}")
+        format!("Git {branch}{tracking} {}{count}", icon_set.delta)
     });
     let (errors, warnings) = state.diagnostics.counts();
     let problems = format!("E {errors}  W {warnings}");
@@ -1365,6 +1471,7 @@ fn render_branch_picker(frame: &mut Frame, area: Rect, state: &AppState, theme: 
             .style(Style::default().fg(theme.text).bg(theme.selection)),
         rows[0],
     );
+    let icon_set = icons(state.settings.ui.icon_mode);
     let branches = state
         .visible_git_branches()
         .into_iter()
@@ -1372,7 +1479,7 @@ fn render_branch_picker(frame: &mut Frame, area: Rect, state: &AppState, theme: 
         .enumerate()
         .map(|(index, branch)| {
             let selected = index == state.git_branch_selected;
-            let marker = if branch.current { "●" } else { " " };
+            let marker = if branch.current { icon_set.dirty } else { " " };
             let remote = if branch.remote { "  remote" } else { "" };
             ListItem::new(format!("{marker} {}{remote}", branch.name)).style(
                 Style::default()
@@ -1610,14 +1717,15 @@ fn render_recovery_prompt(frame: &mut Frame, area: Rect, state: &AppState, theme
     let height = area.height.saturating_sub(4).min(12);
     let popup = Rect::new(area.x + (area.width - width) / 2, area.y + 2, width, height);
     frame.render_widget(Clear, popup);
+    let icon_set = icons(state.settings.ui.icon_mode);
     let names = state
         .pending_recovery
         .iter()
         .take(5)
         .map(|buffer| {
             buffer.path.as_ref().map_or_else(
-                || "  • Untitled".to_owned(),
-                |path| format!("  • {}", path.display()),
+                || format!("  {} Untitled", icon_set.bullet),
+                |path| format!("  {} {}", icon_set.bullet, path.display()),
             )
         })
         .collect::<Vec<_>>()

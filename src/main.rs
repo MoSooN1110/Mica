@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     error::Error,
     io::{self, Read, stdout},
+    path::Path,
     sync::mpsc::{self, Receiver, Sender},
     thread,
     time::Duration,
@@ -26,7 +27,7 @@ use mica::{
     cli::{Cli, CliLocale},
     command::Command,
     config::{ConfigLoad, Keymap, Locale},
-    editor::highlight_rust,
+    editor::highlight,
     git::{GitBackend, GitCliBackend},
     lsp::{LspClient, LspClientConfig},
     search::{find_matches, fuzzy_files, search_workspace},
@@ -582,16 +583,17 @@ fn execute_effects(
                     });
                 });
             }
-            Effect::HighlightRust {
+            Effect::HighlightSyntax {
                 tab,
                 buffer_generation,
                 syntax_generation,
+                language,
                 source,
                 cancellation,
             } => {
                 thread::spawn(move || {
                     let source = source.to_string();
-                    let result = highlight_rust(&source, &cancellation, syntax_generation)
+                    let result = highlight(language, &source, &cancellation, syntax_generation)
                         .map_err(|error| error.to_string());
                     let _ = sender.send(AppEvent::SyntaxHighlighted {
                         tab,
@@ -737,46 +739,10 @@ fn execute_effects(
             Effect::StopTerminal => {
                 runtime.send_terminal(TerminalRuntimeCommand::Stop);
             }
-            Effect::RunCargoCheck { generation } => {
+            Effect::RunCargoDiagnostics { generation } => {
                 let root = state.workspace.as_path().to_path_buf();
                 thread::spawn(move || {
-                    let output = std::process::Command::new("cargo")
-                        .current_dir(&root)
-                        .args(["check", "--message-format=json"])
-                        .env("CARGO_TERM_COLOR", "never")
-                        .output();
-                    match output {
-                        Ok(output) => {
-                            let diagnostics =
-                                mica::diagnostics::parse_cargo_messages(&root, &output.stdout);
-                            if !output.stderr.is_empty() {
-                                let _ = sender.send(AppEvent::OutputMessage {
-                                    source: "cargo".to_owned(),
-                                    message: String::from_utf8_lossy(&output.stderr).into_owned(),
-                                });
-                            }
-                            if output.status.success() || !diagnostics.is_empty() {
-                                let _ = sender.send(AppEvent::DiagnosticsReplaced {
-                                    source: mica::diagnostics::DiagnosticSource::Compiler,
-                                    generation,
-                                    diagnostics,
-                                });
-                            } else {
-                                let _ = sender.send(AppEvent::DiagnosticsFailed {
-                                    source: mica::diagnostics::DiagnosticSource::Compiler,
-                                    generation,
-                                    error: format!("cargo check failed: {}", output.status),
-                                });
-                            }
-                        }
-                        Err(error) => {
-                            let _ = sender.send(AppEvent::DiagnosticsFailed {
-                                source: mica::diagnostics::DiagnosticSource::Compiler,
-                                generation,
-                                error: format!("cannot run cargo check: {error}"),
-                            });
-                        }
-                    }
+                    run_cargo_diagnostics(&root, generation, &sender);
                 });
             }
             Effect::StartLsp {
@@ -821,6 +787,88 @@ fn execute_effects(
                     thread::spawn(move || drop(client));
                 }
             }
+        }
+    }
+}
+
+/// Runs `cargo` with structured JSON diagnostics output, off the UI thread.
+fn spawn_cargo_json(root: &Path, args: &[&str]) -> io::Result<std::process::Output> {
+    std::process::Command::new("cargo")
+        .current_dir(root)
+        .args(args)
+        .env("CARGO_TERM_COLOR", "never")
+        .output()
+}
+
+/// Detects cargo's error text for a missing `clippy` component, so callers
+/// can fall back to plain `cargo check` instead of surfacing a spurious
+/// diagnostics failure.
+fn clippy_unavailable(stderr: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(stderr).to_lowercase();
+    text.contains("no such command") || text.contains("is not installed")
+}
+
+/// Runs `cargo clippy --message-format=json` (SPEC/06 §1.1: compiler + linter
+/// diagnostic sources), falling back to `cargo check` when clippy is not
+/// installed. Clippy output is a superset of check output, so a single run
+/// covers both sources; the parsed diagnostics are split by
+/// `DiagnosticSource` and replaced independently so each source keeps its
+/// own generation.
+fn run_cargo_diagnostics(root: &Path, generation: u64, sender: &Sender<AppEvent>) {
+    let output = match spawn_cargo_json(root, &["clippy", "--message-format=json"]) {
+        Ok(output) if !clippy_unavailable(&output.stderr) => Ok(output),
+        _ => spawn_cargo_json(root, &["check", "--message-format=json"]),
+    };
+    match output {
+        Ok(output) => {
+            let diagnostics = mica::diagnostics::parse_cargo_messages(root, &output.stdout);
+            if !output.stderr.is_empty() {
+                let _ = sender.send(AppEvent::OutputMessage {
+                    source: "cargo".to_owned(),
+                    message: String::from_utf8_lossy(&output.stderr).into_owned(),
+                });
+            }
+            if output.status.success() || !diagnostics.is_empty() {
+                let (linter, compiler): (Vec<_>, Vec<_>) =
+                    diagnostics.into_iter().partition(|diagnostic| {
+                        diagnostic.source == mica::diagnostics::DiagnosticSource::Linter
+                    });
+                let _ = sender.send(AppEvent::DiagnosticsReplaced {
+                    source: mica::diagnostics::DiagnosticSource::Compiler,
+                    generation,
+                    diagnostics: compiler,
+                });
+                let _ = sender.send(AppEvent::DiagnosticsReplaced {
+                    source: mica::diagnostics::DiagnosticSource::Linter,
+                    generation,
+                    diagnostics: linter,
+                });
+            } else {
+                let error = format!("cargo diagnostics failed: {}", output.status);
+                let _ = sender.send(AppEvent::DiagnosticsFailed {
+                    source: mica::diagnostics::DiagnosticSource::Compiler,
+                    generation,
+                    error: error.clone(),
+                });
+                let _ = sender.send(AppEvent::DiagnosticsFailed {
+                    source: mica::diagnostics::DiagnosticSource::Linter,
+                    generation,
+                    error,
+                });
+            }
+        }
+        Err(error) => {
+            let error = format!("cannot run cargo diagnostics: {error}");
+            let _ = sender.send(AppEvent::DiagnosticsFailed {
+                source: mica::diagnostics::DiagnosticSource::Compiler,
+                generation,
+                error: error.clone(),
+            });
+            let _ = sender.send(AppEvent::DiagnosticsFailed {
+                source: mica::diagnostics::DiagnosticSource::Linter,
+                generation,
+                error,
+            });
         }
     }
 }

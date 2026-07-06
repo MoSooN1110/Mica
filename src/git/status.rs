@@ -35,6 +35,36 @@ pub struct GitStatus {
     pub files: Vec<GitFileChange>,
 }
 
+/// Single-character status symbol for a per-file Git state indicator
+/// (SPEC/03_workspace.md §2.1: "ファイルごとのGit状態表示(記号+色。例: `M`
+/// `A` `D` `U` `!`)"). Pure mapping so callers (the Explorer tree renderer)
+/// can pair it with a theme color without this module depending on
+/// ratatui/theme types.
+///
+/// Conflicted files always resolve to `!` regardless of `kind`. Otherwise
+/// untracked files resolve to `U`; everything else maps from
+/// [`GitFileKind`], mirroring the markers already used by the Source
+/// Control sidebar (`Renamed` -> `R`, `Copied` -> `C`, `TypeChanged` -> `T`).
+#[must_use]
+pub fn status_symbol(change: &GitFileChange) -> char {
+    if change.conflicted {
+        return '!';
+    }
+    if change.untracked {
+        return 'U';
+    }
+    match change.kind {
+        GitFileKind::Added => 'A',
+        GitFileKind::Modified => 'M',
+        GitFileKind::Deleted => 'D',
+        GitFileKind::Renamed => 'R',
+        GitFileKind::Copied => 'C',
+        GitFileKind::TypeChanged => 'T',
+        GitFileKind::Unmerged => '!',
+        GitFileKind::Untracked => 'U',
+    }
+}
+
 pub fn parse_porcelain_v2(bytes: &[u8]) -> GitStatus {
     let records = bytes
         .split(|byte| *byte == 0)
@@ -175,5 +205,62 @@ mod tests {
         assert_eq!(status.files.len(), 3);
         assert!(status.files.iter().any(|file| file.staged));
         assert!(status.files.iter().any(|file| file.untracked));
+    }
+
+    fn change(kind: GitFileKind, conflicted: bool, untracked: bool) -> GitFileChange {
+        GitFileChange {
+            path: PathBuf::from("file.rs"),
+            original_path: None,
+            kind,
+            index_status: '.',
+            worktree_status: '.',
+            staged: false,
+            unstaged: true,
+            conflicted,
+            untracked,
+        }
+    }
+
+    #[test]
+    fn status_symbol_maps_each_kind() {
+        assert_eq!(
+            status_symbol(&change(GitFileKind::Added, false, false)),
+            'A'
+        );
+        assert_eq!(
+            status_symbol(&change(GitFileKind::Modified, false, false)),
+            'M'
+        );
+        assert_eq!(
+            status_symbol(&change(GitFileKind::Deleted, false, false)),
+            'D'
+        );
+        assert_eq!(
+            status_symbol(&change(GitFileKind::Renamed, false, false)),
+            'R'
+        );
+        assert_eq!(
+            status_symbol(&change(GitFileKind::Copied, false, false)),
+            'C'
+        );
+        assert_eq!(
+            status_symbol(&change(GitFileKind::TypeChanged, false, false)),
+            'T'
+        );
+        assert_eq!(
+            status_symbol(&change(GitFileKind::Untracked, false, true)),
+            'U'
+        );
+    }
+
+    #[test]
+    fn status_symbol_conflicted_overrides_kind() {
+        // Even an `Added` file that is mid-merge-conflict must show `!`, not
+        // `A`: conflict resolution takes priority over the underlying kind.
+        assert_eq!(status_symbol(&change(GitFileKind::Added, true, false)), '!');
+        assert_eq!(
+            status_symbol(&change(GitFileKind::Unmerged, true, false)),
+            '!'
+        );
     }
 }

@@ -1,0 +1,5 @@
+---
+source: tests/snapshots.rs
+expression: indexed
+---
+(1,23) symbol="N" fg=Indexed(254) bg=Indexed(235) modifier=NONE

@@ -1,0 +1,27 @@
+---
+source: tests/snapshots.rs
+expression: "redact(&text, &state.workspace)"
+---
+ EXPLORER                    │
+v src -                      │
+  - main.rs M                │
+  - utils.rs M               │
+- README.md                  │
+- 設 計 .md U                  │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │

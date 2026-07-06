@@ -1,0 +1,5 @@
+---
+source: tests/snapshots.rs
+expression: rgb
+---
+(1,23) symbol="N" fg=Rgb(216, 222, 233) bg=Rgb(27, 32, 44) modifier=NONE

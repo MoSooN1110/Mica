@@ -1445,8 +1445,8 @@ impl AppState {
                 }
                 self.compiler_diagnostic_generation =
                     self.compiler_diagnostic_generation.saturating_add(1);
-                self.notification = Some("Running cargo check…".to_owned());
-                vec![Effect::RunCargoCheck {
+                self.notification = Some("Running cargo clippy…".to_owned());
+                vec![Effect::RunCargoDiagnostics {
                     generation: self.compiler_diagnostic_generation,
                 }]
             }
@@ -2115,18 +2115,22 @@ impl AppState {
     fn active_syntax_effect(&mut self) -> Option<Effect> {
         let tab_index = self.active_tab?;
         let tab = self.tabs.get_mut(tab_index)?;
-        let is_rust = tab
+        let language = tab
             .buffer
             .path()
             .and_then(|path| path.extension())
-            .is_some_and(|extension| extension == "rs");
+            .and_then(|extension| extension.to_str())
+            .and_then(editor::SyntaxLanguage::from_extension);
         let threshold = self
             .settings
             .editor
             .large_file_threshold_mb
             .saturating_mul(1024 * 1024);
-        if !is_rust || u64::try_from(tab.buffer.text().len_bytes()).unwrap_or(u64::MAX) > threshold
-        {
+        let Some(language) = language else {
+            tab.highlights.clear();
+            return None;
+        };
+        if u64::try_from(tab.buffer.text().len_bytes()).unwrap_or(u64::MAX) > threshold {
             tab.highlights.clear();
             return None;
         }
@@ -2137,10 +2141,11 @@ impl AppState {
         self.syntax_cancellation
             .store(generation, Ordering::Relaxed);
         tab.syntax_generation = generation;
-        Some(Effect::HighlightRust {
+        Some(Effect::HighlightSyntax {
             tab: tab_index,
             buffer_generation: tab.buffer.generation(),
             syntax_generation: generation,
+            language,
             source: tab.buffer.text().clone(),
             cancellation: self.syntax_cancellation.clone(),
         })

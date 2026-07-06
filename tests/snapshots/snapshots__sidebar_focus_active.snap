@@ -1,0 +1,5 @@
+---
+source: tests/snapshots.rs
+expression: active
+---
+(32,2) symbol="│" fg=Indexed(111) bg=Indexed(234) modifier=NONE

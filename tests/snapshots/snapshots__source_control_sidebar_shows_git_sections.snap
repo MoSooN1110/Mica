@@ -1,0 +1,33 @@
+---
+source: tests/snapshots.rs
+expression: "redact(&text, &state.workspace)"
+---
+ SOURCE CONTROL              │
+ ◉ feature/snapshots ↑2 ↓1   │
+                             │
+ STAGED CHANGES (1)          │
+  M src/utils.rs             │
+                             │
+ CONFLICTED (1)              │
+  ! src/legacy.rs            │
+                             │
+ UNTRACKED (1)               │
+  ? 設 計 .md                  │
+                             │
+ WORKING TREE CHANGES (1)    │
+  M src/main.rs              │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │

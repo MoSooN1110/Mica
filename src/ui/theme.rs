@@ -30,6 +30,7 @@ pub struct Theme {
     pub git_added: Color,
     pub git_modified: Color,
     pub git_deleted: Color,
+    pub git_conflict: Color,
     pub diagnostic_error: Color,
     pub diagnostic_warning: Color,
 }
@@ -68,6 +69,7 @@ impl Theme {
             git_added: color(0x9ECE6A),
             git_modified: color(0xE0AF68),
             git_deleted: color(0xF7768E),
+            git_conflict: color(0xFF9E64),
             diagnostic_error: color(0xFF6B81),
             diagnostic_warning: color(0xEBCB8B),
         }

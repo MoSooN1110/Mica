@@ -47,6 +47,14 @@ pub fn parse_cargo_messages(root: &Path, output: &[u8]) -> Vec<Diagnostic> {
                 _ => DiagnosticSeverity::Hint,
             };
             let code = message.code.map(|code| code.code);
+            let source = if code
+                .as_deref()
+                .is_some_and(|code| code.starts_with("clippy::"))
+            {
+                DiagnosticSource::Linter
+            } else {
+                DiagnosticSource::Compiler
+            };
             message
                 .spans
                 .into_iter()
@@ -67,7 +75,7 @@ pub fn parse_cargo_messages(root: &Path, output: &[u8]) -> Vec<Diagnostic> {
                     },
                     severity,
                     message: message.message.clone(),
-                    source: DiagnosticSource::Compiler,
+                    source,
                     code: code.clone(),
                     stale: false,
                 })
@@ -89,5 +97,19 @@ mod tests {
         assert_eq!(diagnostics[0].file, Path::new("/workspace/src/main.rs"));
         assert_eq!(diagnostics[0].range.start.line, 2);
         assert_eq!(diagnostics[0].code.as_deref(), Some("E0308"));
+        assert_eq!(diagnostics[0].source, DiagnosticSource::Compiler);
+    }
+
+    #[test]
+    fn tags_clippy_lints_as_linter_source() {
+        let output = br#"{"reason":"compiler-message","message":{"message":"needless return statement","code":{"code":"clippy::needless_return"},"level":"warning","spans":[{"file_name":"src/lib.rs","line_start":10,"line_end":10,"column_start":5,"column_end":20,"is_primary":true}]}}
+"#;
+        let diagnostics = parse_cargo_messages(Path::new("/workspace"), output);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].source, DiagnosticSource::Linter);
+        assert_eq!(
+            diagnostics[0].code.as_deref(),
+            Some("clippy::needless_return")
+        );
     }
 }

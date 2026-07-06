@@ -156,10 +156,11 @@ pub enum Effect {
         source: ropey::Rope,
         cancellation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     },
-    HighlightRust {
+    HighlightSyntax {
         tab: usize,
         buffer_generation: u64,
         syntax_generation: u64,
+        language: crate::editor::SyntaxLanguage,
         source: ropey::Rope,
         cancellation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     },
@@ -190,7 +191,7 @@ pub enum Effect {
         cols: u16,
     },
     StopTerminal,
-    RunCargoCheck {
+    RunCargoDiagnostics {
         generation: u64,
     },
     StartLsp {

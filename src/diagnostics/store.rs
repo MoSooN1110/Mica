@@ -180,6 +180,23 @@ mod tests {
     }
 
     #[test]
+    fn compiler_beats_linter_on_identical_key() {
+        let mut store = DiagnosticStore::default();
+        store.replace_source(
+            DiagnosticSource::Linter,
+            1,
+            vec![diagnostic(DiagnosticSource::Linter, "unused variable")],
+        );
+        store.replace_source(
+            DiagnosticSource::Compiler,
+            1,
+            vec![diagnostic(DiagnosticSource::Compiler, "unused variable")],
+        );
+        assert_eq!(store.diagnostics().len(), 1);
+        assert_eq!(store.diagnostics()[0].source, DiagnosticSource::Compiler);
+    }
+
+    #[test]
     fn ignores_old_generations_and_marks_files_stale() {
         let mut store = DiagnosticStore::default();
         assert!(store.replace_source(
