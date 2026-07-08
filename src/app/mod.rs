@@ -7,6 +7,7 @@ pub use event::{
     GitOperation, SaveAsInspection, SaveAsPlan,
 };
 pub use state::{
-    AppState, BottomPanelView, BufferTab, CompletionCandidate, DiagnosticRow, Focus, GitSection,
-    Overlay, PathAction, PendingLspRequest, SidebarView, WorkspaceSearchRow,
+    AppState, BottomPanelView, BufferTab, CodeActionCandidate, CompletionCandidate, DiagnosticRow,
+    Focus, GitSection, NavigationLocation, Overlay, PathAction, PendingLspRequest, SidebarView,
+    WorkspaceSearchRow,
 };

@@ -8,7 +8,7 @@ expression: "redact(&text, &state.workspace)"
     │❯ save                                                                │    
     │▎Save File  editor.save                                               │    
     │ Save As  editor.save_as                                              │    
-    │                                                                      │    
+    │ Save All  editor.save_all                                            │    
     │                                                                      │    
     │                                                                      │    
     │                                                                      │    

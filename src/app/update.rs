@@ -24,6 +24,13 @@ impl AppState {
                 let restored_cursor = self.restore_cursors.remove(&path);
                 match result {
                     Ok(buffer) => {
+                        let recent_path = path
+                            .strip_prefix(self.workspace.as_path())
+                            .unwrap_or(path.as_path())
+                            .to_path_buf();
+                        self.recent_files.retain(|item| item != &recent_path);
+                        self.recent_files.insert(0, recent_path);
+                        self.recent_files.truncate(100);
                         self.git_diff_active = false;
                         if let Some(existing) = self
                             .tabs
@@ -74,7 +81,13 @@ impl AppState {
                         if self.overlay.is_none() {
                             self.focus = Focus::Editor;
                         }
-                        self.notification = None;
+                        self.notification = self
+                            .active_tab()
+                            .filter(|tab| self.is_large_buffer(&tab.buffer))
+                            .map(|_| {
+                                "Large-file mode: syntax highlighting, LSP, and diff decorations are disabled"
+                                    .to_owned()
+                            });
                     }
                     Err(error) => self.notification = Some(error),
                 }
@@ -135,6 +148,9 @@ impl AppState {
                     let mut effects = vec![Effect::RefreshGit];
                     if let Some(effect) = self.lsp_save_effect(&snapshot.path) {
                         effects.push(effect);
+                    }
+                    if self.settings.diagnostics.check_on_save {
+                        effects.extend(self.start_cargo_diagnostics(false));
                     }
                     effects
                 } else {
@@ -430,7 +446,7 @@ impl AppState {
                     }
                     Err(error) => {
                         self.append_output("git", &error);
-                        self.notification = Some(error);
+                        self.notification = Some(git_error_guidance(&error));
                     }
                 }
                 Vec::new()
@@ -444,7 +460,7 @@ impl AppState {
                     Ok(message) => self.notification = Some(message),
                     Err(error) => {
                         self.append_output("git", &error);
-                        self.notification = Some(error);
+                        self.notification = Some(git_error_guidance(&error));
                     }
                 }
                 if succeeded {
@@ -568,7 +584,7 @@ impl AppState {
                 self.diagnostic_selected = self
                     .diagnostic_selected
                     .min(self.visible_diagnostics().len().saturating_sub(1));
-                Vec::new()
+                self.finish_cargo_diagnostics(source)
             }
             AppEvent::DiagnosticsFailed {
                 source,
@@ -578,7 +594,7 @@ impl AppState {
                 self.diagnostics.clear_source(source, generation);
                 self.append_output("diagnostics", &error);
                 self.notification = Some(error);
-                Vec::new()
+                self.finish_cargo_diagnostics(source)
             }
             AppEvent::OutputMessage { source, message } => {
                 self.append_output(&source, message);
@@ -595,30 +611,96 @@ impl AppState {
         match command {
             Command::Invoke(id) => self.invoke(&id),
             Command::InsertText(text) => {
-                self.edit(|tab| tab.buffer.insert(&text));
+                let pair = self
+                    .settings
+                    .editor
+                    .auto_pairs
+                    .then_some(match text.as_str() {
+                        "(" => Some(('(', ')')),
+                        "[" => Some(('[', ']')),
+                        "{" => Some(('{', '}')),
+                        "\"" => Some(('"', '"')),
+                        "'" => Some(('\'', '\'')),
+                        _ => None,
+                    })
+                    .flatten();
+                let closer = self
+                    .settings
+                    .editor
+                    .auto_pairs
+                    .then_some(match text.as_str() {
+                        ")" => Some(')'),
+                        "]" => Some(']'),
+                        "}" => Some('}'),
+                        "\"" => Some('"'),
+                        "'" => Some('\''),
+                        _ => None,
+                    })
+                    .flatten();
+                let skipped = closer.is_some_and(|closing| {
+                    self.active_tab
+                        .and_then(|index| self.tabs.get_mut(index))
+                        .is_some_and(|tab| tab.buffer.skip_matching_closer(closing))
+                });
+                if skipped {
+                    // Moving over an auto-inserted closer is not an edit.
+                } else if let Some((opening, closing)) = pair {
+                    self.edit(|tab| tab.buffer.insert_auto_pair(opening, closing));
+                } else if let Some(closing) = closer {
+                    let _ = closing;
+                    self.edit(|tab| tab.buffer.insert(&text));
+                } else {
+                    self.edit(|tab| tab.buffer.insert(&text));
+                }
                 self.active_post_edit_effects()
             }
             Command::InsertNewline => {
-                self.edit(|tab| {
-                    let newline = if tab.buffer.line_ending() == crate::buffer::LineEnding::CrLf {
-                        "\r\n"
-                    } else {
-                        "\n"
-                    };
-                    tab.buffer.insert(newline)
-                });
+                self.edit(|tab| tab.buffer.insert_newline_with_indent());
                 self.active_post_edit_effects()
             }
             Command::DeleteBackward => {
                 self.edit(|tab| tab.buffer.delete_backward());
                 self.active_post_edit_effects()
             }
+            Command::DeleteWordBackward => {
+                self.edit(|tab| {
+                    if !tab.buffer.selection().is_caret() {
+                        return tab.buffer.delete_selection().map(|_| ());
+                    }
+                    let cursor = tab.buffer.selection().head.0;
+                    let start = editor::move_word_left(tab.buffer.text(), cursor);
+                    tab.buffer.delete_range(start, cursor)
+                });
+                self.active_post_edit_effects()
+            }
+            Command::DeleteWordForward => {
+                self.edit(|tab| {
+                    if !tab.buffer.selection().is_caret() {
+                        return tab.buffer.delete_selection().map(|_| ());
+                    }
+                    let cursor = tab.buffer.selection().head.0;
+                    let end = editor::move_word_right(tab.buffer.text(), cursor);
+                    tab.buffer.delete_range(cursor, end)
+                });
+                self.active_post_edit_effects()
+            }
+            Command::IndentSelection => self.change_selected_indent(false),
+            Command::OutdentSelection => self.change_selected_indent(true),
+            Command::ToggleLineComment => self.toggle_line_comment(),
             Command::MoveLeft { extend } => {
                 self.move_horizontal(false, extend);
                 Vec::new()
             }
             Command::MoveRight { extend } => {
                 self.move_horizontal(true, extend);
+                Vec::new()
+            }
+            Command::MoveWordLeft { extend } => {
+                self.move_word_horizontal(false, extend);
+                Vec::new()
+            }
+            Command::MoveWordRight { extend } => {
+                self.move_word_horizontal(true, extend);
                 Vec::new()
             }
             Command::MoveUp { extend } => {
@@ -700,7 +782,24 @@ impl AppState {
                     else {
                         return Vec::new();
                     };
-                    let max = tab.buffer.text().len_lines().saturating_sub(visible_height);
+                    let max = if self.settings.editor.word_wrap {
+                        let width = editor_wrap_width(
+                            self.terminal_size.0,
+                            self.sidebar_visible,
+                            self.settings.ui.sidebar_width,
+                            self.split_tab.is_some(),
+                            tab.buffer.text().len_lines(),
+                        );
+                        editor::visual_row_count(
+                            tab.buffer.text(),
+                            width,
+                            usize::from(self.settings.editor.tab_width),
+                            self.settings.editor.ambiguous_width_wide,
+                        )
+                        .saturating_sub(visible_height)
+                    } else {
+                        tab.buffer.text().len_lines().saturating_sub(visible_height)
+                    };
                     tab.view.scroll_line = if delta < 0 {
                         tab.view
                             .scroll_line
@@ -901,33 +1000,15 @@ impl AppState {
                     vec![Effect::CopyToClipboard(text)]
                 }
             }
+            Command::TerminalOpenReference { row, column } => {
+                self.open_terminal_reference(row, column)
+            }
             Command::DiagnosticSelect(index) => {
                 self.diagnostic_selected =
                     index.min(self.visible_diagnostics().len().saturating_sub(1));
                 Vec::new()
             }
-            Command::DiagnosticOpen => {
-                let Some(diagnostic) = self
-                    .visible_diagnostics()
-                    .get(self.diagnostic_selected)
-                    .cloned()
-                    .cloned()
-                else {
-                    return Vec::new();
-                };
-                self.focus = Focus::Editor;
-                vec![Effect::OpenFile {
-                    path: diagnostic.file,
-                    read_only: self.force_read_only,
-                    line: Some(diagnostic.range.start.line + 1),
-                    // Note: `range.start.column` here is itself UTF-16-derived
-                    // (see `lsp_diagnostic`'s `position` closure), so this
-                    // inherits the same latent non-BMP-column bug that Fix 1
-                    // addresses for definition jumps. Left as `Chars` to keep
-                    // this change scoped to `PendingLspRequest::Definition`.
-                    column: Some(ColumnHint::Chars(diagnostic.range.start.column + 1)),
-                }]
-            }
+            Command::DiagnosticOpen => self.open_selected_diagnostic(),
             Command::DiagnosticCycleFilter => {
                 self.diagnostic_filter = match self.diagnostic_filter {
                     None => Some(crate::diagnostics::DiagnosticSeverity::Error),
@@ -939,6 +1020,39 @@ impl AppState {
                 self.diagnostic_selected = 0;
                 Vec::new()
             }
+            Command::DiagnosticCycleSource => {
+                self.diagnostic_source_filter = match self.diagnostic_source_filter {
+                    None => Some(crate::diagnostics::DiagnosticSource::Compiler),
+                    Some(crate::diagnostics::DiagnosticSource::Compiler) => {
+                        Some(crate::diagnostics::DiagnosticSource::Linter)
+                    }
+                    Some(crate::diagnostics::DiagnosticSource::Linter) => {
+                        Some(crate::diagnostics::DiagnosticSource::Lsp)
+                    }
+                    Some(crate::diagnostics::DiagnosticSource::Lsp) => {
+                        Some(crate::diagnostics::DiagnosticSource::Task)
+                    }
+                    Some(crate::diagnostics::DiagnosticSource::Task) => None,
+                };
+                self.diagnostic_selected = 0;
+                Vec::new()
+            }
+            Command::DiagnosticToggleCurrentFile => {
+                self.diagnostic_current_file_only = !self.diagnostic_current_file_only;
+                self.diagnostic_selected = 0;
+                Vec::new()
+            }
+            Command::LspLocationSelect(index) => {
+                self.lsp_location_selected = index.min(self.lsp_locations.len().saturating_sub(1));
+                Vec::new()
+            }
+            Command::LspLocationOpen => Vec::new(),
+            Command::LspCodeActionSelect(index) => {
+                self.lsp_code_action_selected =
+                    index.min(self.lsp_code_actions.len().saturating_sub(1));
+                Vec::new()
+            }
+            Command::LspCodeActionApply => Vec::new(),
             Command::SelectTab(index) => {
                 if index < self.tabs.len() {
                     self.active_tab = Some(index);
@@ -1029,6 +1143,9 @@ impl AppState {
             | Command::PaletteAccept
             | Command::SearchNext
             | Command::SearchPrevious
+            | Command::SearchToggleReplaceField
+            | Command::ReplaceNext
+            | Command::ReplaceAll
             | Command::RecoveryRecover
             | Command::RecoveryDiscard
             | Command::RecoveryLater => Vec::new(),
@@ -1057,7 +1174,17 @@ impl AppState {
                 self.notification = Some("Recovery data kept for later".to_owned());
             }
             Command::PaletteInput(character) => {
+                if matches!(self.overlay, Some(Overlay::BufferSearch { .. }))
+                    && self.buffer_replace_focused
+                {
+                    self.buffer_replace_query.push(character);
+                    return Vec::new();
+                }
                 self.palette_query.push(character);
+                if matches!(self.overlay, Some(Overlay::LspCompletion)) {
+                    self.filter_lsp_completions();
+                    return Vec::new();
+                }
                 if matches!(self.overlay, Some(Overlay::GitBranchPicker)) {
                     self.git_branch_selected = 0;
                 }
@@ -1069,7 +1196,17 @@ impl AppState {
                 }
             }
             Command::PaletteBackspace => {
+                if matches!(self.overlay, Some(Overlay::BufferSearch { .. }))
+                    && self.buffer_replace_focused
+                {
+                    self.buffer_replace_query.pop();
+                    return Vec::new();
+                }
                 self.palette_query.pop();
+                if matches!(self.overlay, Some(Overlay::LspCompletion)) {
+                    self.filter_lsp_completions();
+                    return Vec::new();
+                }
                 if matches!(self.overlay, Some(Overlay::GitBranchPicker)) {
                     self.git_branch_selected = 0;
                 }
@@ -1092,6 +1229,55 @@ impl AppState {
                 if let Some(Overlay::BufferSearch { tab }) = self.overlay.as_ref() {
                     self.select_search_match(*tab, -1);
                 }
+            }
+            Command::SearchToggleReplaceField => {
+                if self.buffer_replace_visible {
+                    self.buffer_replace_focused = !self.buffer_replace_focused;
+                } else {
+                    self.buffer_replace_visible = true;
+                    self.buffer_replace_focused = true;
+                }
+            }
+            Command::ReplaceNext => {
+                if let Some(Overlay::BufferSearch { tab }) = self.overlay.as_ref() {
+                    return self.replace_current_match(*tab);
+                }
+            }
+            Command::ReplaceAll => {
+                if let Some(Overlay::BufferSearch { tab }) = self.overlay.as_ref() {
+                    return self.replace_all_matches(*tab);
+                }
+            }
+            Command::LspLocationSelect(index)
+                if matches!(self.overlay, Some(Overlay::LspLocations)) =>
+            {
+                self.lsp_location_selected = index.min(self.lsp_locations.len().saturating_sub(1));
+            }
+            Command::LspLocationOpen if matches!(self.overlay, Some(Overlay::LspLocations)) => {
+                let Some(location) = self.lsp_locations.get(self.lsp_location_selected).cloned()
+                else {
+                    return Vec::new();
+                };
+                self.overlay = None;
+                self.focus = Focus::Editor;
+                self.record_navigation_origin();
+                return vec![Effect::OpenFile {
+                    path: location.path,
+                    read_only: self.force_read_only,
+                    line: Some(location.line),
+                    column: Some(location.column),
+                }];
+            }
+            Command::LspCodeActionSelect(index)
+                if matches!(self.overlay, Some(Overlay::LspCodeActions)) =>
+            {
+                self.lsp_code_action_selected =
+                    index.min(self.lsp_code_actions.len().saturating_sub(1));
+            }
+            Command::LspCodeActionApply
+                if matches!(self.overlay, Some(Overlay::LspCodeActions)) =>
+            {
+                return self.apply_selected_code_action();
             }
             Command::MoveUp { .. } if matches!(self.overlay, Some(Overlay::FilePicker)) => {
                 self.file_picker_selected = self.file_picker_selected.saturating_sub(1);
@@ -1163,6 +1349,7 @@ impl AppState {
                         }
                         self.focus = Focus::Editor;
                         if let PathAction::SaveAs { tab } = &action {
+                            self.format_tab_for_save(*tab);
                             let Some(tab_state) = self.tabs.get(*tab) else {
                                 return Vec::new();
                             };
@@ -1190,6 +1377,37 @@ impl AppState {
                             PathAction::SaveAs { .. } => return Vec::new(),
                         };
                         return vec![Effect::FileOperation(request)];
+                    }
+                    Some(Overlay::GotoLine) => {
+                        let input = self.palette_query.trim().to_owned();
+                        self.palette_query.clear();
+                        self.focus = Focus::Editor;
+                        let mut parts = input.split(':');
+                        let line = parts.next().and_then(|value| value.parse::<usize>().ok());
+                        let column = parts.next().and_then(|value| value.parse::<usize>().ok());
+                        if parts.next().is_some() || line.is_none() {
+                            self.notification =
+                                Some("Enter a line or line:column number".to_owned());
+                            return Vec::new();
+                        }
+                        let Some(index) = self.active_tab else {
+                            return Vec::new();
+                        };
+                        let tab = &mut self.tabs[index];
+                        let line_index = line
+                            .unwrap_or(1)
+                            .saturating_sub(1)
+                            .min(tab.buffer.text().len_lines().saturating_sub(1));
+                        let line_start = tab.buffer.text().line_to_char(line_index);
+                        let line_text = tab.buffer.text().line(line_index).to_string();
+                        let content_chars =
+                            line_text.trim_end_matches(['\r', '\n']).chars().count();
+                        let char_offset =
+                            line_start + column.unwrap_or(1).saturating_sub(1).min(content_chars);
+                        tab.buffer
+                            .set_selection(Selection::caret(CharOffset(char_offset)));
+                        self.reveal_cursor(index);
+                        return Vec::new();
                     }
                     Some(Overlay::ConfirmDelete { plan, .. }) => {
                         self.palette_query.clear();
@@ -1275,6 +1493,9 @@ impl AppState {
                     Some(Overlay::LspHover) => {
                         self.focus = Focus::Editor;
                     }
+                    Some(Overlay::LspSignature) => {
+                        self.focus = Focus::Editor;
+                    }
                     Some(Overlay::LspCompletion) => {
                         self.focus = Focus::Editor;
                         let Some(completion) = self
@@ -1286,6 +1507,25 @@ impl AppState {
                         };
                         self.apply_completion(&completion);
                         return self.active_post_edit_effects();
+                    }
+                    Some(Overlay::LspLocations) => {
+                        self.focus = Focus::Editor;
+                        let Some(location) =
+                            self.lsp_locations.get(self.lsp_location_selected).cloned()
+                        else {
+                            return Vec::new();
+                        };
+                        self.record_navigation_origin();
+                        return vec![Effect::OpenFile {
+                            path: location.path,
+                            read_only: self.force_read_only,
+                            line: Some(location.line),
+                            column: Some(location.column),
+                        }];
+                    }
+                    Some(Overlay::LspCodeActions) => {
+                        self.focus = Focus::Editor;
+                        return self.apply_selected_code_action();
                     }
                     None => {}
                 }
@@ -1299,6 +1539,8 @@ impl AppState {
                     tab.view.search.current = 0;
                 }
                 self.overlay = None;
+                self.buffer_replace_focused = false;
+                self.buffer_replace_visible = false;
                 self.palette_query.clear();
                 self.file_search_generation = self.file_search_generation.saturating_add(1);
                 self.file_search_cancellation
@@ -1339,25 +1581,41 @@ impl AppState {
                     self.notification = Some("Save As is already in progress".to_owned());
                     return Vec::new();
                 }
-                match self.tabs[index].buffer.prepare_save() {
-                    Ok(snapshot) => {
-                        if self.saving_tabs.contains(&index) {
-                            self.pending_saves.insert(index, snapshot);
-                            self.notification = Some("Save queued".to_owned());
-                            Vec::new()
-                        } else {
-                            self.saving_tabs.insert(index);
-                            vec![Effect::Save {
-                                tab: index,
-                                snapshot,
-                            }]
-                        }
-                    }
-                    Err(error) => {
-                        self.notification = Some(error.to_string());
-                        Vec::new()
+                if self.settings.editor.format_on_save {
+                    let effects = self.lsp_request_effect(
+                        "textDocument/formatting",
+                        crate::app::PendingLspRequest::Formatting,
+                    );
+                    if !effects.is_empty() {
+                        self.format_on_save_tabs.insert(index);
+                        self.notification = Some("Formatting before save…".to_owned());
+                        return effects;
                     }
                 }
+                self.format_tab_for_save(index);
+                self.save_tab(index)
+            }
+            command::EDITOR_SAVE_ALL => {
+                let candidates = self
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, tab)| {
+                        tab.buffer.is_dirty()
+                            && !tab.buffer.is_read_only()
+                            && tab.buffer.path().is_some()
+                    })
+                    .map(|(index, _)| index)
+                    .collect::<Vec<_>>();
+                let mut effects = Vec::new();
+                for index in candidates {
+                    self.format_tab_for_save(index);
+                    effects.extend(self.save_tab(index));
+                }
+                if effects.is_empty() {
+                    self.notification = Some("No writable files to save".to_owned());
+                }
+                effects
             }
             command::EDITOR_SCROLL_UP => self.execute(Command::EditorScroll(-3)),
             command::EDITOR_SCROLL_DOWN => self.execute(Command::EditorScroll(3)),
@@ -1448,10 +1706,40 @@ impl AppState {
                     return Vec::new();
                 };
                 self.overlay = Some(Overlay::BufferSearch { tab });
-                self.palette_query.clear();
+                self.palette_query = self.tabs[tab].buffer.selected_text().unwrap_or_default();
+                self.tabs[tab].view.search = Default::default();
+                self.buffer_replace_query.clear();
+                self.buffer_replace_visible = false;
+                self.buffer_replace_focused = false;
+                self.focus = Focus::Overlay;
+                self.start_buffer_search(tab).into_iter().collect()
+            }
+            command::EDITOR_REPLACE => {
+                let Some(tab) = self.active_tab else {
+                    return Vec::new();
+                };
+                self.overlay = Some(Overlay::BufferSearch { tab });
+                self.palette_query = self.tabs[tab].buffer.selected_text().unwrap_or_default();
+                self.buffer_replace_query.clear();
+                self.buffer_replace_visible = true;
+                self.buffer_replace_focused = false;
                 self.tabs[tab].view.search = Default::default();
                 self.focus = Focus::Overlay;
-                Vec::new()
+                self.start_buffer_search(tab).into_iter().collect()
+            }
+            command::EDITOR_REPLACE_NEXT => {
+                let Some(Overlay::BufferSearch { tab }) = self.overlay.as_ref() else {
+                    self.notification = Some("Open Replace in Buffer first".to_owned());
+                    return Vec::new();
+                };
+                self.replace_current_match(*tab)
+            }
+            command::EDITOR_REPLACE_ALL => {
+                let Some(Overlay::BufferSearch { tab }) = self.overlay.as_ref() else {
+                    self.notification = Some("Open Replace in Buffer first".to_owned());
+                    return Vec::new();
+                };
+                self.replace_all_matches(*tab)
             }
             command::EDITOR_UNDO => {
                 self.edit(|tab| tab.buffer.undo().map(|_| ()));
@@ -1460,6 +1748,67 @@ impl AppState {
             command::EDITOR_REDO => {
                 self.edit(|tab| tab.buffer.redo().map(|_| ()));
                 self.active_post_edit_effects()
+            }
+            command::EDITOR_INDENT => self.change_selected_indent(false),
+            command::EDITOR_OUTDENT => self.change_selected_indent(true),
+            command::EDITOR_TOGGLE_LINE_COMMENT => self.toggle_line_comment(),
+            command::EDITOR_SELECT_ALL => {
+                if let Some(tab) = self.active_tab.and_then(|index| self.tabs.get_mut(index)) {
+                    tab.buffer.select_all();
+                }
+                Vec::new()
+            }
+            command::EDITOR_DUPLICATE_LINE => {
+                self.edit(|tab| tab.buffer.duplicate_selected_lines());
+                self.active_post_edit_effects()
+            }
+            command::EDITOR_MOVE_LINE_UP => {
+                self.edit(|tab| tab.buffer.move_selected_lines(false));
+                self.active_post_edit_effects()
+            }
+            command::EDITOR_MOVE_LINE_DOWN => {
+                self.edit(|tab| tab.buffer.move_selected_lines(true));
+                self.active_post_edit_effects()
+            }
+            command::EDITOR_DELETE_LINE => {
+                self.edit(|tab| tab.buffer.delete_selected_lines());
+                self.active_post_edit_effects()
+            }
+            command::EDITOR_GOTO_LINE => {
+                if self.active_tab.is_none() {
+                    self.notification = Some("Open a file first".to_owned());
+                    return Vec::new();
+                }
+                self.overlay = Some(Overlay::GotoLine);
+                self.palette_query.clear();
+                self.focus = Focus::Overlay;
+                Vec::new()
+            }
+            command::EDITOR_NAVIGATE_BACK => self.navigate_history(true),
+            command::EDITOR_NAVIGATE_FORWARD => self.navigate_history(false),
+            command::DIAGNOSTICS_NEXT => {
+                let count = self.visible_diagnostics().len();
+                if count == 0 {
+                    self.notification = Some("No diagnostics".to_owned());
+                    return Vec::new();
+                }
+                self.diagnostic_selected = (self.diagnostic_selected + 1) % count;
+                self.open_selected_diagnostic()
+            }
+            command::DIAGNOSTICS_PREVIOUS => {
+                let count = self.visible_diagnostics().len();
+                if count == 0 {
+                    self.notification = Some("No diagnostics".to_owned());
+                    return Vec::new();
+                }
+                self.diagnostic_selected =
+                    self.diagnostic_selected.checked_sub(1).unwrap_or(count - 1);
+                self.open_selected_diagnostic()
+            }
+            command::DIAGNOSTICS_FILTER_SEVERITY => self.execute(Command::DiagnosticCycleFilter),
+            command::DIAGNOSTICS_FILTER_SOURCE => self.execute(Command::DiagnosticCycleSource),
+            command::DIAGNOSTICS_FILTER_CURRENT_FILE => {
+                self.execute(Command::DiagnosticToggleCurrentFile)
             }
             command::COMMAND_PALETTE_OPEN => {
                 self.overlay = Some(Overlay::CommandPalette);
@@ -1523,6 +1872,10 @@ impl AppState {
                 self.terminal_running = false;
                 vec![Effect::StopTerminal, self.start_terminal_effect()]
             }
+            command::TERMINAL_OPEN_REFERENCE => {
+                let snapshot = self.terminal.snapshot(self.terminal_scroll_offset);
+                self.open_terminal_reference(snapshot.cursor_row, Some(snapshot.cursor_col))
+            }
             command::VIEW_OUTPUT => {
                 self.bottom_panel_visible = true;
                 self.bottom_panel_view = BottomPanelView::Output;
@@ -1545,29 +1898,36 @@ impl AppState {
                 self.focus = Focus::BottomPanel;
                 Vec::new()
             }
-            command::DIAGNOSTICS_REFRESH => {
-                if !self.workspace.as_path().join("Cargo.toml").is_file() {
-                    self.notification =
-                        Some("Cargo diagnostics require Cargo.toml in the workspace".to_owned());
-                    return Vec::new();
-                }
-                self.compiler_diagnostic_generation =
-                    self.compiler_diagnostic_generation.saturating_add(1);
-                self.notification = Some("Running cargo clippy…".to_owned());
-                vec![Effect::RunCargoDiagnostics {
-                    generation: self.compiler_diagnostic_generation,
-                }]
-            }
+            command::DIAGNOSTICS_REFRESH => self.start_cargo_diagnostics(true),
             command::LSP_HOVER => {
                 self.lsp_request_effect("textDocument/hover", crate::app::PendingLspRequest::Hover)
             }
-            command::LSP_DEFINITION => self.lsp_request_effect(
-                "textDocument/definition",
-                crate::app::PendingLspRequest::Definition,
-            ),
+            command::LSP_DEFINITION => {
+                self.record_navigation_origin();
+                self.lsp_request_effect(
+                    "textDocument/definition",
+                    crate::app::PendingLspRequest::Definition,
+                )
+            }
             command::LSP_COMPLETION => self.lsp_request_effect(
                 "textDocument/completion",
                 crate::app::PendingLspRequest::Completion,
+            ),
+            command::LSP_REFERENCES => self.lsp_request_effect(
+                "textDocument/references",
+                crate::app::PendingLspRequest::References,
+            ),
+            command::LSP_FORMAT => self.lsp_request_effect(
+                "textDocument/formatting",
+                crate::app::PendingLspRequest::Formatting,
+            ),
+            command::LSP_SIGNATURE_HELP => self.lsp_request_effect(
+                "textDocument/signatureHelp",
+                crate::app::PendingLspRequest::SignatureHelp,
+            ),
+            command::LSP_CODE_ACTION => self.lsp_request_effect(
+                "textDocument/codeAction",
+                crate::app::PendingLspRequest::CodeActions,
             ),
             command::VIEW_EXPLORER => {
                 self.sidebar_visible = true;
@@ -1718,7 +2078,9 @@ impl AppState {
     fn apply_completion(&mut self, completion: &crate::app::CompletionCandidate) {
         let insert_text = completion.insert_text.clone();
         let replace_range = completion.replace_range;
+        let cursor_char_offset = completion.cursor_char_offset;
         self.edit(|tab| {
+            let mut insertion_start = tab.buffer.selection().range().start;
             if let Some((start, end)) = replace_range {
                 let text = tab.buffer.text().to_string();
                 let len_chars = tab.buffer.text().len_chars();
@@ -1732,9 +2094,30 @@ impl AppState {
                     anchor: CharOffset(start_offset),
                     head: CharOffset(end_offset),
                 });
+                insertion_start = start_offset;
             }
-            tab.buffer.insert(&insert_text)
+            tab.buffer.insert(&insert_text)?;
+            if let Some(relative) = cursor_char_offset {
+                tab.buffer.set_selection(Selection::caret(CharOffset(
+                    insertion_start + relative.min(insert_text.chars().count()),
+                )));
+            }
+            Ok(())
         });
+    }
+
+    fn filter_lsp_completions(&mut self) {
+        let labels = self
+            .lsp_completion_all
+            .iter()
+            .map(|completion| completion.label.as_str())
+            .collect::<Vec<_>>();
+        self.lsp_completions =
+            crate::search::fuzzy_label_indices(&self.palette_query, &labels, 200)
+                .into_iter()
+                .filter_map(|index| self.lsp_completion_all.get(index).cloned())
+                .collect();
+        self.lsp_completion_selected = 0;
     }
 
     fn selected_git_operation(&mut self, stage: bool) -> Vec<Effect> {
@@ -1825,8 +2208,55 @@ impl AppState {
         }
     }
 
+    fn open_terminal_reference(&mut self, row: usize, column: Option<usize>) -> Vec<Effect> {
+        let snapshot = self.terminal.snapshot(self.terminal_scroll_offset);
+        let Some(cells) = snapshot.lines.get(row) else {
+            self.notification = Some("No terminal line at that position".to_owned());
+            return Vec::new();
+        };
+        let text = cells
+            .iter()
+            .filter(|cell| !cell.wide_continuation)
+            .map(|cell| cell.character)
+            .collect::<String>();
+        let references = crate::terminal::find_file_references(text.trim_end());
+        let selected = column
+            .and_then(|column| {
+                references
+                    .iter()
+                    .find(|reference| reference.display_columns.contains(&column))
+            })
+            .or_else(|| references.first());
+        let Some(reference) = selected else {
+            self.notification = Some("No file reference on terminal line".to_owned());
+            return Vec::new();
+        };
+        let path = match self.workspace.resolve(&reference.path) {
+            Ok(path) => path.absolute(),
+            Err(error) => {
+                self.notification = Some(format!("Cannot open terminal reference: {error}"));
+                return Vec::new();
+            }
+        };
+        self.focus = Focus::Editor;
+        vec![Effect::OpenFile {
+            path,
+            read_only: self.force_read_only,
+            line: Some(reference.line),
+            column: Some(ColumnHint::Chars(reference.column)),
+        }]
+    }
+
     fn lsp_open_effect(&mut self, path: &std::path::Path) -> Vec<Effect> {
         if !self.settings.lsp.enabled {
+            return Vec::new();
+        }
+        if self
+            .tabs
+            .iter()
+            .find(|tab| tab.buffer.path() == Some(path))
+            .is_some_and(|tab| self.is_large_buffer(&tab.buffer))
+        {
             return Vec::new();
         }
         let Some((language, settings)) = self.language_for_path(path) else {
@@ -1859,6 +2289,9 @@ impl AppState {
 
     fn active_lsp_change_effect(&mut self) -> Option<Effect> {
         let tab = self.active_tab()?;
+        if self.is_large_buffer(&tab.buffer) {
+            return None;
+        }
         let path = tab.buffer.path()?.to_path_buf();
         // `Rope::clone` is O(1) (structural sharing), unlike the
         // `.to_string()` this replaced, so cloning it here — ahead of the
@@ -1925,6 +2358,7 @@ impl AppState {
             crate::lsp::LspClientEvent::Initialized => {
                 self.lsp_starting.remove(&language);
                 self.lsp_started.insert(language.clone());
+                self.lsp_restarts.remove(&language);
                 let paths = self
                     .tabs
                     .iter()
@@ -1996,15 +2430,52 @@ impl AppState {
         effects
     }
 
-    fn handle_lsp_message(&mut self, _language: &str, message: &serde_json::Value) -> Vec<Effect> {
+    fn handle_lsp_message(&mut self, language: &str, message: &serde_json::Value) -> Vec<Effect> {
         if let Some(id) = message.get("id").and_then(serde_json::Value::as_u64)
             && let Some(request) = self.lsp_pending.remove(&id)
         {
             return self.handle_lsp_response(request, message.get("result"));
         }
-        if message.get("method").and_then(serde_json::Value::as_str)
-            != Some("textDocument/publishDiagnostics")
-        {
+        let method = message.get("method").and_then(serde_json::Value::as_str);
+        if matches!(method, Some("window/logMessage" | "window/showMessage")) {
+            if let Some(text) = message
+                .get("params")
+                .and_then(|params| params.get("message"))
+                .and_then(serde_json::Value::as_str)
+            {
+                self.append_output(&format!("lsp:{language}"), text);
+                if method == Some("window/showMessage") {
+                    self.notification = Some(format!("LSP {language}: {text}"));
+                }
+            }
+            return Vec::new();
+        }
+        if method == Some("$/progress") {
+            let value = message.get("params").and_then(|params| params.get("value"));
+            let kind = value
+                .and_then(|value| value.get("kind"))
+                .and_then(serde_json::Value::as_str);
+            if kind == Some("end") {
+                self.lsp_progress.remove(language);
+            } else if let Some(value) = value {
+                let title = value
+                    .get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("working");
+                let detail = value
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .map_or_else(String::new, |message| format!(" {message}"));
+                let percentage = value
+                    .get("percentage")
+                    .and_then(serde_json::Value::as_u64)
+                    .map_or_else(String::new, |value| format!(" {value}%"));
+                self.lsp_progress
+                    .insert(language.to_owned(), format!("{title}{detail}{percentage}"));
+            }
+            return Vec::new();
+        }
+        if method != Some("textDocument/publishDiagnostics") {
             return Vec::new();
         }
         let Some(params) = message.get("params") else {
@@ -2045,6 +2516,10 @@ impl AppState {
         let Some(tab) = self.active_tab() else {
             return Vec::new();
         };
+        if self.is_large_buffer(&tab.buffer) {
+            self.notification = Some("LSP is disabled in large-file mode".to_owned());
+            return Vec::new();
+        }
         let Some(path) = tab.buffer.path().map(ToOwned::to_owned) else {
             return Vec::new();
         };
@@ -2064,13 +2539,36 @@ impl AppState {
         // recognized as stale (Fix 7; see `PendingLspRequest`).
         self.lsp_pending.insert(id, make_request(path.clone()));
         let position = crate::lsp::char_offset_to_position(&text, cursor);
+        let params = if method == "textDocument/references" {
+            serde_json::json!({
+                "textDocument":{"uri":file_uri(&path)},
+                "position":position,
+                "context":{"includeDeclaration":true}
+            })
+        } else if method == "textDocument/codeAction" {
+            serde_json::json!({
+                "textDocument":{"uri":file_uri(&path)},
+                "range":{"start":position,"end":position},
+                "context":{"diagnostics":[]}
+            })
+        } else if method == "textDocument/formatting" {
+            serde_json::json!({
+                "textDocument":{"uri":file_uri(&path)},
+                "options":{
+                    "tabSize":self.settings.editor.tab_width,
+                    "insertSpaces":self.settings.editor.insert_spaces
+                }
+            })
+        } else {
+            serde_json::json!({"textDocument":{"uri":file_uri(&path)},"position":position})
+        };
         vec![Effect::SendLsp {
             language,
             message: serde_json::json!({
                 "jsonrpc":"2.0",
                 "id":id,
                 "method":method,
-                "params":{"textDocument":{"uri":file_uri(&path)},"position":position}
+                "params":params
             }),
         }]
     }
@@ -2080,8 +2578,17 @@ impl AppState {
         request: crate::app::PendingLspRequest,
         result: Option<&serde_json::Value>,
     ) -> Vec<Effect> {
-        let Some(result) = result.filter(|result| !result.is_null()) else {
+        let result = result.filter(|result| !result.is_null());
+        if result.is_none() {
+            if let crate::app::PendingLspRequest::Formatting(path) = request {
+                self.notification =
+                    Some("Formatter returned no edits; saving unchanged".to_owned());
+                return self.finish_format_on_save(&path);
+            }
             self.notification = Some("LSP returned no result".to_owned());
+            return Vec::new();
+        }
+        let Some(result) = result else {
             return Vec::new();
         };
         match request {
@@ -2152,17 +2659,110 @@ impl AppState {
                 let items = result
                     .as_array()
                     .or_else(|| result.get("items").and_then(serde_json::Value::as_array));
-                self.lsp_completions = items
+                self.lsp_completion_all = items
                     .into_iter()
                     .flatten()
                     .filter_map(completion_candidate)
                     .take(200)
                     .collect();
+                self.lsp_completions = self.lsp_completion_all.clone();
+                self.palette_query.clear();
                 self.lsp_completion_selected = 0;
                 if self.lsp_completions.is_empty() {
                     self.notification = Some("No completions".to_owned());
                 } else {
                     self.overlay = Some(Overlay::LspCompletion);
+                    self.focus = Focus::Overlay;
+                }
+                Vec::new()
+            }
+            crate::app::PendingLspRequest::References(path) => {
+                if !self.is_active_path(&path) {
+                    self.notification = Some("Stale LSP response discarded".to_owned());
+                    return Vec::new();
+                }
+                self.lsp_locations = result
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(lsp_location)
+                    .collect();
+                self.lsp_location_selected = 0;
+                if self.lsp_locations.is_empty() {
+                    self.notification = Some("No references found".to_owned());
+                } else {
+                    self.overlay = Some(Overlay::LspLocations);
+                    self.focus = Focus::Overlay;
+                }
+                Vec::new()
+            }
+            crate::app::PendingLspRequest::Formatting(path) => {
+                if !self.is_active_path(&path) {
+                    self.notification = Some("Stale LSP response discarded".to_owned());
+                    return Vec::new();
+                }
+                let Some(index) = self.active_tab else {
+                    return Vec::new();
+                };
+                let source = self.tabs[index].buffer.text().to_string();
+                let edits = result
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|edit| lsp_text_edit(&source, edit))
+                    .collect::<Vec<_>>();
+                if edits.is_empty() {
+                    self.notification = Some("Document is already formatted".to_owned());
+                    return self.finish_format_on_save(&path);
+                }
+                self.edit(|tab| tab.buffer.apply_text_edits(edits).map(|_| ()));
+                self.notification = Some("Formatted document".to_owned());
+                let mut effects = self.active_post_edit_effects();
+                effects.extend(self.finish_format_on_save(&path));
+                effects
+            }
+            crate::app::PendingLspRequest::SignatureHelp(path) => {
+                if !self.is_active_path(&path) {
+                    self.notification = Some("Stale LSP response discarded".to_owned());
+                    return Vec::new();
+                }
+                self.lsp_signature = signature_help_lines(result);
+                if self.lsp_signature.is_empty() {
+                    self.notification = Some("No signature help available".to_owned());
+                } else {
+                    self.overlay = Some(Overlay::LspSignature);
+                    self.focus = Focus::Overlay;
+                }
+                Vec::new()
+            }
+            crate::app::PendingLspRequest::CodeActions(path) => {
+                if !self.is_active_path(&path) {
+                    self.notification = Some("Stale LSP response discarded".to_owned());
+                    return Vec::new();
+                }
+                self.lsp_code_actions = result
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|item| {
+                        Some(crate::app::CodeActionCandidate {
+                            title: item.get("title")?.as_str()?.to_owned(),
+                            edit: item.get("edit").cloned(),
+                            command: item.get("command").map(|command| {
+                                if command.is_string() {
+                                    item.clone()
+                                } else {
+                                    command.clone()
+                                }
+                            }),
+                        })
+                    })
+                    .collect();
+                self.lsp_code_action_selected = 0;
+                if self.lsp_code_actions.is_empty() {
+                    self.notification = Some("No code actions available".to_owned());
+                } else {
+                    self.overlay = Some(Overlay::LspCodeActions);
                     self.focus = Focus::Overlay;
                 }
                 Vec::new()
@@ -2195,18 +2795,352 @@ impl AppState {
         }
     }
 
-    fn move_vertical(&mut self, down: bool, extend: bool) {
-        let tab_width = usize::from(self.settings.editor.tab_width);
+    fn change_selected_indent(&mut self, outdent: bool) -> Vec<Effect> {
+        let indent = if self.settings.editor.insert_spaces {
+            " ".repeat(usize::from(self.settings.editor.tab_width))
+        } else {
+            "\t".to_owned()
+        };
+        self.edit(|tab| tab.buffer.change_selected_line_indent(&indent, outdent));
+        self.active_post_edit_effects()
+    }
+
+    fn format_tab_for_save(&mut self, index: usize) {
+        let trim = self.settings.editor.trim_trailing_whitespace;
+        let final_newline = self.settings.editor.insert_final_newline;
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return;
+        };
+        if let Err(error) = tab.buffer.apply_save_formatting(trim, final_newline) {
+            self.notification = Some(error.to_string());
+        }
+    }
+
+    fn save_tab(&mut self, index: usize) -> Vec<Effect> {
+        let Some(tab) = self.tabs.get(index) else {
+            return Vec::new();
+        };
+        match tab.buffer.prepare_save() {
+            Ok(snapshot) => {
+                if self.saving_tabs.contains(&index) {
+                    self.pending_saves.insert(index, snapshot);
+                    self.notification = Some("Save queued".to_owned());
+                    Vec::new()
+                } else {
+                    self.saving_tabs.insert(index);
+                    vec![Effect::Save {
+                        tab: index,
+                        snapshot,
+                    }]
+                }
+            }
+            Err(error) => {
+                self.notification = Some(error.to_string());
+                Vec::new()
+            }
+        }
+    }
+
+    fn finish_format_on_save(&mut self, path: &std::path::Path) -> Vec<Effect> {
+        let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.buffer.path() == Some(path))
+        else {
+            return Vec::new();
+        };
+        if !self.format_on_save_tabs.remove(&index) {
+            return Vec::new();
+        }
+        self.format_tab_for_save(index);
+        self.save_tab(index)
+    }
+
+    fn apply_selected_code_action(&mut self) -> Vec<Effect> {
+        let Some(action) = self
+            .lsp_code_actions
+            .get(self.lsp_code_action_selected)
+            .cloned()
+        else {
+            return Vec::new();
+        };
+        self.overlay = None;
+        self.focus = Focus::Editor;
+        let mut edits_by_tab = Vec::new();
+        if let Some(edit) = &action.edit {
+            if edit.get("documentChanges").is_some() {
+                self.notification = Some(
+                    "This code action uses documentChanges, which is not yet supported".to_owned(),
+                );
+                return Vec::new();
+            }
+            if let Some(changes) = edit.get("changes").and_then(serde_json::Value::as_object) {
+                for (uri, edits) in changes {
+                    let Some(path) = file_uri_to_path(uri) else {
+                        self.notification =
+                            Some("Code action contains an invalid file URI".to_owned());
+                        return Vec::new();
+                    };
+                    let Some(index) = self
+                        .tabs
+                        .iter()
+                        .position(|tab| tab.buffer.path() == Some(path.as_path()))
+                    else {
+                        self.notification = Some(format!(
+                            "Code action edits unopened file {}; open it before retrying",
+                            path.display()
+                        ));
+                        return Vec::new();
+                    };
+                    let source = self.tabs[index].buffer.text().to_string();
+                    let parsed = edits
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|edit| lsp_text_edit(&source, edit))
+                        .collect::<Vec<_>>();
+                    edits_by_tab.push((index, path, parsed));
+                }
+            }
+        }
+        for (index, path, edits) in edits_by_tab {
+            if let Some(tab) = self.tabs.get_mut(index)
+                && let Err(error) = tab.buffer.apply_text_edits(edits)
+            {
+                self.notification = Some(error.to_string());
+                return Vec::new();
+            }
+            self.diagnostics.mark_file_stale(&path);
+        }
+        let mut effects = self.active_post_edit_effects();
+        if let Some(command) = action.command {
+            let command_name = command.get("command").and_then(serde_json::Value::as_str);
+            let Some(command_name) = command_name else {
+                self.notification = Some("Code action returned an invalid command".to_owned());
+                return effects;
+            };
+            let Some(path) = self.active_tab().and_then(|tab| tab.buffer.path()) else {
+                return effects;
+            };
+            let Some((language, _)) = self.language_for_path(path) else {
+                return effects;
+            };
+            let id = self.lsp_next_request_id;
+            self.lsp_next_request_id = self.lsp_next_request_id.saturating_add(1);
+            effects.push(Effect::SendLsp {
+                language,
+                message: serde_json::json!({
+                    "jsonrpc":"2.0",
+                    "id":id,
+                    "method":"workspace/executeCommand",
+                    "params":{
+                        "command":command_name,
+                        "arguments":command.get("arguments").cloned().unwrap_or_else(|| serde_json::json!([]))
+                    }
+                }),
+            });
+        }
+        self.notification = Some(format!("Applied code action: {}", action.title));
+        effects
+    }
+
+    fn open_selected_diagnostic(&mut self) -> Vec<Effect> {
+        let Some(diagnostic) = self
+            .visible_diagnostics()
+            .get(self.diagnostic_selected)
+            .cloned()
+            .cloned()
+        else {
+            return Vec::new();
+        };
+        self.record_navigation_origin();
+        self.focus = Focus::Editor;
+        vec![Effect::OpenFile {
+            path: diagnostic.file,
+            read_only: self.force_read_only,
+            line: Some(diagnostic.range.start.line + 1),
+            column: Some(ColumnHint::Chars(diagnostic.range.start.column + 1)),
+        }]
+    }
+
+    fn start_cargo_diagnostics(&mut self, notify: bool) -> Vec<Effect> {
+        if !self.workspace.as_path().join("Cargo.toml").is_file() {
+            if notify {
+                self.notification =
+                    Some("Cargo diagnostics require Cargo.toml in the workspace".to_owned());
+            }
+            return Vec::new();
+        }
+        if self.cargo_diagnostics_running {
+            self.cargo_diagnostics_pending = true;
+            return Vec::new();
+        }
+        self.cargo_diagnostics_running = true;
+        self.compiler_diagnostic_generation = self.compiler_diagnostic_generation.saturating_add(1);
+        if notify {
+            self.notification = Some("Running cargo clippy…".to_owned());
+        }
+        vec![Effect::RunCargoDiagnostics {
+            generation: self.compiler_diagnostic_generation,
+        }]
+    }
+
+    fn finish_cargo_diagnostics(
+        &mut self,
+        source: crate::diagnostics::DiagnosticSource,
+    ) -> Vec<Effect> {
+        if source != crate::diagnostics::DiagnosticSource::Compiler {
+            return Vec::new();
+        }
+        self.cargo_diagnostics_running = false;
+        if self.cargo_diagnostics_pending {
+            self.cargo_diagnostics_pending = false;
+            self.start_cargo_diagnostics(false)
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn current_navigation_location(&self) -> Option<crate::app::NavigationLocation> {
+        let tab = self.active_tab()?;
+        let path = tab.buffer.path()?.to_path_buf();
+        let cursor = tab
+            .buffer
+            .selection()
+            .head
+            .0
+            .min(tab.buffer.text().len_chars());
+        let line_index = tab.buffer.text().char_to_line(cursor);
+        let column = cursor - tab.buffer.text().line_to_char(line_index) + 1;
+        Some(crate::app::NavigationLocation {
+            path,
+            line: line_index + 1,
+            column: ColumnHint::Chars(column),
+        })
+    }
+
+    fn record_navigation_origin(&mut self) {
+        if let Some(location) = self.current_navigation_location() {
+            self.navigation_back.push(location);
+            if self.navigation_back.len() > 100 {
+                self.navigation_back.remove(0);
+            }
+            self.navigation_forward.clear();
+        }
+    }
+
+    fn navigate_history(&mut self, back: bool) -> Vec<Effect> {
+        let target = if back {
+            self.navigation_back.pop()
+        } else {
+            self.navigation_forward.pop()
+        };
+        let Some(target) = target else {
+            self.notification = Some(if back {
+                "No previous navigation location".to_owned()
+            } else {
+                "No forward navigation location".to_owned()
+            });
+            return Vec::new();
+        };
+        if let Some(current) = self.current_navigation_location() {
+            if back {
+                self.navigation_forward.push(current);
+            } else {
+                self.navigation_back.push(current);
+            }
+        }
+        vec![Effect::OpenFile {
+            path: target.path,
+            read_only: self.force_read_only,
+            line: Some(target.line),
+            column: Some(target.column),
+        }]
+    }
+
+    fn toggle_line_comment(&mut self) -> Vec<Effect> {
+        let language = self
+            .active_tab()
+            .and_then(|tab| tab.buffer.path())
+            .and_then(|path| {
+                path.extension()
+                    .and_then(|extension| extension.to_str())
+                    .and_then(editor::SyntaxLanguage::from_extension)
+                    .or_else(|| {
+                        self.language_for_path(path)
+                            .and_then(|(name, _)| editor::SyntaxLanguage::from_language_name(&name))
+                    })
+            });
+        let Some((prefix, suffix)) = language.and_then(editor::SyntaxLanguage::comment_tokens)
+        else {
+            self.notification = Some("No line comment syntax for this file type".to_owned());
+            return Vec::new();
+        };
+        self.edit(|tab| tab.buffer.toggle_selected_line_comment(prefix, suffix));
+        self.active_post_edit_effects()
+    }
+
+    fn move_word_horizontal(&mut self, right: bool, extend: bool) {
         let Some(tab) = self.active_tab.and_then(|index| self.tabs.get_mut(index)) else {
             return;
         };
         let selection = tab.buffer.selection();
-        let (next, preferred) = if down {
+        let next = if right {
+            editor::move_word_right(tab.buffer.text(), selection.head.0)
+        } else {
+            editor::move_word_left(tab.buffer.text(), selection.head.0)
+        };
+        tab.buffer.set_selection(Selection {
+            anchor: if extend {
+                selection.anchor
+            } else {
+                CharOffset(next)
+            },
+            head: CharOffset(next),
+        });
+        tab.view.preferred_display_column = None;
+        let _ = tab;
+        if let Some(index) = self.active_tab {
+            self.reveal_cursor(index);
+        }
+    }
+
+    fn move_vertical(&mut self, down: bool, extend: bool) {
+        let tab_width = usize::from(self.settings.editor.tab_width);
+        let ambiguous_width_wide = self.settings.editor.ambiguous_width_wide;
+        let wrap_width = self
+            .active_tab
+            .and_then(|index| self.tabs.get(index))
+            .map(|tab| {
+                editor_wrap_width(
+                    self.terminal_size.0,
+                    self.sidebar_visible,
+                    self.settings.ui.sidebar_width,
+                    self.split_tab.is_some(),
+                    tab.buffer.text().len_lines(),
+                )
+            });
+        let Some(tab) = self.active_tab.and_then(|index| self.tabs.get_mut(index)) else {
+            return;
+        };
+        let selection = tab.buffer.selection();
+        let (next, preferred) = if self.settings.editor.word_wrap {
+            editor::move_visual_vertical(
+                tab.buffer.text(),
+                selection.head.0,
+                tab.view.preferred_display_column,
+                wrap_width.unwrap_or(1),
+                tab_width,
+                ambiguous_width_wide,
+                down,
+            )
+        } else if down {
             editor::move_down(
                 tab.buffer.text(),
                 selection.head.0,
                 tab.view.preferred_display_column,
                 tab_width,
+                ambiguous_width_wide,
             )
         } else {
             editor::move_up(
@@ -2214,6 +3148,7 @@ impl AppState {
                 selection.head.0,
                 tab.view.preferred_display_column,
                 tab_width,
+                ambiguous_width_wide,
             )
         };
         tab.buffer.set_selection(Selection {
@@ -2248,13 +3183,24 @@ impl AppState {
         self.file_search_cancellation
             .store(self.file_search_generation, Ordering::Relaxed);
         self.file_picker_selected = 0;
-        let paths = self
+        let mut paths = self
             .tree
             .entries
             .iter()
             .filter(|entry| entry.kind != TreeEntryKind::Directory)
             .map(|entry| entry.relative_path.clone())
-            .collect();
+            .collect::<Vec<_>>();
+        if self.palette_query.is_empty() {
+            let mut ordered = self
+                .recent_files
+                .iter()
+                .filter(|path| paths.contains(path))
+                .cloned()
+                .collect::<Vec<_>>();
+            paths.retain(|path| !ordered.contains(path));
+            ordered.extend(paths);
+            paths = ordered;
+        }
         Effect::FuzzyFiles {
             generation: self.file_search_generation,
             query: self.palette_query.clone(),
@@ -2431,6 +3377,55 @@ impl AppState {
         self.reveal_cursor(tab_index);
     }
 
+    fn replace_current_match(&mut self, tab_index: usize) -> Vec<Effect> {
+        let range = self.tabs.get(tab_index).and_then(|tab| {
+            tab.view
+                .search
+                .matches
+                .get(tab.view.search.current)
+                .cloned()
+        });
+        let Some(range) = range else {
+            self.notification = Some("No current match to replace".to_owned());
+            return Vec::new();
+        };
+        let replacement = self.buffer_replace_query.clone();
+        self.edit(|tab| {
+            tab.buffer.set_selection(Selection {
+                anchor: CharOffset(range.start),
+                head: CharOffset(range.end),
+            });
+            tab.buffer.insert(&replacement)
+        });
+        self.notification = Some("Replaced current match".to_owned());
+        let mut effects = self.active_post_edit_effects();
+        effects.extend(self.start_buffer_search(tab_index));
+        effects
+    }
+
+    fn replace_all_matches(&mut self, tab_index: usize) -> Vec<Effect> {
+        let ranges = self
+            .tabs
+            .get(tab_index)
+            .map(|tab| tab.view.search.matches.clone())
+            .unwrap_or_default();
+        if ranges.is_empty() {
+            self.notification = Some("No matches to replace".to_owned());
+            return Vec::new();
+        }
+        let replacement = self.buffer_replace_query.clone();
+        let count = ranges.len();
+        self.edit(|tab| {
+            tab.buffer
+                .replace_all_ranges(&ranges, &replacement)
+                .map(|_| ())
+        });
+        self.notification = Some(format!("Replaced {count} matches"));
+        let mut effects = self.active_post_edit_effects();
+        effects.extend(self.start_buffer_search(tab_index));
+        effects
+    }
+
     fn request_close_tab(&mut self, index: usize) -> Vec<Effect> {
         if index >= self.tabs.len() {
             return Vec::new();
@@ -2488,20 +3483,39 @@ impl AppState {
 
     fn reveal_cursor(&mut self, tab_index: usize) {
         let visible_height = self.editor_visible_height();
+        let wrap_width = self.tabs.get(tab_index).map(|tab| {
+            editor_wrap_width(
+                self.terminal_size.0,
+                self.sidebar_visible,
+                self.settings.ui.sidebar_width,
+                self.split_tab.is_some(),
+                tab.buffer.text().len_lines(),
+            )
+        });
         let Some(tab) = self.tabs.get_mut(tab_index) else {
             return;
         };
-        let cursor_line = tab.buffer.text().char_to_line(
-            tab.buffer
-                .selection()
-                .head
-                .0
-                .min(tab.buffer.text().len_chars()),
-        );
-        if cursor_line < tab.view.scroll_line {
-            tab.view.scroll_line = cursor_line;
-        } else if cursor_line >= tab.view.scroll_line + visible_height {
-            tab.view.scroll_line = cursor_line.saturating_sub(visible_height - 1);
+        let cursor_row = if self.settings.editor.word_wrap {
+            editor::visual_index_for_offset(
+                tab.buffer.text(),
+                tab.buffer.selection().head.0,
+                wrap_width.unwrap_or(1),
+                usize::from(self.settings.editor.tab_width),
+                self.settings.editor.ambiguous_width_wide,
+            )
+        } else {
+            tab.buffer.text().char_to_line(
+                tab.buffer
+                    .selection()
+                    .head
+                    .0
+                    .min(tab.buffer.text().len_chars()),
+            )
+        };
+        if cursor_row < tab.view.scroll_line {
+            tab.view.scroll_line = cursor_row;
+        } else if cursor_row >= tab.view.scroll_line + visible_height {
+            tab.view.scroll_line = cursor_row.saturating_sub(visible_height - 1);
         }
     }
 
@@ -2521,6 +3535,15 @@ impl AppState {
                 .saturating_sub(panel_height)
                 .max(1),
         )
+    }
+
+    fn is_large_buffer(&self, buffer: &crate::buffer::TextBuffer) -> bool {
+        let threshold = self
+            .settings
+            .editor
+            .large_file_threshold_mb
+            .saturating_mul(1024 * 1024);
+        u64::try_from(buffer.text().len_bytes()).unwrap_or(u64::MAX) > threshold
     }
 
     fn reveal_selected_git_hunk(&mut self) {
@@ -2660,22 +3683,52 @@ fn hover_lines(result: &serde_json::Value) -> Vec<String> {
     lines
 }
 
+fn signature_help_lines(result: &serde_json::Value) -> Vec<String> {
+    let signatures = result
+        .get("signatures")
+        .and_then(serde_json::Value::as_array);
+    let active = result
+        .get("activeSignature")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as usize;
+    let Some(signature) = signatures.and_then(|items| items.get(active).or_else(|| items.first()))
+    else {
+        return Vec::new();
+    };
+    let mut lines = signature
+        .get("label")
+        .and_then(serde_json::Value::as_str)
+        .map(|label| vec![label.to_owned()])
+        .unwrap_or_default();
+    let documentation = signature.get("documentation").and_then(|documentation| {
+        documentation.as_str().or_else(|| {
+            documentation
+                .get("value")
+                .and_then(serde_json::Value::as_str)
+        })
+    });
+    if let Some(documentation) = documentation {
+        lines.extend(documentation.lines().map(str::to_owned));
+    }
+    lines
+}
+
 fn completion_candidate(value: &serde_json::Value) -> Option<crate::app::CompletionCandidate> {
     let label = value.get("label")?.as_str()?.to_owned();
     let is_snippet = value
         .get("insertTextFormat")
         .and_then(serde_json::Value::as_u64)
         == Some(2);
-    let insert_text = if is_snippet {
-        label.clone()
+    let raw_insert_text = value
+        .get("textEdit")
+        .and_then(|edit| edit.get("newText"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| value.get("insertText").and_then(serde_json::Value::as_str))
+        .unwrap_or(&label);
+    let (insert_text, cursor_char_offset) = if is_snippet {
+        expand_lsp_snippet(raw_insert_text)
     } else {
-        value
-            .get("textEdit")
-            .and_then(|edit| edit.get("newText"))
-            .and_then(serde_json::Value::as_str)
-            .or_else(|| value.get("insertText").and_then(serde_json::Value::as_str))
-            .unwrap_or(&label)
-            .to_owned()
+        (raw_insert_text.to_owned(), None)
     };
     Some(crate::app::CompletionCandidate {
         label,
@@ -2685,7 +3738,79 @@ fn completion_candidate(value: &serde_json::Value) -> Option<crate::app::Complet
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned),
         replace_range: completion_replace_range(value),
+        cursor_char_offset,
     })
+}
+
+fn expand_lsp_snippet(snippet: &str) -> (String, Option<usize>) {
+    let chars = snippet.chars().collect::<Vec<_>>();
+    let mut output = String::new();
+    let mut placeholders = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] == '\\' && index + 1 < chars.len() {
+            output.push(chars[index + 1]);
+            index += 2;
+            continue;
+        }
+        if chars[index] != '$' || index + 1 >= chars.len() {
+            output.push(chars[index]);
+            index += 1;
+            continue;
+        }
+        if chars[index + 1].is_ascii_digit() {
+            let mut end = index + 1;
+            while end < chars.len() && chars[end].is_ascii_digit() {
+                end += 1;
+            }
+            let number = chars[index + 1..end]
+                .iter()
+                .collect::<String>()
+                .parse::<usize>()
+                .unwrap_or(0);
+            placeholders.push((number, output.chars().count()));
+            index = end;
+            continue;
+        }
+        if chars[index + 1] == '{' {
+            let mut end = index + 2;
+            while end < chars.len() && chars[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end == index + 2 {
+                output.push('$');
+                index += 1;
+                continue;
+            }
+            let number = chars[index + 2..end]
+                .iter()
+                .collect::<String>()
+                .parse::<usize>()
+                .unwrap_or(0);
+            let start_offset = output.chars().count();
+            if chars.get(end) == Some(&':') {
+                end += 1;
+                while end < chars.len() && chars[end] != '}' {
+                    output.push(chars[end]);
+                    end += 1;
+                }
+            }
+            if chars.get(end) == Some(&'}') {
+                placeholders.push((number, start_offset));
+                index = end + 1;
+                continue;
+            }
+        }
+        output.push('$');
+        index += 1;
+    }
+    let cursor = placeholders
+        .iter()
+        .filter(|(number, _)| *number > 0)
+        .min_by_key(|(number, _)| *number)
+        .or_else(|| placeholders.iter().find(|(number, _)| *number == 0))
+        .map(|(_, offset)| *offset);
+    (output, cursor)
 }
 
 /// Parses the range `textEdit` says the completion's `newText` should
@@ -2707,6 +3832,87 @@ fn completion_position(value: &serde_json::Value) -> Option<lsp_types::Position>
         value.get("line")?.as_u64()? as u32,
         value.get("character")?.as_u64()? as u32,
     ))
+}
+
+fn lsp_location(value: &serde_json::Value) -> Option<crate::app::NavigationLocation> {
+    let path = value
+        .get("uri")
+        .or_else(|| value.get("targetUri"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(file_uri_to_path)?;
+    let range = value
+        .get("range")
+        .or_else(|| value.get("targetSelectionRange"))?;
+    let start = range.get("start")?;
+    Some(crate::app::NavigationLocation {
+        path,
+        line: start.get("line")?.as_u64()? as usize + 1,
+        column: ColumnHint::Utf16(start.get("character")?.as_u64()? as usize + 1),
+    })
+}
+
+fn lsp_text_edit(
+    source: &str,
+    value: &serde_json::Value,
+) -> Option<(std::ops::Range<usize>, String)> {
+    let range = value.get("range")?;
+    let start = completion_position(range.get("start")?)?;
+    let end = completion_position(range.get("end")?)?;
+    let mut start = crate::lsp::position_to_char_offset(source, start);
+    let mut end = crate::lsp::position_to_char_offset(source, end);
+    if start > end {
+        std::mem::swap(&mut start, &mut end);
+    }
+    Some((start..end, value.get("newText")?.as_str()?.to_owned()))
+}
+
+fn git_error_guidance(error: &str) -> String {
+    let lower = error.to_ascii_lowercase();
+    let guidance = if lower.contains("authentication failed")
+        || lower.contains("could not read username")
+        || lower.contains("permission denied (publickey)")
+    {
+        "Authentication failed. Verify the remote URL and configure HTTPS credentials or an SSH key."
+    } else if lower.contains("non-fast-forward") || lower.contains("rejected") {
+        "Push was rejected because the remote has newer commits. Pull or fetch and reconcile the branch before pushing again."
+    } else if lower.contains("no upstream branch") || lower.contains("has no upstream") {
+        "This branch has no upstream. Configure one with `git push --set-upstream <remote> <branch>`."
+    } else if lower.contains("author identity unknown")
+        || lower.contains("please tell me who you are")
+        || lower.contains("user.email")
+    {
+        "Git author identity is not configured. Set `git config --global user.name` and `git config --global user.email`."
+    } else if lower.contains("unmerged files") || lower.contains("resolve your current index") {
+        "Git found unresolved merge conflicts. Resolve and stage conflicted files before retrying."
+    } else {
+        return error.to_owned();
+    };
+    guidance.to_owned()
+}
+
+fn editor_wrap_width(
+    terminal_width: u16,
+    sidebar_visible: bool,
+    configured_sidebar_width: u16,
+    split: bool,
+    line_count: usize,
+) -> usize {
+    let sidebar_width = if sidebar_visible {
+        configured_sidebar_width.min(terminal_width.saturating_sub(24))
+    } else {
+        0
+    };
+    let editor_width = terminal_width
+        .saturating_sub(3)
+        .saturating_sub(sidebar_width);
+    let group_width = if split {
+        editor_width.saturating_sub(1) / 2
+    } else {
+        editor_width
+    };
+    usize::from(group_width)
+        .saturating_sub(line_count.to_string().len().max(2) + 3)
+        .max(1)
 }
 
 #[cfg(test)]
@@ -2817,6 +4023,87 @@ mod tests {
 
         state.update(AppEvent::Command(Command::SearchNext));
         assert_eq!(state.tabs[0].buffer.selection().range(), 4..5);
+    }
+
+    #[test]
+    fn buffer_replace_all_is_command_driven_and_undoable() {
+        let mut state = state();
+        let mut buffer = TextBuffer::empty(None, false);
+        buffer.insert("one two one").unwrap();
+        state.tabs.push(BufferTab::new(buffer));
+        state.active_tab = Some(0);
+        state.update(AppEvent::Command(Command::Invoke(
+            command::EDITOR_REPLACE.to_owned(),
+        )));
+        let mut effects = Vec::new();
+        for character in "one".chars() {
+            effects = state.update(AppEvent::Command(Command::PaletteInput(character)));
+        }
+        let Effect::SearchBuffer {
+            tab,
+            buffer_generation,
+            search_generation,
+            query,
+            source,
+            cancellation,
+        } = effects.into_iter().next().expect("search effect")
+        else {
+            panic!("expected search effect");
+        };
+        let matches = crate::search::find_matches(
+            &source.to_string(),
+            &query,
+            &cancellation,
+            search_generation,
+            100,
+        );
+        state.update(AppEvent::BufferSearchCompleted {
+            tab,
+            buffer_generation,
+            search_generation,
+            query,
+            matches,
+        });
+        state.update(AppEvent::Command(Command::SearchToggleReplaceField));
+        state.update(AppEvent::Command(Command::PaletteInput('1')));
+        state.update(AppEvent::Command(Command::ReplaceAll));
+        assert_eq!(state.tabs[0].buffer.text_string(), "1 two 1");
+        state.tabs[0].buffer.undo().unwrap();
+        assert_eq!(state.tabs[0].buffer.text_string(), "one two one");
+    }
+
+    #[test]
+    fn navigation_history_moves_back_and_forward_between_files() {
+        let mut state = state();
+        let first = state.workspace.as_path().join("first.rs");
+        let second = state.workspace.as_path().join("second.rs");
+        let mut first_buffer = TextBuffer::empty(Some(first.clone()), false);
+        first_buffer.insert("first\nline").unwrap();
+        first_buffer.set_selection(Selection::caret(CharOffset(7)));
+        state.tabs.push(BufferTab::new(first_buffer));
+        state.tabs.push(BufferTab::new(TextBuffer::empty(
+            Some(second.clone()),
+            false,
+        )));
+        state.active_tab = Some(0);
+        state.record_navigation_origin();
+        state.active_tab = Some(1);
+
+        let effects = state.update(AppEvent::Command(Command::Invoke(
+            command::EDITOR_NAVIGATE_BACK.to_owned(),
+        )));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::OpenFile { path, line: Some(2), .. }] if path == &first
+        ));
+        state.active_tab = Some(0);
+        let effects = state.update(AppEvent::Command(Command::Invoke(
+            command::EDITOR_NAVIGATE_FORWARD.to_owned(),
+        )));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::OpenFile { path, .. }] if path == &second
+        ));
     }
 
     #[test]
@@ -3222,6 +4509,27 @@ mod tests {
     }
 
     #[test]
+    fn terminal_file_reference_command_opens_workspace_location() {
+        let mut state = state();
+        fs::create_dir_all(state.workspace.as_path().join("src")).unwrap();
+        fs::write(state.workspace.as_path().join("src/main.rs"), "a\nb\n").unwrap();
+        state.terminal.feed(b"error src/main.rs:2:1");
+        let effects = state.update(AppEvent::Command(Command::TerminalOpenReference {
+            row: 0,
+            column: Some(12),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::OpenFile {
+                path,
+                line: Some(2),
+                column: Some(ColumnHint::Chars(1)),
+                ..
+            }] if path == &state.workspace.as_path().join("src/main.rs")
+        ));
+    }
+
+    #[test]
     fn utf16_column_hint_lands_past_non_bmp_characters_on_the_target_line() {
         let mut state = state();
         let path = state.workspace.as_path().join("unicode_definition.rs");
@@ -3268,6 +4576,72 @@ mod tests {
                 lsp_types::Position::new(1, 5)
             ))
         );
+    }
+
+    #[test]
+    fn completion_candidate_expands_snippet_defaults_and_places_cursor() {
+        let item = serde_json::json!({
+            "label": "println!",
+            "insertTextFormat": 2,
+            "insertText": "println!(\"${1:value}\");$0"
+        });
+        let candidate = completion_candidate(&item).expect("valid completion item");
+        assert_eq!(candidate.insert_text, "println!(\"value\");");
+        assert_eq!(candidate.cursor_char_offset, Some(10));
+    }
+
+    #[test]
+    fn signature_help_selects_active_signature_and_documentation() {
+        let lines = signature_help_lines(&serde_json::json!({
+            "activeSignature": 1,
+            "signatures": [
+                {"label": "first()"},
+                {"label": "target(value: i32)", "documentation": {"kind": "markdown", "value": "Target docs"}}
+            ]
+        }));
+        assert_eq!(lines, vec!["target(value: i32)", "Target docs"]);
+    }
+
+    #[test]
+    fn git_failures_receive_actionable_guidance_without_losing_raw_output() {
+        assert!(git_error_guidance("fatal: Authentication failed").contains("SSH key"));
+        assert!(
+            git_error_guidance("! [rejected] main -> main (non-fast-forward)")
+                .contains("remote has newer")
+        );
+        assert!(
+            git_error_guidance("Author identity unknown; please tell me who you are")
+                .contains("user.name")
+        );
+        assert_eq!(git_error_guidance("unknown failure"), "unknown failure");
+    }
+
+    #[test]
+    fn cargo_diagnostics_save_triggers_are_coalesced_while_running() {
+        let mut state = state();
+        fs::write(
+            state.workspace.as_path().join("Cargo.toml"),
+            "[package]\nname='x'",
+        )
+        .unwrap();
+        let first = state.start_cargo_diagnostics(false);
+        assert!(matches!(
+            first.as_slice(),
+            [Effect::RunCargoDiagnostics { generation: 1 }]
+        ));
+        assert!(state.start_cargo_diagnostics(false).is_empty());
+        assert!(state.cargo_diagnostics_pending);
+        let next = state.update(AppEvent::DiagnosticsReplaced {
+            source: crate::diagnostics::DiagnosticSource::Compiler,
+            generation: 1,
+            diagnostics: Vec::new(),
+        });
+        assert!(matches!(
+            next.as_slice(),
+            [Effect::RunCargoDiagnostics { generation: 2 }]
+        ));
+        assert!(state.cargo_diagnostics_running);
+        assert!(!state.cargo_diagnostics_pending);
     }
 
     #[test]
@@ -3419,6 +4793,31 @@ mod tests {
     }
 
     #[test]
+    fn large_file_mode_skips_syntax_and_lsp_and_explains_degradation() {
+        let mut state = state();
+        state.settings.editor.large_file_threshold_mb = 0;
+        let path = state.workspace.as_path().join("large.rs");
+        let mut buffer = TextBuffer::empty(Some(path.clone()), false);
+        buffer.insert("fn main() {}").unwrap();
+        let effects = state.update(AppEvent::FileOpened {
+            path,
+            line: None,
+            column: None,
+            result: Ok(buffer),
+        });
+        assert!(!effects.iter().any(|effect| matches!(
+            effect,
+            Effect::HighlightSyntax { .. } | Effect::StartLsp { .. }
+        )));
+        assert!(
+            state
+                .notification
+                .as_deref()
+                .is_some_and(|message| message.contains("Large-file mode"))
+        );
+    }
+
+    #[test]
     fn rust_file_lazily_starts_lsp_and_sends_full_document_changes() {
         let mut state = state();
         let path = state.workspace.as_path().join("main.rs");
@@ -3451,6 +4850,203 @@ mod tests {
                 .iter()
                 .any(|effect| matches!(effect, Effect::SendLspChange { version: 2, .. }))
         );
+    }
+
+    #[test]
+    fn lsp_log_and_progress_notifications_update_output_and_status_state() {
+        let mut state = state();
+        state.update(AppEvent::LspClient {
+            language: "rust".to_owned(),
+            event: crate::lsp::LspClientEvent::Message(serde_json::json!({
+                "method": "window/logMessage",
+                "params": {"type": 3, "message": "indexed crate"}
+            })),
+        });
+        assert!(
+            state
+                .output_lines
+                .iter()
+                .any(|line| line.contains("indexed crate"))
+        );
+
+        state.update(AppEvent::LspClient {
+            language: "rust".to_owned(),
+            event: crate::lsp::LspClientEvent::Message(serde_json::json!({
+                "method": "$/progress",
+                "params": {"token": "index", "value": {
+                    "kind": "report", "message": "workspace", "percentage": 60
+                }}
+            })),
+        });
+        assert_eq!(
+            state.lsp_progress.get("rust").map(String::as_str),
+            Some("working workspace 60%")
+        );
+        state.update(AppEvent::LspClient {
+            language: "rust".to_owned(),
+            event: crate::lsp::LspClientEvent::Message(serde_json::json!({
+                "method": "$/progress",
+                "params": {"token": "index", "value": {"kind": "end"}}
+            })),
+        });
+        assert!(!state.lsp_progress.contains_key("rust"));
+    }
+
+    #[test]
+    fn references_request_opens_navigable_multi_location_results() {
+        let mut state = state();
+        let path = state.workspace.as_path().join("main.rs");
+        let mut buffer = TextBuffer::empty(Some(path.clone()), false);
+        buffer.insert("fn target() {}\n").unwrap();
+        state.tabs.push(BufferTab::new(buffer));
+        state.active_tab = Some(0);
+        state.lsp_started.insert("rust".to_owned());
+        let effects = state.update(AppEvent::Command(Command::Invoke(
+            command::LSP_REFERENCES.to_owned(),
+        )));
+        let (id, message) = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::SendLsp { message, .. } => Some((message["id"].as_u64()?, message)),
+                _ => None,
+            })
+            .expect("references request");
+        assert_eq!(message["params"]["context"]["includeDeclaration"], true);
+        state.update(AppEvent::LspClient {
+            language: "rust".to_owned(),
+            event: crate::lsp::LspClientEvent::Message(serde_json::json!({
+                "id": id,
+                "result": [
+                    {"uri": file_uri(&path), "range": {"start": {"line": 0, "character": 3}}},
+                    {"uri": file_uri(&path), "range": {"start": {"line": 1, "character": 1}}}
+                ]
+            })),
+        });
+        assert!(matches!(state.overlay, Some(Overlay::LspLocations)));
+        assert_eq!(state.lsp_locations.len(), 2);
+        state.update(AppEvent::Command(Command::LspLocationSelect(1)));
+        let effects = state.update(AppEvent::Command(Command::LspLocationOpen));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::OpenFile { line: Some(2), .. }]
+        ));
+    }
+
+    #[test]
+    fn formatting_applies_utf16_text_edits_as_one_undoable_change() {
+        let mut state = state();
+        let path = state.workspace.as_path().join("main.rs");
+        let mut buffer = TextBuffer::empty(Some(path), false);
+        buffer.insert("fn  x(){}").unwrap();
+        state.tabs.push(BufferTab::new(buffer));
+        state.active_tab = Some(0);
+        state.lsp_started.insert("rust".to_owned());
+        let effects = state.update(AppEvent::Command(Command::Invoke(
+            command::LSP_FORMAT.to_owned(),
+        )));
+        let message = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::SendLsp { message, .. } => Some(message),
+                _ => None,
+            })
+            .expect("format request");
+        assert!(message["params"].get("position").is_none());
+        assert_eq!(message["params"]["options"]["tabSize"], 4);
+        let id = message["id"].as_u64().unwrap();
+        state.update(AppEvent::LspClient {
+            language: "rust".to_owned(),
+            event: crate::lsp::LspClientEvent::Message(serde_json::json!({
+                "id": id,
+                "result": [{
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 9}},
+                    "newText": "fn x() {}"
+                }]
+            })),
+        });
+        assert_eq!(state.tabs[0].buffer.text_string(), "fn x() {}");
+        state.tabs[0].buffer.undo().unwrap();
+        assert_eq!(state.tabs[0].buffer.text_string(), "fn  x(){}");
+    }
+
+    #[test]
+    fn format_on_save_waits_for_formatter_then_dispatches_save() {
+        let mut state = state();
+        state.settings.editor.format_on_save = true;
+        let path = state.workspace.as_path().join("save.rs");
+        let mut buffer = TextBuffer::empty(Some(path), false);
+        buffer.insert("fn  x(){}").unwrap();
+        state.tabs.push(BufferTab::new(buffer));
+        state.active_tab = Some(0);
+        state.lsp_started.insert("rust".to_owned());
+        let effects = state.update(AppEvent::Command(Command::Invoke(
+            command::EDITOR_SAVE.to_owned(),
+        )));
+        let id = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::SendLsp { message, .. } => message["id"].as_u64(),
+                _ => None,
+            })
+            .expect("format request before save");
+        let effects = state.update(AppEvent::LspClient {
+            language: "rust".to_owned(),
+            event: crate::lsp::LspClientEvent::Message(serde_json::json!({
+                "id": id,
+                "result": [{
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 9}},
+                    "newText": "fn x() {}"
+                }]
+            })),
+        });
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Save { snapshot, .. } if snapshot.bytes == b"fn x() {}"
+        )));
+    }
+
+    #[test]
+    fn code_action_lists_and_applies_workspace_edit_to_open_buffer() {
+        let mut state = state();
+        let path = state.workspace.as_path().join("main.rs");
+        let mut buffer = TextBuffer::empty(Some(path.clone()), false);
+        buffer.insert("let value = 1").unwrap();
+        state.tabs.push(BufferTab::new(buffer));
+        state.active_tab = Some(0);
+        state.lsp_started.insert("rust".to_owned());
+        let effects = state.update(AppEvent::Command(Command::Invoke(
+            command::LSP_CODE_ACTION.to_owned(),
+        )));
+        let message = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::SendLsp { message, .. } => Some(message),
+                _ => None,
+            })
+            .expect("code action request");
+        assert_eq!(
+            message["params"]["context"]["diagnostics"],
+            serde_json::json!([])
+        );
+        let id = message["id"].as_u64().unwrap();
+        state.update(AppEvent::LspClient {
+            language: "rust".to_owned(),
+            event: crate::lsp::LspClientEvent::Message(serde_json::json!({
+                "id": id,
+                "result": [{
+                    "title": "Add semicolon",
+                    "edit": {"changes": {(file_uri(&path)): [{
+                        "range": {"start": {"line": 0, "character": 13}, "end": {"line": 0, "character": 13}},
+                        "newText": ";"
+                    }]}}
+                }]
+            })),
+        });
+        assert!(matches!(state.overlay, Some(Overlay::LspCodeActions)));
+        state.update(AppEvent::Command(Command::LspCodeActionApply));
+        assert_eq!(state.tabs[0].buffer.text_string(), "let value = 1;");
+        state.tabs[0].buffer.undo().unwrap();
+        assert_eq!(state.tabs[0].buffer.text_string(), "let value = 1");
     }
 
     #[test]

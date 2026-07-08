@@ -32,6 +32,9 @@ pub struct Cli {
     pub locale: Option<CliLocale>,
     #[arg(long)]
     pub safe_mode: bool,
+    /// Validate merged configuration and keybindings without starting the TUI.
+    #[arg(long)]
+    pub check_config: bool,
 }
 
 #[derive(Debug, Clone)]

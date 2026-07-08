@@ -40,13 +40,63 @@ pub fn move_right(text: &Rope, char_offset: usize) -> usize {
         })
 }
 
+/// Moves to the previous Unicode word boundary, skipping whitespace first.
+pub fn move_word_left(text: &Rope, char_offset: usize) -> usize {
+    let cursor = char_offset.min(text.len_chars());
+    if cursor == 0 {
+        return 0;
+    }
+    let prefix = text.slice(..cursor).to_string();
+    let boundaries: Vec<(usize, &str)> = prefix.split_word_bound_indices().collect();
+    let mut target = cursor;
+    for (byte, segment) in boundaries.into_iter().rev() {
+        let start = prefix[..byte].chars().count();
+        if target == cursor && segment.chars().all(char::is_whitespace) {
+            target = start;
+            continue;
+        }
+        return start;
+    }
+    0
+}
+
+/// Moves to the next Unicode word boundary, skipping whitespace after the
+/// current word so repeated movement lands at the start of the next word.
+pub fn move_word_right(text: &Rope, char_offset: usize) -> usize {
+    let cursor = char_offset.min(text.len_chars());
+    if cursor >= text.len_chars() {
+        return text.len_chars();
+    }
+    let suffix = text.slice(cursor..).to_string();
+    let mut consumed = 0;
+    let mut saw_non_whitespace = false;
+    for segment in suffix.split_word_bounds() {
+        let chars = segment.chars().count();
+        let whitespace = segment.chars().all(char::is_whitespace);
+        if saw_non_whitespace && !whitespace {
+            break;
+        }
+        consumed += chars;
+        saw_non_whitespace |= !whitespace;
+    }
+    (cursor + consumed).min(text.len_chars())
+}
+
 pub fn move_up(
     text: &Rope,
     char_offset: usize,
     preferred: Option<usize>,
     tab_width: usize,
+    ambiguous_width_wide: bool,
 ) -> (usize, usize) {
-    move_vertical(text, char_offset, preferred, tab_width, -1)
+    move_vertical(
+        text,
+        char_offset,
+        preferred,
+        tab_width,
+        ambiguous_width_wide,
+        -1,
+    )
 }
 
 pub fn move_down(
@@ -54,11 +104,24 @@ pub fn move_down(
     char_offset: usize,
     preferred: Option<usize>,
     tab_width: usize,
+    ambiguous_width_wide: bool,
 ) -> (usize, usize) {
-    move_vertical(text, char_offset, preferred, tab_width, 1)
+    move_vertical(
+        text,
+        char_offset,
+        preferred,
+        tab_width,
+        ambiguous_width_wide,
+        1,
+    )
 }
 
-pub fn display_column(line: &str, char_in_line: usize, tab_width: usize) -> usize {
+pub fn display_column(
+    line: &str,
+    char_in_line: usize,
+    tab_width: usize,
+    ambiguous_width_wide: bool,
+) -> usize {
     let mut column = 0;
     for grapheme in line
         .graphemes(true)
@@ -67,7 +130,7 @@ pub fn display_column(line: &str, char_in_line: usize, tab_width: usize) -> usiz
         column += if grapheme == "\t" {
             tab_width - (column % tab_width)
         } else {
-            UnicodeWidthStr::width(grapheme)
+            grapheme_width(grapheme, ambiguous_width_wide)
         };
     }
     column
@@ -78,32 +141,45 @@ fn move_vertical(
     char_offset: usize,
     preferred: Option<usize>,
     tab_width: usize,
+    ambiguous_width_wide: bool,
     delta: isize,
 ) -> (usize, usize) {
     let line_idx = text.char_to_line(char_offset.min(text.len_chars()));
     let line_start = text.line_to_char(line_idx);
     let current = text.line(line_idx).to_string();
-    let target_column =
-        preferred.unwrap_or_else(|| display_column(&current, char_offset - line_start, tab_width));
+    let target_column = preferred.unwrap_or_else(|| {
+        display_column(
+            &current,
+            char_offset - line_start,
+            tab_width,
+            ambiguous_width_wide,
+        )
+    });
     let target_line = line_idx
         .saturating_add_signed(delta)
         .min(text.len_lines().saturating_sub(1));
     let target = text.line(target_line).to_string();
-    let char_in_target = char_offset_for_display_column(&target, target_column, tab_width);
+    let char_in_target =
+        char_offset_for_display_column(&target, target_column, tab_width, ambiguous_width_wide);
     (
         text.line_to_char(target_line) + char_in_target,
         target_column,
     )
 }
 
-fn char_offset_for_display_column(line: &str, target: usize, tab_width: usize) -> usize {
+pub(crate) fn char_offset_for_display_column(
+    line: &str,
+    target: usize,
+    tab_width: usize,
+    ambiguous_width_wide: bool,
+) -> usize {
     let mut display = 0;
     let mut chars = 0;
     for grapheme in line.trim_end_matches(['\r', '\n']).graphemes(true) {
         let width = if grapheme == "\t" {
             tab_width - (display % tab_width)
         } else {
-            UnicodeWidthStr::width(grapheme)
+            grapheme_width(grapheme, ambiguous_width_wide)
         };
         if display + width > target {
             break;
@@ -112,6 +188,64 @@ fn char_offset_for_display_column(line: &str, target: usize, tab_width: usize) -
         chars += grapheme.chars().count();
     }
     chars
+}
+
+pub fn grapheme_width(grapheme: &str, ambiguous_width_wide: bool) -> usize {
+    if ambiguous_width_wide {
+        UnicodeWidthStr::width_cjk(grapheme)
+    } else {
+        UnicodeWidthStr::width(grapheme)
+    }
+}
+
+pub fn matching_brackets(text: &Rope, cursor: usize) -> Option<(usize, usize)> {
+    let len = text.len_chars();
+    let candidate = [cursor.min(len), cursor.saturating_sub(1)]
+        .into_iter()
+        .find(|offset| text.get_char(*offset).is_some_and(is_bracket))?;
+    let bracket = text.get_char(candidate)?;
+    let (opening, closing, forward) = match bracket {
+        '(' => ('(', ')', true),
+        '[' => ('[', ']', true),
+        '{' => ('{', '}', true),
+        ')' => ('(', ')', false),
+        ']' => ('[', ']', false),
+        '}' => ('{', '}', false),
+        _ => return None,
+    };
+    let mut depth = 0usize;
+    if forward {
+        for offset in candidate..len {
+            match text.get_char(offset) {
+                Some(character) if character == opening => depth += 1,
+                Some(character) if character == closing => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some((candidate, offset));
+                    }
+                }
+                _ => {}
+            }
+        }
+    } else {
+        for offset in (0..=candidate).rev() {
+            match text.get_char(offset) {
+                Some(character) if character == closing => depth += 1,
+                Some(character) if character == opening => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some((offset, candidate));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+fn is_bracket(character: char) -> bool {
+    matches!(character, '(' | ')' | '[' | ']' | '{' | '}')
 }
 
 trait GraphemeTakeExt<'a>: Iterator<Item = &'a str> + Sized {
@@ -156,7 +290,27 @@ mod tests {
 
     #[test]
     fn display_width_handles_cjk_and_tabs() {
-        assert_eq!(display_column("a\t日本", 4, 4), 8);
+        assert_eq!(display_column("a\t日本", 4, 4, false), 8);
+        assert_eq!(display_column("·", 1, 4, false), 1);
+        assert_eq!(display_column("·", 1, 4, true), 2);
+    }
+
+    #[test]
+    fn word_movement_uses_unicode_boundaries_and_skips_spaces() {
+        let rope = Rope::from_str("hello  日本語 world");
+        assert_eq!(move_word_right(&rope, 0), 7);
+        // UAX #29 treats each ideograph as a word boundary.
+        assert_eq!(move_word_right(&rope, 7), 8);
+        assert_eq!(move_word_left(&rope, 11), 9);
+        assert_eq!(move_word_left(&rope, 7), 0);
+    }
+
+    #[test]
+    fn matching_brackets_handles_nested_pairs_from_either_side() {
+        let rope = Rope::from_str("fn([x])");
+        assert_eq!(matching_brackets(&rope, 2), Some((2, 6)));
+        assert_eq!(matching_brackets(&rope, 7), Some((2, 6)));
+        assert_eq!(matching_brackets(&rope, 3), Some((3, 5)));
     }
 
     /// Full-buffer-scan reference implementations mirroring the pre-windowed

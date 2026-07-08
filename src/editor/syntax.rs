@@ -30,11 +30,34 @@ pub struct HighlightSpan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyntaxLanguage {
     Rust,
+    C,
+    Cpp,
+    Python,
+    Json,
     Markdown,
     Toml,
+    Yaml,
+    Bash,
+    JavaScript,
+    TypeScript,
+    Tsx,
+    Html,
+    Css,
 }
 
 impl SyntaxLanguage {
+    pub fn comment_tokens(self) -> Option<(&'static str, Option<&'static str>)> {
+        match self {
+            Self::Rust | Self::C | Self::Cpp | Self::JavaScript | Self::TypeScript | Self::Tsx => {
+                Some(("//", None))
+            }
+            Self::Python | Self::Yaml | Self::Bash | Self::Toml => Some(("#", None)),
+            Self::Html | Self::Markdown => Some(("<!--", Some("-->"))),
+            Self::Css => Some(("/*", Some("*/"))),
+            Self::Json => None,
+        }
+    }
+
     /// Maps a file extension (without the leading dot) to a supported syntax
     /// language. Returns `None` for unsupported extensions, which callers
     /// treat as plain text.
@@ -46,8 +69,19 @@ impl SyntaxLanguage {
     pub fn from_extension(extension: &str) -> Option<Self> {
         match extension {
             "rs" => Some(Self::Rust),
+            "c" | "h" => Some(Self::C),
+            "cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx" => Some(Self::Cpp),
+            "py" | "pyi" => Some(Self::Python),
+            "json" | "jsonc" => Some(Self::Json),
             "md" | "markdown" => Some(Self::Markdown),
             "toml" => Some(Self::Toml),
+            "yaml" | "yml" => Some(Self::Yaml),
+            "sh" | "bash" => Some(Self::Bash),
+            "js" | "jsx" | "mjs" | "cjs" => Some(Self::JavaScript),
+            "ts" | "mts" | "cts" => Some(Self::TypeScript),
+            "tsx" => Some(Self::Tsx),
+            "html" | "htm" => Some(Self::Html),
+            "css" => Some(Self::Css),
             _ => None,
         }
     }
@@ -63,8 +97,19 @@ impl SyntaxLanguage {
     pub fn from_language_name(name: &str) -> Option<Self> {
         match name {
             "rust" => Some(Self::Rust),
+            "c_cpp" | "cpp" => Some(Self::Cpp),
+            "c" => Some(Self::C),
+            "python" => Some(Self::Python),
+            "json" | "jsonc" => Some(Self::Json),
             "markdown" => Some(Self::Markdown),
             "toml" => Some(Self::Toml),
+            "yaml" => Some(Self::Yaml),
+            "bash" | "shell" => Some(Self::Bash),
+            "javascript" => Some(Self::JavaScript),
+            "typescript" => Some(Self::TypeScript),
+            "tsx" => Some(Self::Tsx),
+            "html" => Some(Self::Html),
+            "css" => Some(Self::Css),
             _ => None,
         }
     }
@@ -108,6 +153,34 @@ pub fn highlight(
             cancellation,
             generation,
         )?,
+        SyntaxLanguage::C => collect_spans(
+            tree_sitter_c::LANGUAGE.into(),
+            tree_sitter_c::HIGHLIGHT_QUERY,
+            source,
+            cancellation,
+            generation,
+        )?,
+        SyntaxLanguage::Cpp => collect_spans(
+            tree_sitter_cpp::LANGUAGE.into(),
+            tree_sitter_cpp::HIGHLIGHT_QUERY,
+            source,
+            cancellation,
+            generation,
+        )?,
+        SyntaxLanguage::Python => collect_spans(
+            tree_sitter_python::LANGUAGE.into(),
+            tree_sitter_python::HIGHLIGHTS_QUERY,
+            source,
+            cancellation,
+            generation,
+        )?,
+        SyntaxLanguage::Json => collect_spans(
+            tree_sitter_json::LANGUAGE.into(),
+            tree_sitter_json::HIGHLIGHTS_QUERY,
+            source,
+            cancellation,
+            generation,
+        )?,
         SyntaxLanguage::Toml => collect_spans(
             tree_sitter_toml_ng::LANGUAGE.into(),
             tree_sitter_toml_ng::HIGHLIGHTS_QUERY,
@@ -132,8 +205,72 @@ pub fn highlight(
             )?);
             spans
         }
+        SyntaxLanguage::Yaml => collect_spans(
+            tree_sitter_yaml::LANGUAGE.into(),
+            tree_sitter_yaml::HIGHLIGHTS_QUERY,
+            source,
+            cancellation,
+            generation,
+        )?,
+        SyntaxLanguage::Bash => collect_spans(
+            tree_sitter_bash::LANGUAGE.into(),
+            tree_sitter_bash::HIGHLIGHT_QUERY,
+            source,
+            cancellation,
+            generation,
+        )?,
+        SyntaxLanguage::JavaScript => collect_spans(
+            tree_sitter_javascript::LANGUAGE.into(),
+            tree_sitter_javascript::HIGHLIGHT_QUERY,
+            source,
+            cancellation,
+            generation,
+        )?,
+        SyntaxLanguage::TypeScript => collect_typescript_spans(
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            source,
+            cancellation,
+            generation,
+        )?,
+        SyntaxLanguage::Tsx => collect_typescript_spans(
+            tree_sitter_typescript::LANGUAGE_TSX.into(),
+            source,
+            cancellation,
+            generation,
+        )?,
+        SyntaxLanguage::Html => collect_spans(
+            tree_sitter_html::LANGUAGE.into(),
+            tree_sitter_html::HIGHLIGHTS_QUERY,
+            source,
+            cancellation,
+            generation,
+        )?,
+        SyntaxLanguage::Css => collect_spans(
+            tree_sitter_css::LANGUAGE.into(),
+            tree_sitter_css::HIGHLIGHTS_QUERY,
+            source,
+            cancellation,
+            generation,
+        )?,
     };
     Ok(convert_byte_spans(source, byte_spans))
+}
+
+fn collect_typescript_spans(
+    language: Language,
+    source: &str,
+    cancellation: &AtomicU64,
+    generation: u64,
+) -> Result<Vec<(usize, usize, HighlightKind)>, SyntaxError> {
+    // The TypeScript grammar publishes only TypeScript-specific additions;
+    // JavaScript's base captures are required for identifiers, literals,
+    // functions, JSX, and comments.
+    let query = format!(
+        "{}\n{}",
+        tree_sitter_javascript::HIGHLIGHT_QUERY,
+        tree_sitter_typescript::HIGHLIGHTS_QUERY
+    );
+    collect_spans(language, &query, source, cancellation, generation)
 }
 
 /// Parses `source` with a single Tree-sitter grammar and highlight query,
@@ -288,5 +425,39 @@ mod tests {
         assert!(spans.iter().any(|span| span.kind == HighlightKind::Comment));
         let char_len = source.chars().count();
         assert!(spans.iter().all(|span| span.end_char <= char_len));
+    }
+
+    #[test]
+    fn every_spec_language_produces_classified_highlights() {
+        let token = AtomicU64::new(1);
+        let samples = [
+            (SyntaxLanguage::C, "int main(void) { return 0; }"),
+            (SyntaxLanguage::Cpp, "class Value { public: int n; };"),
+            (
+                SyntaxLanguage::Python,
+                "def greet(name):\n    return f'hi {name}'\n",
+            ),
+            (SyntaxLanguage::Json, r#"{"name": true, "count": 2}"#),
+            (SyntaxLanguage::Yaml, "name: value\nenabled: true\n"),
+            (SyntaxLanguage::Bash, "#!/bin/bash\necho \"hello\"\n"),
+            (
+                SyntaxLanguage::JavaScript,
+                "const greet = (name) => `hi ${name}`;",
+            ),
+            (SyntaxLanguage::TypeScript, "const count: number = 2;"),
+            (SyntaxLanguage::Tsx, "const view = <div>Hello</div>;"),
+            (SyntaxLanguage::Html, "<main class=\"content\">Hello</main>"),
+            (SyntaxLanguage::Css, ".content { color: red; }"),
+        ];
+        for (language, source) in samples {
+            let spans = highlight(language, source, &token, 1).unwrap();
+            assert!(!spans.is_empty(), "no highlights for {language:?}");
+            assert!(
+                spans
+                    .iter()
+                    .all(|span| span.end_char <= source.chars().count()),
+                "invalid Unicode offset for {language:?}"
+            );
+        }
     }
 }

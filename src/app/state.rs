@@ -114,11 +114,15 @@ pub enum Overlay {
     },
     GitBranchPicker,
     GitBranchCreate,
+    GotoLine,
     SearchIncludeGlobs,
     SearchExcludeGlobs,
     ConfirmQuitTerminal,
     LspHover,
     LspCompletion,
+    LspLocations,
+    LspSignature,
+    LspCodeActions,
 }
 
 #[derive(Debug, Clone)]
@@ -135,6 +139,9 @@ pub struct CompletionCandidate {
     /// text at accept time, since the buffer may have changed since the
     /// request was sent.
     pub replace_range: Option<(lsp_types::Position, lsp_types::Position)>,
+    /// Cursor position in Unicode scalar values relative to `insert_text`,
+    /// derived from the first snippet placeholder when present.
+    pub cursor_char_offset: Option<usize>,
 }
 
 /// A request sent to the LSP server, tagged with the file it was made
@@ -149,6 +156,24 @@ pub enum PendingLspRequest {
     Hover(PathBuf),
     Definition(PathBuf),
     Completion(PathBuf),
+    References(PathBuf),
+    Formatting(PathBuf),
+    SignatureHelp(PathBuf),
+    CodeActions(PathBuf),
+}
+
+#[derive(Debug, Clone)]
+pub struct NavigationLocation {
+    pub path: PathBuf,
+    pub line: usize,
+    pub column: crate::app::ColumnHint,
+}
+
+#[derive(Debug, Clone)]
+pub struct CodeActionCandidate {
+    pub title: String,
+    pub edit: Option<serde_json::Value>,
+    pub command: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -209,6 +234,9 @@ pub struct AppState {
     pub bottom_panel_visible: bool,
     pub overlay: Option<Overlay>,
     pub palette_query: String,
+    pub buffer_replace_query: String,
+    pub buffer_replace_focused: bool,
+    pub buffer_replace_visible: bool,
     pub notification: Option<String>,
     pub config_warnings: Vec<String>,
     pub should_quit: bool,
@@ -223,6 +251,7 @@ pub struct AppState {
     pub file_search_cancellation: Arc<AtomicU64>,
     pub file_preview_path: Option<PathBuf>,
     pub file_preview_lines: Vec<String>,
+    pub recent_files: Vec<PathBuf>,
     pub internal_clipboard: String,
     pub buffer_search_cancellation: Arc<AtomicU64>,
     pub syntax_cancellation: Arc<AtomicU64>,
@@ -260,7 +289,11 @@ pub struct AppState {
     pub diagnostics: crate::diagnostics::DiagnosticStore,
     pub diagnostic_selected: usize,
     pub diagnostic_filter: Option<crate::diagnostics::DiagnosticSeverity>,
+    pub diagnostic_source_filter: Option<crate::diagnostics::DiagnosticSource>,
+    pub diagnostic_current_file_only: bool,
     pub compiler_diagnostic_generation: u64,
+    pub cargo_diagnostics_running: bool,
+    pub cargo_diagnostics_pending: bool,
     pub lsp_starting: HashSet<String>,
     pub lsp_started: HashSet<String>,
     pub lsp_warned: HashSet<String>,
@@ -270,8 +303,18 @@ pub struct AppState {
     pub lsp_pending: HashMap<u64, PendingLspRequest>,
     pub lsp_hover: Vec<String>,
     pub lsp_completions: Vec<CompletionCandidate>,
+    pub lsp_completion_all: Vec<CompletionCandidate>,
     pub lsp_completion_selected: usize,
     pub lsp_restarts: HashMap<String, u8>,
+    pub lsp_progress: HashMap<String, String>,
+    pub navigation_back: Vec<NavigationLocation>,
+    pub navigation_forward: Vec<NavigationLocation>,
+    pub lsp_locations: Vec<NavigationLocation>,
+    pub lsp_location_selected: usize,
+    pub format_on_save_tabs: HashSet<usize>,
+    pub lsp_signature: Vec<String>,
+    pub lsp_code_actions: Vec<CodeActionCandidate>,
+    pub lsp_code_action_selected: usize,
 }
 
 impl AppState {
@@ -300,6 +343,9 @@ impl AppState {
             bottom_panel_visible: false,
             overlay: None,
             palette_query: String::new(),
+            buffer_replace_query: String::new(),
+            buffer_replace_focused: false,
+            buffer_replace_visible: false,
             notification: config_warnings.first().cloned(),
             config_warnings,
             should_quit: false,
@@ -314,6 +360,7 @@ impl AppState {
             file_search_cancellation: Arc::new(AtomicU64::new(0)),
             file_preview_path: None,
             file_preview_lines: Vec::new(),
+            recent_files: Vec::new(),
             internal_clipboard: String::new(),
             buffer_search_cancellation: Arc::new(AtomicU64::new(0)),
             syntax_cancellation: Arc::new(AtomicU64::new(0)),
@@ -350,7 +397,11 @@ impl AppState {
             diagnostics: Default::default(),
             diagnostic_selected: 0,
             diagnostic_filter: None,
+            diagnostic_source_filter: None,
+            diagnostic_current_file_only: false,
             compiler_diagnostic_generation: 0,
+            cargo_diagnostics_running: false,
+            cargo_diagnostics_pending: false,
             lsp_starting: HashSet::new(),
             lsp_started: HashSet::new(),
             lsp_warned: HashSet::new(),
@@ -360,8 +411,18 @@ impl AppState {
             lsp_pending: HashMap::new(),
             lsp_hover: Vec::new(),
             lsp_completions: Vec::new(),
+            lsp_completion_all: Vec::new(),
             lsp_completion_selected: 0,
             lsp_restarts: HashMap::new(),
+            lsp_progress: HashMap::new(),
+            navigation_back: Vec::new(),
+            navigation_forward: Vec::new(),
+            lsp_locations: Vec::new(),
+            lsp_location_selected: 0,
+            format_on_save_tabs: HashSet::new(),
+            lsp_signature: Vec::new(),
+            lsp_code_actions: Vec::new(),
+            lsp_code_action_selected: 0,
         }
     }
 
@@ -465,12 +526,18 @@ impl AppState {
     }
 
     pub fn visible_diagnostics(&self) -> Vec<&crate::diagnostics::Diagnostic> {
+        let active_path = self.active_tab().and_then(|tab| tab.buffer.path());
         self.diagnostics
             .diagnostics()
             .iter()
             .filter(|diagnostic| {
                 self.diagnostic_filter
                     .is_none_or(|severity| diagnostic.severity == severity)
+                    && self
+                        .diagnostic_source_filter
+                        .is_none_or(|source| diagnostic.source == source)
+                    && (!self.diagnostic_current_file_only
+                        || active_path.is_some_and(|path| path == diagnostic.file))
             })
             .collect()
     }

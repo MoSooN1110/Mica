@@ -35,6 +35,15 @@ impl FromStr for KeyChord {
                 "down" => code = Some(KeyCode::Down),
                 "left" => code = Some(KeyCode::Left),
                 "right" => code = Some(KeyCode::Right),
+                value if value.len() > 1 && value.starts_with('f') => {
+                    let number = value[1..]
+                        .parse::<u8>()
+                        .map_err(|_| KeymapError::InvalidChord(value.to_owned()))?;
+                    if !(1..=12).contains(&number) {
+                        return Err(KeymapError::InvalidChord(value.to_owned()));
+                    }
+                    code = Some(KeyCode::F(number));
+                }
                 "space" => code = Some(KeyCode::Char(' ')),
                 value if value.chars().count() == 1 => {
                     code = value.chars().next().map(KeyCode::Char)
@@ -57,11 +66,28 @@ impl Default for Keymap {
         let defaults = [
             ("ctrl-s", "editor.save"),
             ("ctrl-shift-s", "editor.save_as"),
+            ("ctrl-alt-s", "editor.save_all"),
             ("ctrl-w", "editor.close"),
             ("ctrl-c", "editor.copy"),
             ("ctrl-x", "editor.cut"),
             ("ctrl-v", "editor.paste"),
             ("ctrl-f", "editor.find"),
+            ("ctrl-h", "editor.replace"),
+            ("ctrl-/", "editor.toggle_line_comment"),
+            ("ctrl-a", "editor.select_all"),
+            ("shift-alt-down", "editor.duplicate_line"),
+            ("alt-up", "editor.move_line_up"),
+            ("alt-down", "editor.move_line_down"),
+            ("ctrl-shift-k", "editor.delete_line"),
+            ("ctrl-g", "editor.goto_line"),
+            ("alt-left", "editor.navigate_back"),
+            ("alt-right", "editor.navigate_forward"),
+            ("f8", "diagnostics.next"),
+            ("shift-f8", "diagnostics.previous"),
+            ("shift-f12", "lsp.references"),
+            ("shift-alt-f", "lsp.format"),
+            ("ctrl-shift-space", "lsp.signature_help"),
+            ("ctrl-.", "lsp.code_action"),
             ("ctrl-z", "editor.undo"),
             ("ctrl-y", "editor.redo"),
             ("ctrl-\\", "editor.split"),
@@ -71,6 +97,7 @@ impl Default for Keymap {
             ("ctrl-b", "view.toggle_sidebar"),
             ("ctrl-j", "view.toggle_bottom_panel"),
             ("ctrl-`", "terminal.toggle"),
+            ("alt-enter", "terminal.open_reference"),
             ("alt-1", "view.explorer"),
             ("alt-2", "view.source_control"),
             ("alt-3", "view.search"),

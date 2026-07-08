@@ -141,6 +141,9 @@ pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) -> Regions {
             Overlay::GitBranchCreate => {
                 render_text_prompt(frame, area, " CREATE BRANCH ", state, theme)
             }
+            Overlay::GotoLine => {
+                render_text_prompt(frame, area, " GO TO LINE[:COLUMN] ", state, theme)
+            }
             Overlay::SearchIncludeGlobs => {
                 render_text_prompt(frame, area, " SEARCH INCLUDE GLOBS ", state, theme)
             }
@@ -152,6 +155,9 @@ pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) -> Regions {
             }
             Overlay::LspHover => render_lsp_hover(frame, area, state, theme),
             Overlay::LspCompletion => render_lsp_completion(frame, area, state, theme),
+            Overlay::LspLocations => render_lsp_locations(frame, area, state, theme),
+            Overlay::LspSignature => render_lsp_signature(frame, area, state, theme),
+            Overlay::LspCodeActions => render_lsp_code_actions(frame, area, state, theme),
         }
     }
     regions
@@ -1064,26 +1070,70 @@ fn render_editor_group(
         .char_to_line(selection.head.0.min(tab.buffer.text().len_chars()));
     let line_start = tab.buffer.text().line_to_char(cursor_line);
     let gutter_width = tab.buffer.text().len_lines().to_string().len().max(2);
-    let active_diagnostics = tab
-        .buffer
-        .path()
-        .map(|path| state.diagnostics.for_file(path).collect::<Vec<_>>())
-        .unwrap_or_default();
+    let large_file = u64::try_from(tab.buffer.text().len_bytes()).unwrap_or(u64::MAX)
+        > state
+            .settings
+            .editor
+            .large_file_threshold_mb
+            .saturating_mul(1024 * 1024);
+    let active_diagnostics = if large_file {
+        Vec::new()
+    } else {
+        tab.buffer
+            .path()
+            .map(|path| state.diagnostics.for_file(path).collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    let bracket_match = (!large_file)
+        .then(|| crate::editor::matching_brackets(tab.buffer.text(), selection.head.0))
+        .flatten();
     let visible_height = usize::from(rows[2].height);
-    let lines = tab
-        .buffer
-        .text()
-        .lines()
-        .skip(tab.view.scroll_line)
-        .take(visible_height)
-        .enumerate()
-        .map(|(visible, line)| {
-            let line_index = tab.view.scroll_line + visible;
-            let content = line.to_string();
+    let wrap_width = usize::from(rows[2].width)
+        .saturating_sub(gutter_width + 3)
+        .max(1);
+    let visual_rows = if state.settings.editor.word_wrap {
+        crate::editor::visible_visual_rows(
+            tab.buffer.text(),
+            tab.view.scroll_line,
+            visible_height,
+            wrap_width,
+            usize::from(state.settings.editor.tab_width),
+            state.settings.editor.ambiguous_width_wide,
+        )
+    } else {
+        (tab.view.scroll_line..tab.buffer.text().len_lines())
+            .take(visible_height)
+            .map(|line_index| {
+                let content = tab.buffer.text().line(line_index).to_string();
+                crate::editor::VisualRow {
+                    line_index,
+                    line_start_char: tab.buffer.text().line_to_char(line_index),
+                    range_in_line: 0..content.trim_end_matches(['\r', '\n']).chars().count(),
+                }
+            })
+            .collect()
+    };
+    let lines = visual_rows
+        .iter()
+        .map(|visual_row| {
+            let line_index = visual_row.line_index;
+            let content = tab.buffer.text().line(line_index).to_string();
             let content = content.trim_end_matches(['\r', '\n']);
-            let (marker, diagnostic_color) =
-                editor_gutter_marker(state, tab.buffer.path(), line_index, theme);
-            let number = format!("{marker} {:>width$} ", line_index + 1, width = gutter_width);
+            let segment = content
+                .chars()
+                .skip(visual_row.range_in_line.start)
+                .take(visual_row.range_in_line.len())
+                .collect::<String>();
+            let (marker, diagnostic_color) = if large_file {
+                (" ", None)
+            } else {
+                editor_gutter_marker(state, tab.buffer.path(), line_index, theme)
+            };
+            let number = if visual_row.range_in_line.start == 0 {
+                format!("{marker} {:>width$} ", line_index + 1, width = gutter_width)
+            } else {
+                format!("  {:>width$} ", "", width = gutter_width)
+            };
             let active = line_index == cursor_line;
             let mut spans = vec![Span::styled(
                 number,
@@ -1100,17 +1150,41 @@ fn render_editor_group(
                     }),
             )];
             spans.extend(editor_line_spans(
-                content,
-                tab.buffer.text().line_to_char(line_index),
+                &segment,
+                visual_row.line_start_char + visual_row.range_in_line.start,
                 selection,
                 active,
                 theme,
                 &EditorLineDecorations {
                     search: &tab.view.search,
-                    highlights: &tab.highlights,
+                    highlights: if large_file { &[] } else { &tab.highlights },
                     diagnostics: &active_diagnostics,
+                    bracket_match,
                 },
             ));
+            let logical_line_chars = content.chars().count();
+            if state.settings.diagnostics.inline_messages
+                && visual_row.range_in_line.end == logical_line_chars
+                && let Some(diagnostic) = active_diagnostics
+                    .iter()
+                    .filter(|diagnostic| diagnostic.range.start.line == line_index)
+                    .min_by_key(|diagnostic| match diagnostic.severity {
+                        crate::diagnostics::DiagnosticSeverity::Error => 0,
+                        crate::diagnostics::DiagnosticSeverity::Warning => 1,
+                        crate::diagnostics::DiagnosticSeverity::Information => 2,
+                        crate::diagnostics::DiagnosticSeverity::Hint => 3,
+                    })
+            {
+                let (_, color) = diagnostic_style(diagnostic.severity, theme);
+                spans.push(Span::styled(
+                    format!("  {}", diagnostic.message),
+                    Style::default().fg(color).bg(if active {
+                        theme.active_line
+                    } else {
+                        theme.background
+                    }),
+                ));
+            }
             Line::from(spans)
         })
         .collect::<Vec<_>>();
@@ -1118,21 +1192,39 @@ fn render_editor_group(
         Paragraph::new(lines).style(Style::default().bg(theme.background)),
         rows[2],
     );
-    if focused && state.focus == Focus::Editor && cursor_line >= tab.view.scroll_line {
+    if focused && state.focus == Focus::Editor {
         let line = tab.buffer.text().line(cursor_line).to_string();
         let char_in_line = selection.head.0.saturating_sub(line_start);
+        let visible_cursor = visual_rows.iter().position(|row| {
+            row.line_index == cursor_line
+                && (char_in_line < row.range_in_line.end
+                    || (char_in_line == row.range_in_line.end
+                        && row.range_in_line.end
+                            == line.trim_end_matches(['\r', '\n']).chars().count()))
+        });
+        let Some(visible_cursor) = visible_cursor else {
+            return;
+        };
+        let cursor_row = &visual_rows[visible_cursor];
+        let segment_before_cursor = line
+            .trim_end_matches(['\r', '\n'])
+            .chars()
+            .skip(cursor_row.range_in_line.start)
+            .take(char_in_line.saturating_sub(cursor_row.range_in_line.start))
+            .collect::<String>();
         let x = rows[2].x
             + u16::try_from(
                 gutter_width
                     + 3
                     + crate::editor::display_column(
-                        &line,
-                        char_in_line,
+                        &segment_before_cursor,
+                        segment_before_cursor.chars().count(),
                         usize::from(state.settings.editor.tab_width),
+                        state.settings.editor.ambiguous_width_wide,
                     ),
             )
             .unwrap_or(u16::MAX);
-        let y = rows[2].y + u16::try_from(cursor_line - tab.view.scroll_line).unwrap_or(u16::MAX);
+        let y = rows[2].y + u16::try_from(visible_cursor).unwrap_or(u16::MAX);
         if x < rows[2].right() && y < rows[2].bottom() {
             frame.set_cursor_position(Position::new(x, y));
         }
@@ -1324,6 +1416,7 @@ struct EditorLineDecorations<'a> {
     search: &'a crate::editor::BufferSearchState,
     highlights: &'a [crate::editor::HighlightSpan],
     diagnostics: &'a [&'a crate::diagnostics::Diagnostic],
+    bracket_match: Option<(usize, usize)>,
 }
 
 fn editor_line_spans(
@@ -1366,6 +1459,10 @@ fn editor_line_spans(
         ) {
             add_boundaries(&(start..end.max(start + 1)));
         }
+    }
+    if let Some((opening, closing)) = decorations.bracket_match {
+        add_boundaries(&(opening..opening + 1));
+        add_boundaries(&(closing..closing + 1));
     }
     boundaries.sort_unstable();
     boundaries.dedup();
@@ -1411,6 +1508,14 @@ fn editor_line_spans(
         }) {
             let (_, color) = diagnostic_style(diagnostic.severity, theme);
             style = style.fg(color).add_modifier(Modifier::UNDERLINED);
+        }
+        if decorations
+            .bracket_match
+            .is_some_and(|(opening, closing)| global_start == opening || global_start == closing)
+        {
+            style = style
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
         }
         let start_byte = byte_index_at_char(content, local_start);
         let end_byte = byte_index_at_char(content, local_end);
@@ -1489,6 +1594,15 @@ fn render_problems(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
             crate::diagnostics::DiagnosticSeverity::Information => "Information",
             crate::diagnostics::DiagnosticSeverity::Hint => "Hints",
         });
+    let source_filter = state.diagnostic_source_filter.map_or_else(
+        || "all sources".to_owned(),
+        |source| format!("{source:?}").to_ascii_lowercase(),
+    );
+    let file_filter = if state.diagnostic_current_file_only {
+        "current file"
+    } else {
+        "all files"
+    };
     let lines = state
         .diagnostic_rows()
         .into_iter()
@@ -1554,7 +1668,7 @@ fn render_problems(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         .block(
             Block::default()
                 .title(format!(
-                    " PROBLEMS  OUTPUT  TERMINAL   [Problems: {filter}] F filter "
+                    " PROBLEMS  OUTPUT  TERMINAL   [{filter}; {source_filter}; {file_filter}] F severity S source C file "
                 ))
                 .borders(Borders::TOP)
                 .border_style(Style::default().fg(if state.focus == Focus::BottomPanel {
@@ -1874,7 +1988,9 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
                 &line_text,
                 char_in_line,
                 usize::from(state.settings.editor.tab_width),
+                state.settings.editor.ambiguous_width_wide,
             );
+            let selected_chars = selection.range().len();
             let ending = match tab.buffer.line_ending() {
                 LineEnding::Lf => "LF",
                 LineEnding::CrLf => "CRLF",
@@ -1886,7 +2002,16 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
                 .and_then(|path| state.language_for_path(path))
                 .map_or_else(String::new, |(name, _)| name);
             (
-                format!("Ln {}, Col {}", line + 1, column + 1),
+                if selected_chars == 0 {
+                    format!("Ln {}, Col {}", line + 1, column + 1)
+                } else {
+                    format!(
+                        "Ln {}, Col {}  Sel {}",
+                        line + 1,
+                        column + 1,
+                        selected_chars
+                    )
+                },
                 language,
                 format!("UTF-8 {ending}"),
                 tab.buffer.is_read_only(),
@@ -1901,7 +2026,27 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
     let language_segment = if language.is_empty() {
         Vec::new()
     } else {
-        vec![Span::styled(language, faint)]
+        vec![Span::styled(language.clone(), faint)]
+    };
+    let lsp_segment = if language.is_empty() || !state.settings.lsp.enabled {
+        Vec::new()
+    } else if let Some(progress) = state.lsp_progress.get(&language) {
+        vec![Span::styled(
+            format!("LSP {progress}"),
+            Style::default().fg(theme.accent).bg(background),
+        )]
+    } else if state.lsp_started.contains(&language) {
+        vec![Span::styled(
+            "LSP ready",
+            Style::default().fg(theme.git_added).bg(background),
+        )]
+    } else if state.lsp_starting.contains(&language) {
+        vec![Span::styled(
+            "LSP starting",
+            Style::default().fg(theme.diagnostic_warning).bg(background),
+        )]
+    } else {
+        Vec::new()
     };
     let encoding_segment = if encoding.is_empty() {
         Vec::new()
@@ -1930,6 +2075,7 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         vec![
             diagnostics_segment,
             ro_segment,
+            lsp_segment,
             language_segment,
             encoding_segment,
             position_segment,
@@ -2070,6 +2216,7 @@ fn render_path_input(
         &state.palette_query,
         state.palette_query.chars().count(),
         usize::from(state.settings.editor.tab_width),
+        state.settings.editor.ambiguous_width_wide,
     );
     let cursor_x = popup
         .x
@@ -2193,6 +2340,26 @@ fn render_lsp_hover(frame: &mut Frame, area: Rect, state: &AppState, theme: &The
     );
 }
 
+fn render_lsp_signature(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let width = area.width.saturating_sub(6).min(72);
+    let height = u16::try_from(state.lsp_signature.len().saturating_add(2))
+        .unwrap_or(u16::MAX)
+        .min(area.height.saturating_sub(4))
+        .max(3);
+    let popup = Rect::new(area.x + (area.width - width) / 2, area.y + 2, width, height);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(state.lsp_signature.join("\n"))
+            .block(overlay_block(
+                " SIGNATURE  Enter/Esc close ",
+                theme,
+                state.settings.ui.icon_mode,
+            ))
+            .style(Style::default().fg(theme.text).bg(theme.surface_raised)),
+        popup,
+    );
+}
+
 fn render_lsp_completion(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let width = area.width.saturating_sub(6).min(64);
     let height = area.height.saturating_sub(4).min(14);
@@ -2242,7 +2409,97 @@ fn render_lsp_completion(frame: &mut Frame, area: Rect, state: &AppState, theme:
         })
         .collect::<Vec<_>>();
     frame.render_widget(
-        List::new(items).block(overlay_block(" COMPLETION ", theme, icon_mode)),
+        List::new(items).block(overlay_block(
+            format!(" COMPLETION  {} ", state.palette_query),
+            theme,
+            icon_mode,
+        )),
+        popup,
+    );
+}
+
+fn render_lsp_locations(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let width = area.width.saturating_sub(8).min(84);
+    let height = area.height.saturating_sub(4).min(18);
+    let popup = Rect::new(area.x + (area.width - width) / 2, area.y + 2, width, height);
+    frame.render_widget(Clear, popup);
+    let items = state
+        .lsp_locations
+        .iter()
+        .take(usize::from(height.saturating_sub(2)))
+        .enumerate()
+        .map(|(index, location)| {
+            let selected = index == state.lsp_location_selected;
+            let background = if selected {
+                theme.selection
+            } else {
+                theme.surface_raised
+            };
+            let column = match location.column {
+                crate::app::ColumnHint::Chars(column) | crate::app::ColumnHint::Utf16(column) => {
+                    column
+                }
+            };
+            ListItem::new(format!(
+                "{}:{}:{}",
+                location.path.display(),
+                location.line,
+                column
+            ))
+            .style(
+                Style::default()
+                    .fg(if selected {
+                        theme.text
+                    } else {
+                        theme.text_muted
+                    })
+                    .bg(background),
+            )
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        List::new(items).block(overlay_block(
+            format!(" REFERENCES ({}) ", state.lsp_locations.len()),
+            theme,
+            state.settings.ui.icon_mode,
+        )),
+        popup,
+    );
+}
+
+fn render_lsp_code_actions(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let width = area.width.saturating_sub(8).min(72);
+    let height = area.height.saturating_sub(4).min(16);
+    let popup = Rect::new(area.x + (area.width - width) / 2, area.y + 2, width, height);
+    frame.render_widget(Clear, popup);
+    let items = state
+        .lsp_code_actions
+        .iter()
+        .take(usize::from(height.saturating_sub(2)))
+        .enumerate()
+        .map(|(index, action)| {
+            let selected = index == state.lsp_code_action_selected;
+            ListItem::new(action.title.clone()).style(
+                Style::default()
+                    .fg(if selected {
+                        theme.text
+                    } else {
+                        theme.text_muted
+                    })
+                    .bg(if selected {
+                        theme.selection
+                    } else {
+                        theme.surface_raised
+                    }),
+            )
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        List::new(items).block(overlay_block(
+            " CODE ACTIONS ",
+            theme,
+            state.settings.ui.icon_mode,
+        )),
         popup,
     );
 }
@@ -2318,36 +2575,75 @@ fn render_buffer_search(
     theme: &Theme,
 ) {
     let width = area.width.saturating_sub(4).min(48);
-    let popup = Rect::new(area.right().saturating_sub(width + 2), area.y + 2, width, 3);
+    let popup_height = if state.buffer_replace_visible { 4 } else { 3 };
+    let popup = Rect::new(
+        area.right().saturating_sub(width + 2),
+        area.y + 2,
+        width,
+        popup_height,
+    );
     frame.render_widget(Clear, popup);
     let (current, total) = state.tabs.get(tab).map_or((0, 0), |tab| {
         let total = tab.view.search.matches.len();
         (usize::from(total > 0) + tab.view.search.current, total)
     });
     let icon_mode = state.settings.ui.icon_mode;
-    let block = overlay_block(format!(" FIND  {current}/{total} "), theme, icon_mode);
-    frame.render_widget(
-        Paragraph::new(prompt_line(
-            &state.palette_query,
+    let title = if state.buffer_replace_visible {
+        format!(" FIND/REPLACE  {current}/{total}  Tab field  Ctrl+Enter all ")
+    } else {
+        format!(" FIND  {current}/{total} ")
+    };
+    let block = overlay_block(title, theme, icon_mode);
+    let find_background = if state.buffer_replace_focused {
+        theme.surface_raised
+    } else {
+        theme.selection
+    };
+    let mut lines = vec![prompt_line(
+        &state.palette_query,
+        theme,
+        icons(icon_mode),
+        find_background,
+    )];
+    if state.buffer_replace_visible {
+        let replace_background = if state.buffer_replace_focused {
+            theme.selection
+        } else {
+            theme.surface_raised
+        };
+        lines.push(prompt_line(
+            &state.buffer_replace_query,
             theme,
             icons(icon_mode),
-            theme.surface_raised,
-        ))
-        .block(block)
-        .style(Style::default().fg(theme.text).bg(theme.surface_raised)),
+            replace_background,
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .style(Style::default().fg(theme.text).bg(theme.surface_raised)),
         popup,
     );
+    let cursor_query = if state.buffer_replace_focused {
+        &state.buffer_replace_query
+    } else {
+        &state.palette_query
+    };
     let query_column = crate::editor::display_column(
-        &state.palette_query,
-        state.palette_query.chars().count(),
+        cursor_query,
+        cursor_query.chars().count(),
         usize::from(state.settings.editor.tab_width),
+        state.settings.editor.ambiguous_width_wide,
     );
     let cursor_x = popup
         .x
         .saturating_add(2)
         .saturating_add(u16::try_from(query_column).unwrap_or(u16::MAX));
     if cursor_x < popup.right().saturating_sub(1) {
-        frame.set_cursor_position(Position::new(cursor_x, popup.y + 1));
+        frame.set_cursor_position(Position::new(
+            cursor_x,
+            popup.y + 1 + u16::from(state.buffer_replace_focused),
+        ));
     }
 }
 

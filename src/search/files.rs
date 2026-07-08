@@ -58,6 +58,29 @@ pub fn fuzzy_files(
     matches
 }
 
+/// Returns label indices ordered by fuzzy score. Used by completion lists so
+/// filtering continues locally after the LSP response arrives.
+pub fn fuzzy_label_indices(query: &str, labels: &[&str], limit: usize) -> Vec<usize> {
+    if query.is_empty() {
+        return (0..labels.len().min(limit)).collect();
+    }
+    let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
+    let mut matcher = Matcher::new(Config::DEFAULT);
+    let mut utf32 = Vec::new();
+    let mut matches = labels
+        .iter()
+        .enumerate()
+        .filter_map(|(index, label)| {
+            pattern
+                .score(Utf32Str::new(label, &mut utf32), &mut matcher)
+                .map(|score| (index, score))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    matches.truncate(limit);
+    matches.into_iter().map(|(index, _)| index).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,5 +115,12 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn fuzzy_labels_rank_non_contiguous_matches() {
+        let labels = ["print", "println", "parse_integer"];
+        let ranked = fuzzy_label_indices("ptln", &labels, 10);
+        assert_eq!(ranked.first(), Some(&1));
     }
 }

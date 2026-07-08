@@ -30,6 +30,11 @@ mouse = true
 auto_reload_unmodified = true
 large_file_threshold_mb = 10
 word_wrap = false
+trim_trailing_whitespace = false
+insert_final_newline = false
+auto_pairs = true
+ambiguous_width_wide = false
+format_on_save = false
 
 [workspace]
 show_hidden = false
@@ -47,6 +52,8 @@ scrollback_lines = 10000
 
 [diagnostics]
 enabled = true
+inline_messages = false
+check_on_save = false
 
 [lsp]
 enabled = true
@@ -109,6 +116,7 @@ mica src/main.rs:42:8     # 42行8列へ
 --log-level <LVL>   ログレベル
 --locale <LOCALE>   UI表示言語("en" | "ja")。既定はシステムロケールから自動判定
 --safe-mode         ユーザー設定・テーマ・LSPを読み込まず起動
+--check-config      設定とキーマップを検証して終了(警告時は非0)
 --version
 --help
 ```

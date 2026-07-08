@@ -22,6 +22,7 @@ use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
 use mica::{
     app::{AppState, BottomPanelView, BufferTab, Focus, Overlay, SidebarView},
     buffer::TextBuffer,
+    command::Command,
     config::{IconMode, Keymap, Settings},
     diagnostics::{Diagnostic, DiagnosticSeverity, DiagnosticSource, TextPosition, TextRange},
     editor::EditorView,
@@ -588,6 +589,7 @@ fn status_bar_shows_diagnostics_and_git_segments() {
     state.tabs.push(tab);
     state.active_tab = Some(0);
     state.focus = Focus::Editor;
+    state.lsp_started.insert("rust".to_owned());
     state.notification = Some("Saved src/main.rs".to_owned());
     state.git_status = Some(sample_git_status());
 
@@ -595,4 +597,40 @@ fn status_bar_shows_diagnostics_and_git_segments() {
     let (regions, terminal) = draw(&state, &theme, 120, 24);
     let text = region_text(terminal.backend().buffer(), regions.status);
     insta::assert_snapshot!(redact(&text, &state.workspace));
+}
+
+#[test]
+fn word_wrap_renders_continuations_and_mouse_maps_to_visual_row() {
+    let mut state = base_state("word-wrap");
+    state.sidebar_visible = false;
+    state.settings.editor.word_wrap = true;
+    let path = state.workspace.as_path().join("wrapped.md");
+    let mut buffer = TextBuffer::empty(Some(path), false);
+    buffer
+        .insert("長い日本語の行とemoji👩‍💻を含むword-wrap-content-that-continues")
+        .unwrap();
+    state.tabs.push(BufferTab::new(buffer));
+    state.active_tab = Some(0);
+    state.focus = Focus::Editor;
+
+    let theme = Theme::mica_dark(ColorMode::Ansi256);
+    let (regions, terminal) = draw(&state, &theme, 50, 12);
+    let text = region_text(terminal.backend().buffer(), regions.editor);
+    assert!(text.lines().filter(|line| line.contains('1')).count() >= 1);
+    assert!(text.lines().any(|line| line.contains("continues")));
+
+    let command = command_for_mouse(
+        &state,
+        regions,
+        MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: regions.editor.x + 8,
+            row: regions.editor.y + 3,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(matches!(
+        command,
+        Some(Command::SetCursor { char_offset, .. }) if char_offset > 0
+    ));
 }

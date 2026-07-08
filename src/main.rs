@@ -62,6 +62,34 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     let (keymap, key_warnings) = Keymap::from_overrides(&config.settings.keymap);
     config.warnings.extend(key_warnings);
+    let registry = mica::command::CommandRegistry::built_in();
+    for (chord, command) in &config.settings.keymap {
+        if !registry.contains(command) {
+            config
+                .warnings
+                .push(format!("unknown command ID for {chord}: {command}"));
+        }
+    }
+    if cli.check_config {
+        if config.warnings.is_empty() {
+            let sources = if config.paths.is_empty() {
+                "built-in defaults".to_owned()
+            } else {
+                config
+                    .paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            println!("configuration valid ({sources})");
+            return Ok(());
+        }
+        for warning in &config.warnings {
+            eprintln!("config: {warning}");
+        }
+        return Err(format!("configuration has {} error(s)", config.warnings.len()).into());
+    }
     let workspace = WorkspaceRoot::new(&target.workspace)?;
     let mut state = AppState::new(
         workspace,
@@ -155,7 +183,13 @@ fn run() -> Result<(), Box<dyn Error>> {
     let size = terminal.size()?;
     state.update(AppEvent::Command(Command::Resize(size.width, size.height)));
     let color_mode = detect_color_mode();
-    let theme = Theme::mica_dark(color_mode);
+    let theme = match Theme::load(&state.settings.ui.theme, color_mode) {
+        Ok(theme) => theme,
+        Err(error) => {
+            state.notification = Some(format!("Theme: {error}; using mica-dark"));
+            Theme::mica_dark(color_mode)
+        }
+    };
     if let Some(journal) = &session_journal {
         journal.submit(state.session_snapshot());
     }

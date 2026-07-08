@@ -44,6 +44,10 @@ impl CommandRegistry {
                     title: "Save As",
                 },
                 CommandMeta {
+                    id: EDITOR_SAVE_ALL,
+                    title: "Save All",
+                },
+                CommandMeta {
                     id: EDITOR_CLOSE,
                     title: "Close Editor",
                 },
@@ -64,12 +68,68 @@ impl CommandRegistry {
                     title: "Find in Buffer",
                 },
                 CommandMeta {
+                    id: EDITOR_REPLACE,
+                    title: "Replace in Buffer",
+                },
+                CommandMeta {
+                    id: EDITOR_REPLACE_NEXT,
+                    title: "Replace Current Match",
+                },
+                CommandMeta {
+                    id: EDITOR_REPLACE_ALL,
+                    title: "Replace All Matches",
+                },
+                CommandMeta {
                     id: EDITOR_UNDO,
                     title: "Undo",
                 },
                 CommandMeta {
                     id: EDITOR_REDO,
                     title: "Redo",
+                },
+                CommandMeta {
+                    id: EDITOR_INDENT,
+                    title: "Indent Selected Lines",
+                },
+                CommandMeta {
+                    id: EDITOR_OUTDENT,
+                    title: "Outdent Selected Lines",
+                },
+                CommandMeta {
+                    id: EDITOR_TOGGLE_LINE_COMMENT,
+                    title: "Toggle Line Comment",
+                },
+                CommandMeta {
+                    id: EDITOR_SELECT_ALL,
+                    title: "Select All",
+                },
+                CommandMeta {
+                    id: EDITOR_DUPLICATE_LINE,
+                    title: "Duplicate Selected Lines",
+                },
+                CommandMeta {
+                    id: EDITOR_MOVE_LINE_UP,
+                    title: "Move Selected Lines Up",
+                },
+                CommandMeta {
+                    id: EDITOR_MOVE_LINE_DOWN,
+                    title: "Move Selected Lines Down",
+                },
+                CommandMeta {
+                    id: EDITOR_DELETE_LINE,
+                    title: "Delete Selected Lines",
+                },
+                CommandMeta {
+                    id: EDITOR_GOTO_LINE,
+                    title: "Go to Line",
+                },
+                CommandMeta {
+                    id: EDITOR_NAVIGATE_BACK,
+                    title: "Navigate Back",
+                },
+                CommandMeta {
+                    id: EDITOR_NAVIGATE_FORWARD,
+                    title: "Navigate Forward",
                 },
                 CommandMeta {
                     id: WORKSPACE_OPEN_FILE,
@@ -184,6 +244,10 @@ impl CommandRegistry {
                     title: "Terminal: Restart Session",
                 },
                 CommandMeta {
+                    id: TERMINAL_OPEN_REFERENCE,
+                    title: "Terminal: Open File Reference at Cursor",
+                },
+                CommandMeta {
                     id: VIEW_OUTPUT,
                     title: "Show Output Panel",
                 },
@@ -200,6 +264,26 @@ impl CommandRegistry {
                     title: "Diagnostics: Run Cargo Check",
                 },
                 CommandMeta {
+                    id: DIAGNOSTICS_NEXT,
+                    title: "Diagnostics: Go to Next Problem",
+                },
+                CommandMeta {
+                    id: DIAGNOSTICS_PREVIOUS,
+                    title: "Diagnostics: Go to Previous Problem",
+                },
+                CommandMeta {
+                    id: DIAGNOSTICS_FILTER_SEVERITY,
+                    title: "Diagnostics: Cycle Severity Filter",
+                },
+                CommandMeta {
+                    id: DIAGNOSTICS_FILTER_SOURCE,
+                    title: "Diagnostics: Cycle Source Filter",
+                },
+                CommandMeta {
+                    id: DIAGNOSTICS_FILTER_CURRENT_FILE,
+                    title: "Diagnostics: Toggle Current File Filter",
+                },
+                CommandMeta {
                     id: LSP_HOVER,
                     title: "LSP: Hover",
                 },
@@ -210,6 +294,22 @@ impl CommandRegistry {
                 CommandMeta {
                     id: LSP_COMPLETION,
                     title: "LSP: Completion",
+                },
+                CommandMeta {
+                    id: LSP_REFERENCES,
+                    title: "LSP: Find References",
+                },
+                CommandMeta {
+                    id: LSP_FORMAT,
+                    title: "LSP: Format Document",
+                },
+                CommandMeta {
+                    id: LSP_SIGNATURE_HELP,
+                    title: "LSP: Signature Help",
+                },
+                CommandMeta {
+                    id: LSP_CODE_ACTION,
+                    title: "LSP: Code Action",
                 },
                 CommandMeta {
                     id: COMMAND_PALETTE_OPEN,

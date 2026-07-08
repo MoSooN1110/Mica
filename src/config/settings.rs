@@ -35,6 +35,11 @@ pub struct EditorSettings {
     pub auto_reload_unmodified: bool,
     pub large_file_threshold_mb: u64,
     pub word_wrap: bool,
+    pub trim_trailing_whitespace: bool,
+    pub insert_final_newline: bool,
+    pub auto_pairs: bool,
+    pub ambiguous_width_wide: bool,
+    pub format_on_save: bool,
 }
 
 impl Default for EditorSettings {
@@ -48,6 +53,11 @@ impl Default for EditorSettings {
             auto_reload_unmodified: true,
             large_file_threshold_mb: 10,
             word_wrap: false,
+            trim_trailing_whitespace: false,
+            insert_final_newline: false,
+            auto_pairs: true,
+            ambiguous_width_wide: false,
+            format_on_save: false,
         }
     }
 }
@@ -108,11 +118,17 @@ impl Default for TerminalSettings {
 #[serde(default, deny_unknown_fields)]
 pub struct DiagnosticsSettings {
     pub enabled: bool,
+    pub inline_messages: bool,
+    pub check_on_save: bool,
 }
 
 impl Default for DiagnosticsSettings {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            inline_messages: false,
+            check_on_save: false,
+        }
     }
 }
 

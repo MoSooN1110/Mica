@@ -1,4 +1,8 @@
+use std::{fs, path::PathBuf};
+
 use ratatui::style::Color;
+use serde::Deserialize;
+use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColorMode {
@@ -46,6 +50,43 @@ pub struct Theme {
 }
 
 impl Theme {
+    pub fn load(name: &str, mode: ColorMode) -> Result<Self, ThemeError> {
+        match name {
+            "mica-dark" => return Ok(Self::mica_dark(mode)),
+            "mica-light" => return Ok(Self::mica_light(mode)),
+            _ => {}
+        }
+        if name
+            != PathBuf::from(name)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("")
+        {
+            return Err(ThemeError::InvalidName(name.to_owned()));
+        }
+        let config_home = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+            .ok_or(ThemeError::NoConfigHome)?;
+        let filename = if name.ends_with(".toml") {
+            name.to_owned()
+        } else {
+            format!("{name}.toml")
+        };
+        let path = config_home.join("mica/themes").join(filename);
+        let source = fs::read_to_string(&path).map_err(|source| ThemeError::Read {
+            path: path.clone(),
+            source,
+        })?;
+        let file: ThemeFile = toml::from_str(&source).map_err(|source| ThemeError::Parse {
+            path: path.clone(),
+            source,
+        })?;
+        let mut theme = Self::mica_dark(mode);
+        theme.apply_colors(file.colors, mode)?;
+        Ok(theme)
+    }
+
     pub fn mica_dark(mode: ColorMode) -> Self {
         let color = |hex: u32| {
             let red = ((hex >> 16) & 0xff) as u8;
@@ -94,6 +135,166 @@ impl Theme {
             diff_add_bg: color(0x124612),
             diff_delete_bg: color(0x461212),
         }
+    }
+
+    pub fn mica_light(mode: ColorMode) -> Self {
+        let color = |hex| theme_color(hex, mode);
+        Self {
+            background: color(0xFAFAFC),
+            surface: color(0xF1F2F6),
+            surface_raised: color(0xFFFFFF),
+            border: color(0xD4D7DE),
+            text: color(0x242833),
+            text_muted: color(0x626B7A),
+            text_faint: color(0x8B93A1),
+            accent: color(0x315EAF),
+            selection: color(0xDCE7FA),
+            active_line: color(0xF0F4FA),
+            cursor: color(0x172033),
+            syntax_keyword: color(0x7C3E9D),
+            syntax_function: color(0x245AA8),
+            syntax_type: color(0x8A5B00),
+            syntax_string: color(0x357A38),
+            syntax_number: color(0xB24728),
+            syntax_comment: color(0x747D8C),
+            syntax_variable: color(0x242833),
+            syntax_constant: color(0x087F8C),
+            git_added: color(0x2E7D32),
+            git_modified: color(0xA06400),
+            git_deleted: color(0xC62828),
+            git_conflict: color(0xC45100),
+            diagnostic_error: color(0xC62828),
+            diagnostic_warning: color(0x966000),
+            diagnostic_info: color(0x245AA8),
+            diagnostic_hint: color(0x087F8C),
+            diff_add_bg: color(0xDDF2DF),
+            diff_delete_bg: color(0xF8DFE1),
+        }
+    }
+
+    fn apply_colors(&mut self, colors: ThemeColors, mode: ColorMode) -> Result<(), ThemeError> {
+        macro_rules! apply {
+            ($field:ident) => {
+                if let Some(value) = colors.$field {
+                    self.$field = parse_color(stringify!($field), &value, mode)?;
+                }
+            };
+        }
+        apply!(background);
+        apply!(surface);
+        apply!(surface_raised);
+        apply!(border);
+        apply!(text);
+        apply!(text_muted);
+        apply!(text_faint);
+        apply!(accent);
+        apply!(selection);
+        apply!(active_line);
+        apply!(cursor);
+        apply!(syntax_keyword);
+        apply!(syntax_function);
+        apply!(syntax_type);
+        apply!(syntax_string);
+        apply!(syntax_number);
+        apply!(syntax_comment);
+        apply!(syntax_variable);
+        apply!(syntax_constant);
+        apply!(git_added);
+        apply!(git_modified);
+        apply!(git_deleted);
+        apply!(git_conflict);
+        apply!(diagnostic_error);
+        apply!(diagnostic_warning);
+        apply!(diagnostic_info);
+        apply!(diagnostic_hint);
+        apply!(diff_add_bg);
+        apply!(diff_delete_bg);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ThemeError {
+    #[error("invalid theme name: {0}")]
+    InvalidName(String),
+    #[error("cannot locate the configuration directory")]
+    NoConfigHome,
+    #[error("failed to read theme {path}: {source}")]
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("failed to parse theme {path}: {source}")]
+    Parse {
+        path: PathBuf,
+        source: toml::de::Error,
+    },
+    #[error("invalid color for {token}: {value}; expected #RRGGBB")]
+    InvalidColor { token: &'static str, value: String },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ThemeFile {
+    colors: ThemeColors,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ThemeColors {
+    background: Option<String>,
+    surface: Option<String>,
+    surface_raised: Option<String>,
+    border: Option<String>,
+    text: Option<String>,
+    text_muted: Option<String>,
+    text_faint: Option<String>,
+    accent: Option<String>,
+    selection: Option<String>,
+    active_line: Option<String>,
+    cursor: Option<String>,
+    syntax_keyword: Option<String>,
+    syntax_function: Option<String>,
+    syntax_type: Option<String>,
+    syntax_string: Option<String>,
+    syntax_number: Option<String>,
+    syntax_comment: Option<String>,
+    syntax_variable: Option<String>,
+    syntax_constant: Option<String>,
+    git_added: Option<String>,
+    git_modified: Option<String>,
+    git_deleted: Option<String>,
+    git_conflict: Option<String>,
+    diagnostic_error: Option<String>,
+    diagnostic_warning: Option<String>,
+    diagnostic_info: Option<String>,
+    diagnostic_hint: Option<String>,
+    diff_add_bg: Option<String>,
+    diff_delete_bg: Option<String>,
+}
+
+fn parse_color(token: &'static str, value: &str, mode: ColorMode) -> Result<Color, ThemeError> {
+    let hex = value
+        .strip_prefix('#')
+        .filter(|value| value.len() == 6)
+        .ok_or_else(|| ThemeError::InvalidColor {
+            token,
+            value: value.to_owned(),
+        })?;
+    let value = u32::from_str_radix(hex, 16).map_err(|_| ThemeError::InvalidColor {
+        token,
+        value: value.to_owned(),
+    })?;
+    Ok(theme_color(value, mode))
+}
+
+fn theme_color(hex: u32, mode: ColorMode) -> Color {
+    let red = ((hex >> 16) & 0xff) as u8;
+    let green = ((hex >> 8) & 0xff) as u8;
+    let blue = (hex & 0xff) as u8;
+    match mode {
+        ColorMode::TrueColor => Color::Rgb(red, green, blue),
+        ColorMode::Ansi256 => Color::Indexed(nearest_xterm(red, green, blue)),
     }
 }
 
@@ -151,5 +352,35 @@ mod tests {
         assert_ne!(theme.diagnostic_info, theme.diagnostic_error);
         assert_ne!(theme.diagnostic_hint, theme.diagnostic_warning);
         assert_ne!(theme.diagnostic_info, theme.diagnostic_hint);
+    }
+
+    #[test]
+    fn light_theme_is_distinct_and_supports_ansi256() {
+        let dark = Theme::mica_dark(ColorMode::TrueColor);
+        let light = Theme::mica_light(ColorMode::TrueColor);
+        assert_ne!(light.background, dark.background);
+        assert!(matches!(
+            Theme::mica_light(ColorMode::Ansi256).background,
+            Color::Indexed(_)
+        ));
+    }
+
+    #[test]
+    fn external_theme_colors_overlay_defaults_and_validate_hex() {
+        let mut theme = Theme::mica_dark(ColorMode::TrueColor);
+        theme
+            .apply_colors(
+                ThemeColors {
+                    accent: Some("#123456".to_owned()),
+                    ..ThemeColors::default()
+                },
+                ColorMode::TrueColor,
+            )
+            .unwrap();
+        assert_eq!(theme.accent, Color::Rgb(0x12, 0x34, 0x56));
+        assert!(matches!(
+            parse_color("accent", "blue", ColorMode::TrueColor),
+            Err(ThemeError::InvalidColor { .. })
+        ));
     }
 }

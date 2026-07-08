@@ -308,6 +308,361 @@ impl TextBuffer {
         Ok(())
     }
 
+    pub fn delete_range(&mut self, start_char: usize, end_char: usize) -> Result<(), BufferError> {
+        self.ensure_writable()?;
+        let start = start_char.min(self.text.len_chars());
+        let end = end_char.min(self.text.len_chars()).max(start);
+        if start == end {
+            return Ok(());
+        }
+        self.set_selection(Selection {
+            anchor: CharOffset(start),
+            head: CharOffset(end),
+        });
+        self.insert("")
+    }
+
+    pub fn insert_newline_with_indent(&mut self) -> Result<(), BufferError> {
+        self.ensure_writable()?;
+        let cursor = self.selection().range().start;
+        let line_index = self.text.char_to_line(cursor.min(self.text.len_chars()));
+        let line_start = self.text.line_to_char(line_index);
+        let before_cursor = self.text.slice(line_start..cursor).to_string();
+        let indent: String = before_cursor
+            .chars()
+            .take_while(|character| matches!(character, ' ' | '\t'))
+            .collect();
+        let newline = if self.line_ending == LineEnding::CrLf {
+            "\r\n"
+        } else {
+            "\n"
+        };
+        self.insert(&format!("{newline}{indent}"))
+    }
+
+    /// Indents or outdents every logical line touched by the selection as one
+    /// undoable edit. A selection ending at column zero does not include that
+    /// final line, matching common editor behavior.
+    pub fn change_selected_line_indent(
+        &mut self,
+        indent: &str,
+        outdent: bool,
+    ) -> Result<(), BufferError> {
+        self.ensure_writable()?;
+        let selection = self.selection();
+        let range = selection.range();
+        let start_line = self.text.char_to_line(range.start);
+        let mut end_line = self.text.char_to_line(range.end.min(self.text.len_chars()));
+        if range.end > range.start && self.text.line_to_char(end_line) == range.end {
+            end_line = end_line.saturating_sub(1);
+        }
+        let block_start = self.text.line_to_char(start_line);
+        let block_end = if end_line + 1 < self.text.len_lines() {
+            self.text.line_to_char(end_line + 1)
+        } else {
+            self.text.len_chars()
+        };
+        let original = self.text.slice(block_start..block_end).to_string();
+        let replacement = original
+            .split_inclusive('\n')
+            .map(|line| {
+                if outdent {
+                    if let Some(rest) = line.strip_prefix('\t') {
+                        rest.to_owned()
+                    } else {
+                        let spaces = line
+                            .chars()
+                            .take_while(|character| *character == ' ')
+                            .count()
+                            .min(indent.chars().count());
+                        line.chars().skip(spaces).collect()
+                    }
+                } else {
+                    format!("{indent}{line}")
+                }
+            })
+            .collect::<String>();
+        if replacement == original {
+            return Ok(());
+        }
+        self.set_selection(Selection {
+            anchor: CharOffset(block_start),
+            head: CharOffset(block_end),
+        });
+        self.insert(&replacement)?;
+        self.set_selection(Selection {
+            anchor: CharOffset(block_start),
+            head: CharOffset(block_start + replacement.chars().count()),
+        });
+        Ok(())
+    }
+
+    pub fn toggle_selected_line_comment(
+        &mut self,
+        prefix: &str,
+        suffix: Option<&str>,
+    ) -> Result<(), BufferError> {
+        self.ensure_writable()?;
+        let selection = self.selection();
+        let range = selection.range();
+        let start_line = self.text.char_to_line(range.start);
+        let mut end_line = self.text.char_to_line(range.end.min(self.text.len_chars()));
+        if range.end > range.start && self.text.line_to_char(end_line) == range.end {
+            end_line = end_line.saturating_sub(1);
+        }
+        let block_start = self.text.line_to_char(start_line);
+        let block_end = if end_line + 1 < self.text.len_lines() {
+            self.text.line_to_char(end_line + 1)
+        } else {
+            self.text.len_chars()
+        };
+        let original = self.text.slice(block_start..block_end).to_string();
+        let uncomment = original
+            .split_inclusive('\n')
+            .filter(|line| !line.trim().is_empty())
+            .all(|line| line_comment_body(line).starts_with(prefix));
+        let replacement = original
+            .split_inclusive('\n')
+            .map(|line| transform_commented_line(line, prefix, suffix, uncomment))
+            .collect::<String>();
+        self.set_selection(Selection {
+            anchor: CharOffset(block_start),
+            head: CharOffset(block_end),
+        });
+        self.insert(&replacement)?;
+        self.set_selection(Selection {
+            anchor: CharOffset(block_start),
+            head: CharOffset(block_start + replacement.chars().count()),
+        });
+        Ok(())
+    }
+
+    pub fn select_all(&mut self) {
+        self.set_selection(Selection {
+            anchor: CharOffset(0),
+            head: CharOffset(self.text.len_chars()),
+        });
+    }
+
+    pub fn apply_save_formatting(
+        &mut self,
+        trim_trailing_whitespace: bool,
+        insert_final_newline: bool,
+    ) -> Result<bool, BufferError> {
+        self.ensure_writable()?;
+        if !trim_trailing_whitespace && !insert_final_newline {
+            return Ok(false);
+        }
+        let original = self.text.to_string();
+        let mut formatted = if trim_trailing_whitespace {
+            original
+                .split_inclusive('\n')
+                .map(|line| {
+                    let without_lf = line.strip_suffix('\n').unwrap_or(line);
+                    let (content, cr) = without_lf
+                        .strip_suffix('\r')
+                        .map_or((without_lf, ""), |content| (content, "\r"));
+                    let content = content.trim_end_matches([' ', '\t']);
+                    let lf = if line.ends_with('\n') { "\n" } else { "" };
+                    format!("{content}{cr}{lf}")
+                })
+                .collect::<String>()
+        } else {
+            original.clone()
+        };
+        if insert_final_newline && !formatted.is_empty() && !formatted.ends_with('\n') {
+            formatted.push_str(if self.line_ending == LineEnding::CrLf {
+                "\r\n"
+            } else {
+                "\n"
+            });
+        }
+        if formatted == original {
+            return Ok(false);
+        }
+        let selection = self.selection();
+        self.select_all();
+        self.insert(&formatted)?;
+        self.set_selection(selection);
+        Ok(true)
+    }
+
+    pub fn insert_auto_pair(&mut self, opening: char, closing: char) -> Result<(), BufferError> {
+        self.ensure_writable()?;
+        let selection = self.selection();
+        let range = selection.range();
+        let selected = self.text.slice(range.clone()).to_string();
+        self.insert(&format!("{opening}{selected}{closing}"))?;
+        if selection.is_caret() {
+            self.set_selection(Selection::caret(CharOffset(range.start + 1)));
+        } else {
+            self.set_selection(Selection {
+                anchor: CharOffset(range.start + 1),
+                head: CharOffset(range.start + 1 + selected.chars().count()),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn replace_all_ranges(
+        &mut self,
+        ranges: &[std::ops::Range<usize>],
+        replacement: &str,
+    ) -> Result<usize, BufferError> {
+        self.ensure_writable()?;
+        if ranges.is_empty() {
+            return Ok(0);
+        }
+        let mut output = String::new();
+        let mut cursor = 0usize;
+        for range in ranges {
+            let start = range.start.min(self.text.len_chars());
+            let end = range.end.min(self.text.len_chars());
+            if start < cursor || start > end {
+                continue;
+            }
+            output.push_str(&self.text.slice(cursor..start).to_string());
+            output.push_str(replacement);
+            cursor = end;
+        }
+        output.push_str(&self.text.slice(cursor..).to_string());
+        let count = ranges.len();
+        self.select_all();
+        self.insert(&output)?;
+        Ok(count)
+    }
+
+    pub fn apply_text_edits(
+        &mut self,
+        mut edits: Vec<(std::ops::Range<usize>, String)>,
+    ) -> Result<usize, BufferError> {
+        self.ensure_writable()?;
+        edits.sort_by_key(|(range, _)| (range.start, range.end));
+        let mut output = String::new();
+        let mut cursor = 0usize;
+        let mut applied = 0usize;
+        for (range, replacement) in edits {
+            let start = range.start.min(self.text.len_chars());
+            let end = range.end.min(self.text.len_chars());
+            if start < cursor || start > end {
+                continue;
+            }
+            output.push_str(&self.text.slice(cursor..start).to_string());
+            output.push_str(&replacement);
+            cursor = end;
+            applied += 1;
+        }
+        if applied == 0 {
+            return Ok(0);
+        }
+        output.push_str(&self.text.slice(cursor..).to_string());
+        self.select_all();
+        self.insert(&output)?;
+        Ok(applied)
+    }
+
+    pub fn skip_matching_closer(&mut self, closing: char) -> bool {
+        let selection = self.selection();
+        if !selection.is_caret() || self.text.get_char(selection.head.0) != Some(closing) {
+            return false;
+        }
+        self.set_selection(Selection::caret(CharOffset(selection.head.0 + 1)));
+        true
+    }
+
+    pub fn duplicate_selected_lines(&mut self) -> Result<(), BufferError> {
+        let (start, end) = self.selected_line_block();
+        let block = self.text.slice(start..end).to_string();
+        self.set_selection(Selection {
+            anchor: CharOffset(start),
+            head: CharOffset(end),
+        });
+        self.insert(&format!("{block}{block}"))?;
+        let block_chars = block.chars().count();
+        self.set_selection(Selection {
+            anchor: CharOffset(start + block_chars),
+            head: CharOffset(start + block_chars * 2),
+        });
+        Ok(())
+    }
+
+    pub fn move_selected_lines(&mut self, down: bool) -> Result<(), BufferError> {
+        self.ensure_writable()?;
+        let selection = self.selection();
+        let range = selection.range();
+        let start_line = self.text.char_to_line(range.start);
+        let mut end_line = self.text.char_to_line(range.end.min(self.text.len_chars()));
+        if range.end > range.start && self.text.line_to_char(end_line) == range.end {
+            end_line = end_line.saturating_sub(1);
+        }
+        let (block_start, block_end) = self.selected_line_block();
+        let block = self.text.slice(block_start..block_end).to_string();
+        if down {
+            if end_line + 1 >= self.text.len_lines() {
+                return Ok(());
+            }
+            let next_end = if end_line + 2 < self.text.len_lines() {
+                self.text.line_to_char(end_line + 2)
+            } else {
+                self.text.len_chars()
+            };
+            let next = self.text.slice(block_end..next_end).to_string();
+            self.set_selection(Selection {
+                anchor: CharOffset(block_start),
+                head: CharOffset(next_end),
+            });
+            self.insert(&format!("{next}{block}"))?;
+            let next_chars = next.chars().count();
+            self.set_selection(Selection {
+                anchor: CharOffset(block_start + next_chars),
+                head: CharOffset(block_start + next_chars + block.chars().count()),
+            });
+        } else {
+            if start_line == 0 {
+                return Ok(());
+            }
+            let previous_start = self.text.line_to_char(start_line - 1);
+            let previous = self.text.slice(previous_start..block_start).to_string();
+            self.set_selection(Selection {
+                anchor: CharOffset(previous_start),
+                head: CharOffset(block_end),
+            });
+            self.insert(&format!("{block}{previous}"))?;
+            self.set_selection(Selection {
+                anchor: CharOffset(previous_start),
+                head: CharOffset(previous_start + block.chars().count()),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn delete_selected_lines(&mut self) -> Result<(), BufferError> {
+        let (mut start, end) = self.selected_line_block();
+        let mut end = end;
+        if end == self.text.len_chars() && start > 0 {
+            start -= 1;
+        } else if end == start && end < self.text.len_chars() {
+            end += 1;
+        }
+        self.delete_range(start, end)
+    }
+
+    fn selected_line_block(&self) -> (usize, usize) {
+        let range = self.selection().range();
+        let start_line = self.text.char_to_line(range.start);
+        let mut end_line = self.text.char_to_line(range.end.min(self.text.len_chars()));
+        if range.end > range.start && self.text.line_to_char(end_line) == range.end {
+            end_line = end_line.saturating_sub(1);
+        }
+        let start = self.text.line_to_char(start_line);
+        let end = if end_line + 1 < self.text.len_lines() {
+            self.text.line_to_char(end_line + 1)
+        } else {
+            self.text.len_chars()
+        };
+        (start, end)
+    }
+
     pub fn undo(&mut self) -> Result<bool, BufferError> {
         self.ensure_writable()?;
         let Some(edit) = self.history.pop_undo() else {
@@ -424,6 +779,41 @@ fn detect_line_ending(text: &str) -> LineEnding {
     }
 }
 
+fn line_comment_body(line: &str) -> &str {
+    line.trim_end_matches(['\r', '\n'])
+        .trim_start_matches([' ', '\t'])
+}
+
+fn transform_commented_line(
+    line: &str,
+    prefix: &str,
+    suffix: Option<&str>,
+    uncomment: bool,
+) -> String {
+    let content = line.trim_end_matches(['\r', '\n']);
+    let ending = &line[content.len()..];
+    if content.trim().is_empty() {
+        return line.to_owned();
+    }
+    let indent_len = content.len() - content.trim_start_matches([' ', '\t']).len();
+    let (indent, body) = content.split_at(indent_len);
+    if uncomment {
+        let Some(mut body) = body.strip_prefix(prefix) else {
+            return line.to_owned();
+        };
+        body = body.strip_prefix(' ').unwrap_or(body);
+        if let Some(suffix) = suffix {
+            body = body.strip_suffix(suffix).unwrap_or(body);
+            body = body.strip_suffix(' ').unwrap_or(body);
+        }
+        format!("{indent}{body}{ending}")
+    } else if let Some(suffix) = suffix {
+        format!("{indent}{prefix} {body} {suffix}{ending}")
+    } else {
+        format!("{indent}{prefix} {body}{ending}")
+    }
+}
+
 fn hash_text(text: &Rope) -> u64 {
     let mut hasher = DefaultHasher::new();
     for chunk in text.chunks() {
@@ -471,6 +861,126 @@ mod tests {
         assert_eq!(buffer.text_string(), "abXf");
         buffer.undo().unwrap();
         assert_eq!(buffer.text_string(), "abcdef");
+    }
+
+    #[test]
+    fn newline_inherits_leading_indentation_as_one_undoable_edit() {
+        let mut buffer = TextBuffer::empty(None, false);
+        buffer.insert("\t  value").unwrap();
+        buffer.insert_newline_with_indent().unwrap();
+        assert_eq!(buffer.text_string(), "\t  value\n\t  ");
+        buffer.undo().unwrap();
+        assert_eq!(buffer.text_string(), "\t  value");
+    }
+
+    #[test]
+    fn selected_lines_indent_and_outdent_as_single_edits() {
+        let mut buffer = TextBuffer::empty(None, false);
+        buffer.insert("one\n  two\nthree").unwrap();
+        buffer.set_selection(Selection {
+            anchor: CharOffset(0),
+            head: CharOffset(9),
+        });
+        buffer.change_selected_line_indent("    ", false).unwrap();
+        assert_eq!(buffer.text_string(), "    one\n      two\nthree");
+        buffer.undo().unwrap();
+        assert_eq!(buffer.text_string(), "one\n  two\nthree");
+        buffer.set_selection(Selection {
+            anchor: CharOffset(0),
+            head: CharOffset(9),
+        });
+        buffer.change_selected_line_indent("    ", true).unwrap();
+        assert_eq!(buffer.text_string(), "one\ntwo\nthree");
+    }
+
+    #[test]
+    fn line_comment_toggle_preserves_indentation_and_line_endings() {
+        let mut buffer = TextBuffer::empty(None, false);
+        buffer.insert("  one\r\n\ttwo\r\n").unwrap();
+        buffer.set_selection(Selection {
+            anchor: CharOffset(0),
+            head: CharOffset(buffer.text().len_chars()),
+        });
+        buffer.toggle_selected_line_comment("//", None).unwrap();
+        assert_eq!(buffer.text_string(), "  // one\r\n\t// two\r\n");
+        buffer.toggle_selected_line_comment("//", None).unwrap();
+        assert_eq!(buffer.text_string(), "  one\r\n\ttwo\r\n");
+    }
+
+    #[test]
+    fn line_duplicate_move_delete_are_each_undoable() {
+        let mut buffer = TextBuffer::empty(None, false);
+        buffer.insert("one\ntwo\nthree\n").unwrap();
+        buffer.set_selection(Selection::caret(CharOffset(5)));
+        buffer.duplicate_selected_lines().unwrap();
+        assert_eq!(buffer.text_string(), "one\ntwo\ntwo\nthree\n");
+        buffer.undo().unwrap();
+        buffer.set_selection(Selection::caret(CharOffset(5)));
+        buffer.move_selected_lines(false).unwrap();
+        assert_eq!(buffer.text_string(), "two\none\nthree\n");
+        buffer.undo().unwrap();
+        buffer.set_selection(Selection::caret(CharOffset(5)));
+        buffer.move_selected_lines(true).unwrap();
+        assert_eq!(buffer.text_string(), "one\nthree\ntwo\n");
+        buffer.undo().unwrap();
+        buffer.set_selection(Selection::caret(CharOffset(5)));
+        buffer.delete_selected_lines().unwrap();
+        assert_eq!(buffer.text_string(), "one\nthree\n");
+        buffer.undo().unwrap();
+        assert_eq!(buffer.text_string(), "one\ntwo\nthree\n");
+    }
+
+    #[test]
+    fn save_formatting_trims_whitespace_and_uses_existing_line_ending() {
+        let mut buffer = TextBuffer::empty(None, false);
+        buffer.line_ending = LineEnding::CrLf;
+        buffer.insert("one  \r\ntwo\t").unwrap();
+        assert!(buffer.apply_save_formatting(true, true).unwrap());
+        assert_eq!(buffer.text_string(), "one\r\ntwo\r\n");
+        buffer.undo().unwrap();
+        assert_eq!(buffer.text_string(), "one  \r\ntwo\t");
+    }
+
+    #[test]
+    fn auto_pair_places_caret_inside_and_surrounds_selection() {
+        let mut buffer = TextBuffer::empty(None, false);
+        buffer.insert_auto_pair('(', ')').unwrap();
+        assert_eq!(buffer.text_string(), "()");
+        assert_eq!(buffer.selection().head, CharOffset(1));
+        assert!(buffer.skip_matching_closer(')'));
+        buffer.insert("word").unwrap();
+        buffer.set_selection(Selection {
+            anchor: CharOffset(2),
+            head: CharOffset(6),
+        });
+        buffer.insert_auto_pair('"', '"').unwrap();
+        assert_eq!(buffer.text_string(), "()\"word\"");
+        assert_eq!(buffer.selected_text().as_deref(), Some("word"));
+    }
+
+    #[test]
+    fn replacing_all_ranges_is_one_undoable_edit() {
+        let mut buffer = TextBuffer::empty(None, false);
+        buffer.insert("one two one").unwrap();
+        assert_eq!(buffer.replace_all_ranges(&[0..3, 8..11], "1").unwrap(), 2);
+        assert_eq!(buffer.text_string(), "1 two 1");
+        buffer.undo().unwrap();
+        assert_eq!(buffer.text_string(), "one two one");
+    }
+
+    #[test]
+    fn heterogeneous_text_edits_are_applied_as_one_edit() {
+        let mut buffer = TextBuffer::empty(None, false);
+        buffer.insert("let  x=1;").unwrap();
+        assert_eq!(
+            buffer
+                .apply_text_edits(vec![(3..5, " ".to_owned()), (6..7, " = ".to_owned())])
+                .unwrap(),
+            2
+        );
+        assert_eq!(buffer.text_string(), "let x = 1;");
+        buffer.undo().unwrap();
+        assert_eq!(buffer.text_string(), "let  x=1;");
     }
 
     #[test]
