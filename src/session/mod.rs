@@ -27,6 +27,7 @@ pub struct SessionBufferSnapshot {
     pub expected_disk_hash: Option<u64>,
     pub has_bom: bool,
     pub line_ending: LineEnding,
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -59,13 +60,20 @@ pub struct RecoverySet {
 
 #[derive(Debug)]
 pub struct RestoredSession {
-    pub buffers: Vec<(PathBuf, usize)>,
+    pub buffers: Vec<RestoredBuffer>,
     pub active_path: Option<PathBuf>,
     pub sidebar_visible: bool,
     pub sidebar_view: SidebarView,
     pub bottom_panel_visible: bool,
     pub sidebar_width: u16,
     pub bottom_panel_height: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoredBuffer {
+    pub path: PathBuf,
+    pub cursor_char: usize,
+    pub pinned: bool,
 }
 
 #[derive(Debug, Error)]
@@ -205,7 +213,13 @@ impl SessionStore {
             buffers: stored
                 .buffers
                 .into_iter()
-                .filter_map(|buffer| Some((buffer.path?, buffer.cursor_char)))
+                .filter_map(|buffer| {
+                    Some(RestoredBuffer {
+                        path: buffer.path?,
+                        cursor_char: buffer.cursor_char,
+                        pinned: buffer.pinned,
+                    })
+                })
                 .collect(),
             active_path,
             sidebar_visible: stored.sidebar_visible,
@@ -331,6 +345,8 @@ struct StoredBuffer {
     expected_disk_hash: Option<u64>,
     has_bom: bool,
     line_ending: StoredLineEnding,
+    #[serde(default)]
+    pinned: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -381,6 +397,7 @@ fn write_stored(path: &Path, snapshot: SessionSnapshot) -> Result<(), SessionErr
                 expected_disk_hash: buffer.expected_disk_hash,
                 has_bom: buffer.has_bom,
                 line_ending: buffer.line_ending.into(),
+                pinned: buffer.pinned,
             })
             .collect(),
         active_tab: snapshot.active_tab,
@@ -431,6 +448,7 @@ mod tests {
                 expected_disk_hash: Some(42),
                 has_bom: false,
                 line_ending: LineEnding::Lf,
+                pinned: true,
             }],
             active_tab: Some(0),
             sidebar_visible: true,
@@ -477,7 +495,14 @@ mod tests {
             .load_session()
             .unwrap()
             .unwrap();
-        assert_eq!(restored.buffers, vec![(workspace.join("src.rs"), 2)]);
+        assert_eq!(
+            restored.buffers,
+            vec![RestoredBuffer {
+                path: workspace.join("src.rs"),
+                cursor_char: 2,
+                pinned: true,
+            }]
+        );
         assert_eq!(restored.active_path, Some(workspace.join("src.rs")));
         fs::remove_dir_all(root).unwrap();
     }

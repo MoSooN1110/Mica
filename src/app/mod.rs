@@ -8,6 +8,6 @@ pub use event::{
 };
 pub use state::{
     AppState, BottomPanelView, BufferTab, CodeActionCandidate, CompletionCandidate, DiagnosticRow,
-    Focus, GitSection, NavigationLocation, Overlay, PathAction, PendingLspRequest, SidebarView,
-    WorkspaceSearchRow,
+    Focus, GitSection, NavigationLocation, NotificationEntry, NotificationLevel, Overlay,
+    PathAction, PendingLspRequest, SidebarView, WorkspaceSearchRow,
 };

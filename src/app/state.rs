@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::{Arc, atomic::AtomicU64},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
@@ -118,11 +119,28 @@ pub enum Overlay {
     SearchIncludeGlobs,
     SearchExcludeGlobs,
     ConfirmQuitTerminal,
+    TerminalSearch,
+    KeybindingHelp,
+    NotificationHistory,
     LspHover,
     LspCompletion,
     LspLocations,
     LspSignature,
     LspCodeActions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationLevel {
+    Info,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationEntry {
+    pub message: String,
+    pub level: NotificationLevel,
+    pub unix_seconds: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -190,6 +208,7 @@ pub struct BufferTab {
     pub view: EditorView,
     pub highlights: Vec<HighlightSpan>,
     pub syntax_generation: u64,
+    pub pinned: bool,
 }
 
 impl BufferTab {
@@ -202,6 +221,7 @@ impl BufferTab {
             view: Default::default(),
             highlights: Vec::new(),
             syntax_generation: 0,
+            pinned: false,
         }
     }
 
@@ -222,6 +242,10 @@ pub struct AppState {
     pub tree: FileTree,
     pub tree_selected: usize,
     pub tabs: Vec<BufferTab>,
+    /// Visual tab order. Entries are stable indices into `tabs`; missing
+    /// indices are appended by `visual_tab_order` for newly opened tabs.
+    pub tab_order: Vec<usize>,
+    pub tab_drag_source: Option<usize>,
     pub active_tab: Option<usize>,
     /// The inactive editor group's tab. `None` means the editor is not split.
     pub split_tab: Option<usize>,
@@ -238,7 +262,13 @@ pub struct AppState {
     pub buffer_replace_focused: bool,
     pub buffer_replace_visible: bool,
     pub notification: Option<String>,
+    pub notification_history: VecDeque<NotificationEntry>,
+    pub notification_expires_at: Option<Instant>,
+    pub notification_selected: usize,
+    pub notification_context: Focus,
     pub config_warnings: Vec<String>,
+    pub help_context: Focus,
+    pub help_selected: usize,
     pub should_quit: bool,
     pub terminal_size: (u16, u16),
     pub force_read_only: bool,
@@ -258,6 +288,8 @@ pub struct AppState {
     pub pending_recovery: Vec<RecoveryBuffer>,
     pub recovery_journals: Vec<PathBuf>,
     pub restore_cursors: HashMap<PathBuf, usize>,
+    pub restore_pins: HashMap<PathBuf, bool>,
+    pub restore_tab_order: HashMap<PathBuf, usize>,
     pub preferred_active_path: Option<PathBuf>,
     pub git_status: Option<crate::git::GitStatus>,
     pub git_loading: bool,
@@ -285,6 +317,8 @@ pub struct AppState {
     pub terminal_scroll_offset: usize,
     pub terminal_generation: u64,
     pub terminal_selection: Option<((usize, usize), (usize, usize))>,
+    pub terminal_search_matches: Vec<crate::terminal::TerminalSearchMatch>,
+    pub terminal_search_selected: usize,
     pub output_lines: VecDeque<String>,
     pub diagnostics: crate::diagnostics::DiagnosticStore,
     pub diagnostic_selected: usize,
@@ -334,6 +368,8 @@ impl AppState {
             tree: FileTree::default(),
             tree_selected: 0,
             tabs: Vec::new(),
+            tab_order: Vec::new(),
+            tab_drag_source: None,
             active_tab: None,
             split_tab: None,
             split_focus_right: false,
@@ -347,7 +383,24 @@ impl AppState {
             buffer_replace_focused: false,
             buffer_replace_visible: false,
             notification: config_warnings.first().cloned(),
+            notification_history: config_warnings
+                .first()
+                .map(|message| {
+                    VecDeque::from([NotificationEntry {
+                        message: message.clone(),
+                        level: NotificationLevel::Warning,
+                        unix_seconds: unix_seconds(),
+                    }])
+                })
+                .unwrap_or_default(),
+            notification_expires_at: config_warnings
+                .first()
+                .map(|_| Instant::now() + Duration::from_secs(5)),
+            notification_selected: 0,
+            notification_context: Focus::Editor,
             config_warnings,
+            help_context: Focus::Editor,
+            help_selected: 0,
             should_quit: false,
             terminal_size: (0, 0),
             force_read_only,
@@ -367,6 +420,8 @@ impl AppState {
             pending_recovery: Vec::new(),
             recovery_journals: Vec::new(),
             restore_cursors: HashMap::new(),
+            restore_pins: HashMap::new(),
+            restore_tab_order: HashMap::new(),
             preferred_active_path: None,
             git_status: None,
             git_loading: false,
@@ -393,6 +448,8 @@ impl AppState {
             terminal_scroll_offset: 0,
             terminal_generation: 0,
             terminal_selection: None,
+            terminal_search_matches: Vec::new(),
+            terminal_search_selected: 0,
             output_lines: VecDeque::new(),
             diagnostics: Default::default(),
             diagnostic_selected: 0,
@@ -595,6 +652,110 @@ impl AppState {
             .collect()
     }
 
+    pub fn active_keybindings(&self) -> Vec<(String, &str, &'static str)> {
+        self.keymap
+            .bindings()
+            .into_iter()
+            .filter(|(_, id)| self.command_active_in_help_context(id))
+            .filter_map(|(chord, id)| self.commands.title(id).map(|title| (chord, id, title)))
+            .collect()
+    }
+
+    pub fn visual_tab_order(&self) -> Vec<usize> {
+        let mut seen = HashSet::new();
+        let mut order = self
+            .tab_order
+            .iter()
+            .copied()
+            .filter(|index| *index < self.tabs.len() && seen.insert(*index))
+            .collect::<Vec<_>>();
+        order.extend((0..self.tabs.len()).filter(|index| seen.insert(*index)));
+        if self.tab_order.is_empty() && !self.restore_tab_order.is_empty() {
+            order.sort_by_key(|index| {
+                self.tabs[*index]
+                    .buffer
+                    .path()
+                    .and_then(|path| self.restore_tab_order.get(path))
+                    .copied()
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        let mut pinned = order
+            .iter()
+            .copied()
+            .filter(|index| self.tabs[*index].pinned)
+            .collect::<Vec<_>>();
+        pinned.extend(order.into_iter().filter(|index| !self.tabs[*index].pinned));
+        pinned
+    }
+
+    pub fn tab_visual_index(&self, tab_index: usize) -> Option<usize> {
+        self.visual_tab_order()
+            .iter()
+            .position(|index| *index == tab_index)
+    }
+
+    pub fn notify(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        self.notification = Some(message.clone());
+        self.record_notification(message);
+    }
+
+    pub(crate) fn record_notification(&mut self, message: String) {
+        self.notification_history.push_back(NotificationEntry {
+            level: notification_level(&message),
+            message,
+            unix_seconds: unix_seconds(),
+        });
+        while self.notification_history.len() > 200 {
+            self.notification_history.pop_front();
+        }
+        self.notification_expires_at = Some(Instant::now() + Duration::from_secs(5));
+        self.notification_selected = 0;
+    }
+
+    pub(crate) fn expire_notification(&mut self) {
+        if self
+            .notification_expires_at
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.notification = None;
+            self.notification_expires_at = None;
+        }
+    }
+
+    fn command_active_in_help_context(&self, id: &str) -> bool {
+        if id.starts_with("app.")
+            || id.starts_with("view.")
+            || id.starts_with("command_palette.")
+            || id.starts_with("config.")
+            || id.starts_with("help.")
+            || id.starts_with("notifications.")
+            || id == crate::command::WORKSPACE_OPEN_FILE
+        {
+            return true;
+        }
+        match self.help_context {
+            Focus::Editor => {
+                id.starts_with("editor.")
+                    || id.starts_with("lsp.")
+                    || id.starts_with("diagnostics.")
+                    || id.starts_with("workspace.")
+            }
+            Focus::Sidebar => match self.sidebar_view {
+                SidebarView::Explorer => id.starts_with("file.") || id.starts_with("workspace."),
+                SidebarView::SourceControl => id.starts_with("git."),
+                SidebarView::Search => id.starts_with("search."),
+            },
+            Focus::BottomPanel => match self.bottom_panel_view {
+                BottomPanelView::Terminal => id.starts_with("terminal."),
+                BottomPanelView::Problems => id.starts_with("diagnostics."),
+                BottomPanelView::Output => false,
+            },
+            Focus::Overlay => true,
+        }
+    }
+
     pub fn requested_file(&self, relative: &Path) -> PathBuf {
         self.workspace.as_path().join(relative)
     }
@@ -609,11 +770,12 @@ impl AppState {
     }
 
     pub fn session_snapshot(&self) -> SessionSnapshot {
+        let order = self.visual_tab_order();
         SessionSnapshot {
             workspace: self.workspace.as_path().to_path_buf(),
-            buffers: self
-                .tabs
+            buffers: order
                 .iter()
+                .filter_map(|index| self.tabs.get(*index))
                 .map(|tab| SessionBufferSnapshot {
                     path: tab.buffer.path().map(Path::to_path_buf),
                     text: tab.buffer.text().clone(),
@@ -622,9 +784,12 @@ impl AppState {
                     expected_disk_hash: tab.buffer.disk_hash(),
                     has_bom: tab.buffer.has_bom(),
                     line_ending: tab.buffer.line_ending(),
+                    pinned: tab.pinned,
                 })
                 .collect(),
-            active_tab: self.active_tab,
+            active_tab: self
+                .active_tab
+                .and_then(|active| order.iter().position(|index| *index == active)),
             sidebar_visible: self.sidebar_visible,
             sidebar_view: self.sidebar_view,
             bottom_panel_visible: self.bottom_panel_visible,
@@ -639,7 +804,46 @@ impl AppState {
         self.bottom_panel_visible = restored.bottom_panel_visible;
         self.settings.ui.sidebar_width = restored.sidebar_width;
         self.settings.ui.bottom_panel_height = restored.bottom_panel_height;
-        self.restore_cursors = restored.buffers.iter().cloned().collect();
+        self.restore_cursors = restored
+            .buffers
+            .iter()
+            .map(|buffer| (buffer.path.clone(), buffer.cursor_char))
+            .collect();
+        self.restore_pins = restored
+            .buffers
+            .iter()
+            .map(|buffer| (buffer.path.clone(), buffer.pinned))
+            .collect();
+        self.restore_tab_order = restored
+            .buffers
+            .iter()
+            .enumerate()
+            .map(|(index, buffer)| (buffer.path.clone(), index))
+            .collect();
         self.preferred_active_path = restored.active_path.clone();
+    }
+}
+
+fn unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn notification_level(message: &str) -> NotificationLevel {
+    let lower = message.to_ascii_lowercase();
+    if ["error", "failed", "cannot", "invalid", "refus"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
+        NotificationLevel::Error
+    } else if ["warning", "unavailable", "no ", "wait", "select "]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
+        NotificationLevel::Warning
+    } else {
+        NotificationLevel::Info
     }
 }

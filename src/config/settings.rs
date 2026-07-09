@@ -281,6 +281,25 @@ pub struct ConfigLoad {
 }
 
 impl ConfigLoad {
+    pub fn candidate_paths(
+        workspace: &Path,
+        explicit: Option<&Path>,
+        safe_mode: bool,
+    ) -> Vec<PathBuf> {
+        if safe_mode {
+            return Vec::new();
+        }
+        if let Some(path) = explicit {
+            return vec![path.to_path_buf()];
+        }
+        let mut paths = Vec::new();
+        if let Some(config_home) = config_home() {
+            paths.push(config_home.join("mica/config.toml"));
+        }
+        paths.push(workspace.join(".mica/config.toml"));
+        paths
+    }
+
     pub fn load(workspace: &Path, explicit: Option<&Path>, safe_mode: bool) -> Self {
         if safe_mode {
             return Self {
@@ -292,16 +311,7 @@ impl ConfigLoad {
         let mut settings = Settings::default();
         let mut merged = toml::Value::Table(toml::map::Map::new());
         let mut warnings = Vec::new();
-        let paths = if let Some(path) = explicit {
-            vec![path.to_path_buf()]
-        } else {
-            let mut paths = Vec::new();
-            if let Some(config_home) = config_home() {
-                paths.push(config_home.join("mica/config.toml"));
-            }
-            paths.push(workspace.join(".mica/config.toml"));
-            paths
-        };
+        let paths = Self::candidate_paths(workspace, explicit, safe_mode);
         let mut loaded = Vec::new();
         for path in paths {
             if !path.exists() {

@@ -52,6 +52,18 @@ impl CommandRegistry {
                     title: "Close Editor",
                 },
                 CommandMeta {
+                    id: EDITOR_TOGGLE_PIN,
+                    title: "Editor: Toggle Pin Active Tab",
+                },
+                CommandMeta {
+                    id: EDITOR_MOVE_TAB_LEFT,
+                    title: "Editor: Move Tab Left",
+                },
+                CommandMeta {
+                    id: EDITOR_MOVE_TAB_RIGHT,
+                    title: "Editor: Move Tab Right",
+                },
+                CommandMeta {
                     id: EDITOR_COPY,
                     title: "Copy",
                 },
@@ -138,6 +150,22 @@ impl CommandRegistry {
                 CommandMeta {
                     id: WORKSPACE_REFRESH,
                     title: "Refresh Workspace",
+                },
+                CommandMeta {
+                    id: CONFIG_RELOAD,
+                    title: "Configuration: Reload",
+                },
+                CommandMeta {
+                    id: CONFIG_OPEN,
+                    title: "Configuration: Open Workspace Settings",
+                },
+                CommandMeta {
+                    id: HELP_KEYBINDINGS,
+                    title: "Help: Active Keyboard Shortcuts",
+                },
+                CommandMeta {
+                    id: NOTIFICATIONS_HISTORY,
+                    title: "Notifications: Show History",
                 },
                 CommandMeta {
                     id: VIEW_TOGGLE_SIDEBAR,
@@ -248,6 +276,10 @@ impl CommandRegistry {
                     title: "Terminal: Open File Reference at Cursor",
                 },
                 CommandMeta {
+                    id: TERMINAL_SEARCH,
+                    title: "Terminal: Find in Scrollback",
+                },
+                CommandMeta {
                     id: VIEW_OUTPUT,
                     title: "Show Output Panel",
                 },
@@ -329,5 +361,12 @@ impl CommandRegistry {
 
     pub fn contains(&self, id: &str) -> bool {
         self.commands.iter().any(|command| command.id == id)
+    }
+
+    pub fn title(&self, id: &str) -> Option<&'static str> {
+        self.commands
+            .iter()
+            .find(|command| command.id == id)
+            .map(|command| command.title)
     }
 }

@@ -182,18 +182,21 @@ LSP / PTY Output / Syntax Task / Timer / Resize / Shutdown
 ```text
 file.new  file.new_directory  file.rename  file.move  file.delete
 editor.save  editor.save_as  editor.close  editor.undo  editor.redo
+editor.toggle_pin  editor.move_tab_left  editor.move_tab_right
 workspace.open_file  workspace.search  workspace.refresh
 git.open_panel  git.open_diff
 git.stage_file  git.unstage_file  git.stage_hunk  git.unstage_hunk
 git.restore_file  git.restore_hunk
 git.commit  git.branch_switch  git.branch_create
 git.push  git.pull  git.fetch
-terminal.toggle  terminal.new_session
+terminal.toggle  terminal.new_session  terminal.open_reference  terminal.search
 diagnostics.open_problems
 lsp.hover  lsp.goto_definition  lsp.completion
 view.toggle_sidebar  view.explorer  view.source_control  view.search
 command_palette.open
-config.reload
+config.reload  config.open
+help.keybindings
+notifications.history
 ```
 
 要件:

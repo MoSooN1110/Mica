@@ -31,6 +31,8 @@ impl FromStr for KeyChord {
                 "tab" => code = Some(KeyCode::Tab),
                 "backspace" => code = Some(KeyCode::Backspace),
                 "delete" => code = Some(KeyCode::Delete),
+                "pageup" => code = Some(KeyCode::PageUp),
+                "pagedown" => code = Some(KeyCode::PageDown),
                 "up" => code = Some(KeyCode::Up),
                 "down" => code = Some(KeyCode::Down),
                 "left" => code = Some(KeyCode::Left),
@@ -68,6 +70,9 @@ impl Default for Keymap {
             ("ctrl-shift-s", "editor.save_as"),
             ("ctrl-alt-s", "editor.save_all"),
             ("ctrl-w", "editor.close"),
+            ("ctrl-alt-p", "editor.toggle_pin"),
+            ("ctrl-shift-pageup", "editor.move_tab_left"),
+            ("ctrl-shift-pagedown", "editor.move_tab_right"),
             ("ctrl-c", "editor.copy"),
             ("ctrl-x", "editor.cut"),
             ("ctrl-v", "editor.paste"),
@@ -98,10 +103,13 @@ impl Default for Keymap {
             ("ctrl-j", "view.toggle_bottom_panel"),
             ("ctrl-`", "terminal.toggle"),
             ("alt-enter", "terminal.open_reference"),
+            ("ctrl-alt-f", "terminal.search"),
             ("alt-1", "view.explorer"),
             ("alt-2", "view.source_control"),
             ("alt-3", "view.search"),
             ("ctrl-q", "app.quit"),
+            ("f1", "help.keybindings"),
+            ("alt-n", "notifications.history"),
         ];
         let bindings = defaults
             .into_iter()
@@ -133,6 +141,49 @@ impl Keymap {
         };
         self.bindings.get(&chord).map(String::as_str)
     }
+
+    pub fn bindings(&self) -> Vec<(String, &str)> {
+        let mut bindings = self
+            .bindings
+            .iter()
+            .map(|(chord, command)| (chord.label(), command.as_str()))
+            .collect::<Vec<_>>();
+        bindings.sort_by(|left, right| left.0.cmp(&right.0));
+        bindings
+    }
+}
+
+impl KeyChord {
+    fn label(&self) -> String {
+        let mut parts = Vec::new();
+        if self.modifiers.contains(KeyModifiers::CONTROL) {
+            parts.push("Ctrl".to_owned());
+        }
+        if self.modifiers.contains(KeyModifiers::ALT) {
+            parts.push("Alt".to_owned());
+        }
+        if self.modifiers.contains(KeyModifiers::SHIFT) {
+            parts.push("Shift".to_owned());
+        }
+        parts.push(match self.code {
+            KeyCode::Backspace => "Backspace".to_owned(),
+            KeyCode::Enter => "Enter".to_owned(),
+            KeyCode::Left => "Left".to_owned(),
+            KeyCode::Right => "Right".to_owned(),
+            KeyCode::Up => "Up".to_owned(),
+            KeyCode::Down => "Down".to_owned(),
+            KeyCode::Tab => "Tab".to_owned(),
+            KeyCode::BackTab => "BackTab".to_owned(),
+            KeyCode::Delete => "Delete".to_owned(),
+            KeyCode::PageUp => "PageUp".to_owned(),
+            KeyCode::PageDown => "PageDown".to_owned(),
+            KeyCode::F(number) => format!("F{number}"),
+            KeyCode::Char(' ') => "Space".to_owned(),
+            KeyCode::Char(character) => character.to_ascii_uppercase().to_string(),
+            _ => format!("{:?}", self.code),
+        });
+        parts.join("+")
+    }
 }
 
 #[cfg(test)]
@@ -144,5 +195,10 @@ mod tests {
         let keymap = Keymap::default();
         let event = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
         assert_eq!(keymap.resolve(event), Some("editor.save"));
+        assert!(keymap.bindings().iter().any(|(chord, command)| {
+            chord == "Ctrl+Shift+Space" && *command == "lsp.signature_help"
+        }));
+        let move_tab = KeyEvent::new(KeyCode::PageUp, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        assert_eq!(keymap.resolve(move_tab), Some("editor.move_tab_left"));
     }
 }

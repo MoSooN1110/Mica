@@ -40,6 +40,8 @@ pub struct IconSet {
     pub dirty: &'static str,
     /// Tab close button.
     pub close: &'static str,
+    /// Pinned-tab marker.
+    pub pin: &'static str,
     /// Source Control branch-line marker.
     pub branch: &'static str,
     /// "Ahead of upstream" arrow.
@@ -82,6 +84,7 @@ const UNICODE: IconSet = IconSet {
     ellipsis: "…",
     dirty: "●",
     close: "×",
+    pin: "◆",
     branch: "◉",
     arrow_up: "↑",
     arrow_down: "↓",
@@ -104,6 +107,7 @@ const ASCII: IconSet = IconSet {
     ellipsis: "...",
     dirty: "*",
     close: "x",
+    pin: "P",
     branch: "*",
     arrow_up: "^",
     arrow_down: "v",
@@ -374,6 +378,7 @@ mod tests {
             set.ellipsis,
             set.dirty,
             set.close,
+            set.pin,
             set.branch,
             set.arrow_up,
             set.arrow_down,

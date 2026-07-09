@@ -2,4 +2,4 @@
 source: tests/snapshots.rs
 expression: "redact(&text, &state.workspace)"
 ---
- EDITOR │ ◉ feature/snapshots ↑2 ↓1 ±4 Saved src/main.rs           ✗ 1  ▲ 1 │ LSP ready │ rust │ UTF-8 LF │ Ln 1, Col 1
+ EDITOR │ ◉ feature/snapshots ↑2 ↓1 ±4        ✗ 1  ▲ 1 │ LSP ready │ rust │ UTF-8 LF │ Ln 1, Col 1 │ Notifs 0 │ F1 Help

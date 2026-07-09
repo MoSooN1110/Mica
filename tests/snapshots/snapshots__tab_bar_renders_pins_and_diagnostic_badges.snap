@@ -1,0 +1,5 @@
+---
+source: tests/snapshots.rs
+expression: "redact(&text, &state.workspace)"
+---
+  ◆ main.rs E1

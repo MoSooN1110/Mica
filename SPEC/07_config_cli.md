@@ -72,6 +72,9 @@ reduced_decoration = false
 "ctrl-p"        = "workspace.open_file"
 "ctrl-shift-p"  = "command_palette.open"
 "ctrl-s"        = "editor.save"
+"ctrl-alt-f"    = "terminal.search"
+"f1"            = "help.keybindings"
+"alt-n"         = "notifications.history"
 # キーマップはコマンドIDへの割り当て。既定は01_ui.md参照
 ```
 
@@ -84,7 +87,12 @@ reduced_decoration = false
 
 ### 1.4 反映
 
-- 1.0では再起動での反映でよい。設定リロードコマンド(`config.reload`)の提供は任意
+- `config.reload`でユーザー設定とワークスペース設定を再読込する
+- 起動後は対象設定ファイルを監視し、作成・更新・置換時に同じ再読込経路を実行する
+- 設定とキーマップの解析、および外部テーマの読込はUIスレッド外で行う
+- 読込に失敗したテーマは現在のテーマを維持し、警告を通知する
+- 実行中プロセスに関わる設定（ターミナルのシェル等）は次回起動するプロセスから反映する
+- `config.open`は`<workspace>/.mica/config.toml`を開く。未作成時は、既存パスを上書きせずスキーマコメント付き雛形を生成する
 
 ---
 

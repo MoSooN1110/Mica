@@ -9,8 +9,8 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     app::{
-        AppState, BottomPanelView, DiagnosticRow, Focus, GitSection, Overlay, PathAction,
-        SidebarView, WorkspaceSearchRow,
+        AppState, BottomPanelView, DiagnosticRow, Focus, GitSection, NotificationLevel, Overlay,
+        PathAction, SidebarView, WorkspaceSearchRow,
     },
     buffer::LineEnding,
     config::IconMode,
@@ -98,6 +98,9 @@ pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) -> Regions {
         render_bottom(frame, regions.bottom, state, theme);
     }
     render_status(frame, regions.status, state, theme);
+    if state.overlay.is_none() {
+        render_notification_toast(frame, area, state, theme);
+    }
     if let Some(overlay) = &state.overlay {
         match overlay {
             Overlay::CommandPalette => render_palette(frame, area, state, theme),
@@ -153,6 +156,23 @@ pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) -> Regions {
             Overlay::ConfirmQuitTerminal => {
                 render_terminal_quit_confirmation(frame, area, theme, state.settings.ui.icon_mode)
             }
+            Overlay::TerminalSearch => render_text_prompt(
+                frame,
+                area,
+                &format!(
+                    " TERMINAL FIND  {}/{} ",
+                    if state.terminal_search_matches.is_empty() {
+                        0
+                    } else {
+                        state.terminal_search_selected + 1
+                    },
+                    state.terminal_search_matches.len()
+                ),
+                state,
+                theme,
+            ),
+            Overlay::KeybindingHelp => render_keybinding_help(frame, area, state, theme),
+            Overlay::NotificationHistory => render_notification_history(frame, area, state, theme),
             Overlay::LspHover => render_lsp_hover(frame, area, state, theme),
             Overlay::LspCompletion => render_lsp_completion(frame, area, state, theme),
             Overlay::LspLocations => render_lsp_locations(frame, area, state, theme),
@@ -989,17 +1009,54 @@ fn render_editor_group(
             Constraint::Min(1),
         ])
         .split(area);
-    let mut titles = state
-        .tabs
+    let tab_order = state.visual_tab_order();
+    let mut titles = tab_order
         .iter()
+        .filter_map(|index| state.tabs.get(*index))
         .map(|tab| {
             let dirty_style = Style::default().fg(theme.git_modified).bg(theme.surface);
             let text_style = Style::default().fg(theme.text_muted).bg(theme.surface);
-            let mut spans = vec![Span::styled(format!(" {}", tab.title()), text_style)];
+            let mut spans = vec![Span::styled(" ", text_style)];
+            if tab.pinned {
+                spans.push(Span::styled(
+                    format!("{} ", icon_set.pin),
+                    Style::default().fg(theme.accent).bg(theme.surface),
+                ));
+            }
+            spans.push(Span::styled(tab.title(), text_style));
             if tab.buffer.is_dirty() {
                 spans.push(Span::styled(format!(" {}", icon_set.dirty), dirty_style));
             }
-            spans.push(Span::styled(format!(" {} ", icon_set.close), text_style));
+            let (errors, warnings) = tab.buffer.path().map_or((0, 0), |path| {
+                state.diagnostics.for_file(path).fold(
+                    (0usize, 0usize),
+                    |(errors, warnings), diagnostic| match diagnostic.severity {
+                        crate::diagnostics::DiagnosticSeverity::Error => (errors + 1, warnings),
+                        crate::diagnostics::DiagnosticSeverity::Warning => (errors, warnings + 1),
+                        _ => (errors, warnings),
+                    },
+                )
+            });
+            if errors > 0 {
+                spans.push(Span::styled(
+                    format!(" E{errors}"),
+                    Style::default()
+                        .fg(theme.diagnostic_error)
+                        .bg(theme.surface),
+                ));
+            } else if warnings > 0 {
+                spans.push(Span::styled(
+                    format!(" W{warnings}"),
+                    Style::default()
+                        .fg(theme.diagnostic_warning)
+                        .bg(theme.surface),
+                ));
+            }
+            if tab.pinned {
+                spans.push(Span::styled(" ", text_style));
+            } else {
+                spans.push(Span::styled(format!(" {} ", icon_set.close), text_style));
+            }
             Line::from(spans)
         })
         .collect::<Vec<_>>();
@@ -1027,7 +1084,9 @@ fn render_editor_group(
     .select(if state.git_diff_active && focused {
         state.tabs.len()
     } else {
-        tab_index.unwrap_or(0)
+        tab_index
+            .and_then(|index| state.tab_visual_index(index))
+            .unwrap_or(0)
     })
     .style(Style::default().fg(theme.text_muted).bg(theme.surface))
     .highlight_style(
@@ -1697,6 +1756,9 @@ fn diagnostic_style(
 fn render_terminal(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let content_height = usize::from(area.height.saturating_sub(1));
     let snapshot = state.terminal.snapshot(state.terminal_scroll_offset);
+    let history_start = state
+        .terminal
+        .visible_history_start(state.terminal_scroll_offset);
     let title = snapshot.title.as_deref().unwrap_or("Terminal");
     let status = if state.terminal_running {
         "running".to_owned()
@@ -1715,7 +1777,17 @@ fn render_terminal(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         .iter()
         .take(content_height)
         .enumerate()
-        .map(|(row, line)| terminal_line(line, row, state.terminal_selection, theme))
+        .map(|(row, line)| {
+            terminal_line(
+                line,
+                row,
+                history_start + row,
+                state.terminal_selection,
+                &state.terminal_search_matches,
+                state.terminal_search_selected,
+                theme,
+            )
+        })
         .collect::<Vec<_>>();
     frame.render_widget(
         Paragraph::new(lines)
@@ -1754,9 +1826,17 @@ fn render_terminal(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
 fn terminal_line(
     cells: &[crate::terminal::TerminalCell],
     row: usize,
+    history_row: usize,
     selection: Option<((usize, usize), (usize, usize))>,
+    search_matches: &[crate::terminal::TerminalSearchMatch],
+    selected_search_match: usize,
     theme: &Theme,
 ) -> Line<'static> {
+    let row_matches = search_matches
+        .iter()
+        .enumerate()
+        .filter(|(_, matched)| matched.history_row == history_row)
+        .collect::<Vec<_>>();
     let spans = cells
         .iter()
         .enumerate()
@@ -1769,6 +1849,17 @@ fn terminal_line(
             }
             if terminal_cell_selected(selection, row, column) {
                 background = theme.selection;
+            }
+            if let Some((index, _)) = row_matches
+                .iter()
+                .find(|(_, matched)| (matched.start_column..matched.end_column).contains(&column))
+                .copied()
+            {
+                background = if index == selected_search_match {
+                    theme.active_line
+                } else {
+                    theme.selection
+                };
             }
             let mut modifier = Modifier::empty();
             modifier.set(Modifier::BOLD, cell.style.bold);
@@ -1839,9 +1930,9 @@ fn git_diff_lines(state: &AppState, theme: &Theme, limit: usize) -> Vec<Line<'st
             let (color, base_background) = if is_hunk_header {
                 (theme.accent, theme.surface_raised)
             } else if is_added {
-                (theme.git_added, theme.diff_add_bg)
+                (theme.git_added, theme.surface)
             } else if is_deleted {
-                (theme.git_deleted, theme.diff_delete_bg)
+                (theme.git_deleted, theme.surface)
             } else {
                 (theme.text_muted, theme.surface)
             };
@@ -1850,7 +1941,7 @@ fn git_diff_lines(state: &AppState, theme: &Theme, limit: usize) -> Vec<Line<'st
                 Style::default()
                     .fg(color)
                     .bg(if selected {
-                        theme.active_line
+                        theme.diff_add_bg
                     } else {
                         base_background
                     })
@@ -2064,6 +2155,14 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
     } else {
         Vec::new()
     };
+    let help_segment = vec![Span::styled(
+        "F1 Help",
+        Style::default().fg(theme.accent).bg(background),
+    )];
+    let notification_segment = vec![Span::styled(
+        format!("Notifs {}", state.notification_history.len()),
+        Style::default().fg(theme.text_muted).bg(background),
+    )];
 
     let left = join_segments(
         vec![pane_segment, git_segment],
@@ -2079,6 +2178,8 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
             language_segment,
             encoding_segment,
             position_segment,
+            notification_segment,
+            help_segment,
         ],
         icon_set.separator,
         theme,
@@ -2102,10 +2203,8 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         ])
         .split(area);
     frame.render_widget(Paragraph::new(Line::from(left)).style(base), columns[0]);
-    let message = state.notification.as_deref().unwrap_or("");
     frame.render_widget(
-        Paragraph::new(format!(" {message}"))
-            .style(Style::default().fg(theme.text_muted).bg(background)),
+        Paragraph::new("").style(Style::default().fg(theme.text_muted).bg(background)),
         columns[1],
     );
     frame.render_widget(Paragraph::new(Line::from(right)).style(base), columns[2]);
@@ -2177,6 +2276,186 @@ fn render_palette(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme
         })
         .collect::<Vec<_>>();
     frame.render_widget(List::new(commands), rows[1]);
+}
+
+fn render_keybinding_help(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let bindings = state.active_keybindings();
+    let width = area.width.saturating_sub(4).min(84);
+    let height = u16::try_from(bindings.len().saturating_add(2))
+        .unwrap_or(u16::MAX)
+        .min(area.height.saturating_sub(4))
+        .max(3);
+    let popup = Rect::new(
+        area.x + (area.width.saturating_sub(width)) / 2,
+        area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    let visible = usize::from(height.saturating_sub(2));
+    let start = state
+        .help_selected
+        .saturating_sub(visible.saturating_sub(1));
+    let row_width = usize::from(width.saturating_sub(2));
+    let items = bindings
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+        .map(|(index, (chord, id, title))| {
+            let selected = index == state.help_selected;
+            let background = if selected {
+                theme.selection
+            } else {
+                theme.surface_raised
+            };
+            let base = Style::default().fg(theme.text).bg(background);
+            let mut spans = vec![
+                Span::styled(
+                    format!("{chord:<18}"),
+                    Style::default().fg(theme.accent).bg(background),
+                ),
+                Span::styled(format!("{title:<34}"), base),
+                Span::styled(
+                    (*id).to_owned(),
+                    Style::default().fg(theme.text_faint).bg(background),
+                ),
+            ];
+            spans = pad_to_width(spans, row_width, background);
+            ListItem::new(Line::from(spans)).style(base)
+        })
+        .collect::<Vec<_>>();
+    let context = match state.help_context {
+        Focus::Editor => "EDITOR",
+        Focus::Sidebar => "SIDEBAR",
+        Focus::BottomPanel => "BOTTOM PANEL",
+        Focus::Overlay => "OVERLAY",
+    };
+    frame.render_widget(
+        List::new(items).block(overlay_block(
+            format!(" ACTIVE SHORTCUTS · {context} · F1/ESC CLOSE "),
+            theme,
+            state.settings.ui.icon_mode,
+        )),
+        popup,
+    );
+}
+
+fn render_notification_toast(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let Some(message) = state.notification.as_deref() else {
+        return;
+    };
+    let level = state
+        .notification_history
+        .back()
+        .map_or(NotificationLevel::Info, |entry| entry.level);
+    let border = notification_color(level, theme);
+    let message_width = UnicodeWidthStr::width(message).min(58);
+    let width = u16::try_from(message_width.saturating_add(4))
+        .unwrap_or(u16::MAX)
+        .min(area.width);
+    let height = 3.min(area.height);
+    let popup = Rect::new(
+        area.right().saturating_sub(width),
+        area.bottom().saturating_sub(height + 1),
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(message)
+            .block(overlay_block_bordered(
+                " NOTIFICATION ",
+                border,
+                theme,
+                state.settings.ui.icon_mode,
+            ))
+            .style(Style::default().fg(theme.text).bg(theme.surface_raised)),
+        popup,
+    );
+}
+
+fn render_notification_history(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let width = area.width.saturating_sub(4).min(90);
+    let height = area.height.saturating_sub(4).clamp(3, 24);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    let visible = usize::from(height.saturating_sub(2));
+    let start = state
+        .notification_selected
+        .saturating_sub(visible.saturating_sub(1));
+    let row_width = usize::from(width.saturating_sub(2));
+    let items = state
+        .notification_history
+        .iter()
+        .rev()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+        .map(|(index, entry)| {
+            let selected = index == state.notification_selected;
+            let background = if selected {
+                theme.selection
+            } else {
+                theme.surface_raised
+            };
+            let level = match entry.level {
+                NotificationLevel::Info => "I",
+                NotificationLevel::Warning => "W",
+                NotificationLevel::Error => "E",
+            };
+            let seconds = entry.unix_seconds % 86_400;
+            let timestamp = format!(
+                "{:02}:{:02}:{:02}Z",
+                seconds / 3_600,
+                (seconds % 3_600) / 60,
+                seconds % 60
+            );
+            let mut spans = vec![
+                Span::styled(
+                    format!(" {level} "),
+                    Style::default()
+                        .fg(notification_color(entry.level, theme))
+                        .bg(background)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{timestamp}  "),
+                    Style::default().fg(theme.text_faint).bg(background),
+                ),
+                Span::styled(
+                    entry.message.clone(),
+                    Style::default().fg(theme.text).bg(background),
+                ),
+            ];
+            spans = pad_to_width(spans, row_width, background);
+            ListItem::new(Line::from(spans))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        List::new(items).block(overlay_block(
+            format!(
+                " NOTIFICATION HISTORY · {} · ALT+N/ESC CLOSE ",
+                state.notification_history.len()
+            ),
+            theme,
+            state.settings.ui.icon_mode,
+        )),
+        popup,
+    );
+}
+
+fn notification_color(level: NotificationLevel, theme: &Theme) -> Color {
+    match level {
+        NotificationLevel::Info => theme.accent,
+        NotificationLevel::Warning => theme.diagnostic_warning,
+        NotificationLevel::Error => theme.diagnostic_error,
+    }
 }
 
 fn render_path_input(

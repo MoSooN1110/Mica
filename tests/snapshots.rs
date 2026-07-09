@@ -16,11 +16,14 @@
 //! before the snapshot assertion, so the snapshot itself never encodes a
 //! machine-specific path.
 
-use std::{fs, path::PathBuf};
+use std::{collections::VecDeque, fs, path::PathBuf};
 
-use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use mica::{
-    app::{AppState, BottomPanelView, BufferTab, Focus, Overlay, SidebarView},
+    app::{
+        AppState, BottomPanelView, BufferTab, Focus, NotificationEntry, NotificationLevel, Overlay,
+        SidebarView,
+    },
     buffer::TextBuffer,
     command::Command,
     config::{IconMode, Keymap, Settings},
@@ -81,6 +84,7 @@ fn open_main_tab(workspace: &WorkspaceRoot) -> BufferTab {
         view: EditorView::default(),
         highlights: Vec::new(),
         syntax_generation: 0,
+        pinned: false,
     }
 }
 
@@ -273,6 +277,10 @@ fn full_text(buffer: &Buffer) -> String {
 /// snapshots never encode a machine-specific path.
 fn redact(text: &str, workspace: &WorkspaceRoot) -> String {
     text.replace(&workspace.as_path().display().to_string(), "<WORKSPACE>")
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn style_line(buffer: &Buffer, x: u16, y: u16) -> String {
@@ -382,6 +390,34 @@ fn git_diff_panel_renders_unified_hunks() {
 }
 
 #[test]
+fn selected_git_hunk_uses_green_background_and_other_hunks_do_not() {
+    let mut state = base_state("git-diff-focus");
+    state.git_diff = Some(main_rs_diff());
+    state.git_diff_active = true;
+    state.git_hunk_selected = 1;
+    state.focus = Focus::Editor;
+
+    let theme = Theme::mica_dark(ColorMode::TrueColor);
+    let (regions, terminal) = draw(&state, &theme, 100, 30);
+    let buffer = terminal.backend().buffer();
+    let selected_row = (0..regions.editor.height)
+        .find(|row| row_text(buffer, regions.editor, *row).contains("println!(\"value\")"))
+        .expect("selected hunk row");
+    let other_row = (0..regions.editor.height)
+        .find(|row| row_text(buffer, regions.editor, *row).contains("// banner"))
+        .expect("non-selected hunk row");
+
+    assert_eq!(
+        cell_at(buffer, regions.editor.x, regions.editor.y + selected_row).bg,
+        theme.diff_add_bg
+    );
+    assert_eq!(
+        cell_at(buffer, regions.editor.x, regions.editor.y + other_row).bg,
+        theme.surface
+    );
+}
+
+#[test]
 fn split_editor_groups_render_side_by_side() {
     let mut state = base_state("editor-split");
     state.sidebar_visible = false;
@@ -397,6 +433,24 @@ fn split_editor_groups_render_side_by_side() {
     let theme = Theme::mica_dark(ColorMode::Ansi256);
     let (regions, terminal) = draw(&state, &theme, 100, 20);
     let text = region_text(terminal.backend().buffer(), regions.editor);
+    insta::assert_snapshot!(redact(&text, &state.workspace));
+}
+
+#[test]
+fn tab_bar_renders_pins_and_diagnostic_badges() {
+    let mut state = base_state("tab-pin-badge");
+    let mut main = open_main_tab(&state.workspace);
+    let diagnostics = main_rs_diagnostics(&main);
+    main.pinned = true;
+    state.tabs.push(main);
+    state.active_tab = Some(0);
+    state
+        .diagnostics
+        .replace_source(DiagnosticSource::Compiler, 1, diagnostics);
+
+    let theme = Theme::mica_dark(ColorMode::Ansi256);
+    let (regions, terminal) = draw(&state, &theme, 80, 12);
+    let text = region_text(terminal.backend().buffer(), regions.tabs);
     insta::assert_snapshot!(redact(&text, &state.workspace));
 }
 
@@ -421,6 +475,57 @@ fn editor_mouse_wheel_dispatches_scroll_command() {
         command,
         Some(mica::command::Command::EditorScroll(3))
     ));
+}
+
+#[test]
+fn tab_mouse_drag_reorders_and_control_click_pins() {
+    let mut state = base_state("tab-drag");
+    state.tabs.push(open_main_tab(&state.workspace));
+    let utils_path = state.workspace.as_path().join("src/utils.rs");
+    state.tabs.push(BufferTab::new(
+        TextBuffer::open(&utils_path, false).expect("open utils.rs"),
+    ));
+    state.active_tab = Some(0);
+    let theme = Theme::mica_dark(ColorMode::Ansi256);
+    let (regions, _) = draw(&state, &theme, 100, 24);
+
+    let down = command_for_mouse(
+        &state,
+        regions,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: regions.tabs.x + 2,
+            row: regions.tabs.y,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(matches!(down, Some(Command::BeginTabDrag(0))));
+    state.update(mica::app::AppEvent::Command(down.expect("tab down")));
+    let drag = command_for_mouse(
+        &state,
+        regions,
+        MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: regions.tabs.x + 16,
+            row: regions.tabs.y,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(matches!(drag, Some(Command::ReorderTab { from: 0, to: 1 })));
+    state.update(mica::app::AppEvent::Command(drag.expect("tab drag")));
+    assert_eq!(state.visual_tab_order(), vec![1, 0]);
+
+    let pin = command_for_mouse(
+        &state,
+        regions,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: regions.tabs.x + 2,
+            row: regions.tabs.y,
+            modifiers: KeyModifiers::CONTROL,
+        },
+    );
+    assert!(matches!(pin, Some(Command::TogglePinTab(1))));
 }
 
 /// Bullet: Problemsパネル.
@@ -480,6 +585,82 @@ fn command_palette_overlay_filters_commands() {
     let (_, terminal) = draw(&state, &theme, 80, 24);
     let text = full_text(terminal.backend().buffer());
     insta::assert_snapshot!(redact(&text, &state.workspace));
+}
+
+#[test]
+fn keybinding_help_lists_active_shortcuts_and_status_opens_it() {
+    let mut state = base_state("keybinding-help");
+    state.tabs.push(open_main_tab(&state.workspace));
+    state.active_tab = Some(0);
+    state.focus = Focus::Editor;
+    state.help_context = Focus::Editor;
+    state.overlay = Some(Overlay::KeybindingHelp);
+
+    let theme = Theme::mica_dark(ColorMode::Ansi256);
+    let (regions, terminal) = draw(&state, &theme, 100, 30);
+    let text = full_text(terminal.backend().buffer());
+    insta::assert_snapshot!(redact(&text, &state.workspace));
+
+    state.overlay = None;
+    let command = command_for_mouse(
+        &state,
+        regions,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: regions.status.right().saturating_sub(2),
+            row: regions.status.y,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(matches!(
+        command,
+        Some(Command::Invoke(id)) if id == "help.keybindings"
+    ));
+}
+
+#[test]
+fn notification_toast_history_and_status_mouse_path_render() {
+    let mut state = base_state("notification-history");
+    state.notification_history = VecDeque::from([
+        NotificationEntry {
+            message: "Saved src/main.rs".to_owned(),
+            level: NotificationLevel::Info,
+            unix_seconds: 3_661,
+        },
+        NotificationEntry {
+            message: "Git push failed".to_owned(),
+            level: NotificationLevel::Error,
+            unix_seconds: 7_322,
+        },
+    ]);
+    state.notification = Some("Git push failed".to_owned());
+    state.notification_context = Focus::Editor;
+    state.overlay = Some(Overlay::NotificationHistory);
+    state.focus = Focus::Overlay;
+
+    let theme = Theme::mica_dark(ColorMode::Ansi256);
+    let (regions, terminal) = draw(&state, &theme, 100, 24);
+    let text = full_text(terminal.backend().buffer());
+    insta::assert_snapshot!(redact(&text, &state.workspace));
+
+    state.overlay = None;
+    state.focus = Focus::Editor;
+    let (_, terminal) = draw(&state, &theme, 100, 24);
+    assert!(full_text(terminal.backend().buffer()).contains("Git push failed"));
+    let command = command_for_mouse(
+        &state,
+        regions,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: regions.status.right().saturating_sub(15),
+            row: regions.status.y,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(matches!(
+        command,
+        Some(Command::Invoke(id)) if id == "notifications.history"
+    ));
 }
 
 /// Bullet: コマンドパレット、ダイアログ (confirmation dialog half).

@@ -10,7 +10,7 @@ use crate::{
     workspace::TreeEntryKind,
 };
 
-use super::Regions;
+use super::{Regions, icons};
 
 pub fn command_for_key(state: &AppState, event: KeyEvent) -> Option<Command> {
     if !matches!(event.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
@@ -109,6 +109,20 @@ pub fn command_for_key(state: &AppState, event: KeyEvent) -> Option<Command> {
                     Some(Command::SearchPrevious)
                 }
                 KeyCode::Enter => Some(Command::SearchNext),
+                KeyCode::Backspace => Some(Command::PaletteBackspace),
+                KeyCode::Char(character) if !event.modifiers.contains(KeyModifiers::CONTROL) => {
+                    Some(Command::PaletteInput(character))
+                }
+                _ => None,
+            };
+        }
+        if matches!(state.overlay, Some(Overlay::TerminalSearch)) {
+            return match event.code {
+                KeyCode::Esc => Some(Command::Cancel),
+                KeyCode::Enter if event.modifiers.contains(KeyModifiers::SHIFT) => {
+                    Some(Command::TerminalSearchPrevious)
+                }
+                KeyCode::Enter => Some(Command::TerminalSearchNext),
                 KeyCode::Backspace => Some(Command::PaletteBackspace),
                 KeyCode::Char(character) if !event.modifiers.contains(KeyModifiers::CONTROL) => {
                     Some(Command::PaletteInput(character))
@@ -341,6 +355,31 @@ pub fn command_for_key(state: &AppState, event: KeyEvent) -> Option<Command> {
 }
 
 pub fn command_for_mouse(state: &AppState, regions: Regions, event: MouseEvent) -> Option<Command> {
+    if matches!(
+        state.overlay,
+        Some(Overlay::KeybindingHelp | Overlay::NotificationHistory)
+    ) {
+        return match event.kind {
+            MouseEventKind::ScrollUp => Some(Command::MoveUp { extend: false }),
+            MouseEventKind::ScrollDown => Some(Command::MoveDown { extend: false }),
+            _ => None,
+        };
+    }
+    if event.kind == MouseEventKind::Up(MouseButton::Left) && state.tab_drag_source.is_some() {
+        return Some(Command::EndTabDrag);
+    }
+    if event.kind == MouseEventKind::Down(MouseButton::Left)
+        && contains(regions.status, (event.column, event.row))
+        && event.column >= regions.status.right().saturating_sub(9)
+    {
+        return Some(Command::Invoke("help.keybindings".to_owned()));
+    }
+    if event.kind == MouseEventKind::Down(MouseButton::Left)
+        && contains(regions.status, (event.column, event.row))
+        && event.column >= regions.status.right().saturating_sub(22)
+    {
+        return Some(Command::Invoke("notifications.history".to_owned()));
+    }
     if event.kind == MouseEventKind::Down(MouseButton::Left)
         && contains(regions.bottom, (event.column, event.row))
         && event.row == regions.bottom.y
@@ -467,7 +506,7 @@ pub fn command_for_mouse(state: &AppState, regions: Regions, event: MouseEvent) 
             }
         });
     }
-    if left_down && contains(regions.tabs, point) {
+    if (left_down || left_drag) && contains(regions.tabs, point) {
         let group_x = if state.split_tab.is_some() && state.split_focus_right {
             regions.tabs.x + regions.tabs.width / 2
         } else {
@@ -475,15 +514,60 @@ pub fn command_for_mouse(state: &AppState, regions: Regions, event: MouseEvent) 
         };
         let target = usize::from(event.column.saturating_sub(group_x));
         let mut start = 0usize;
-        for (index, tab) in state.tabs.iter().enumerate() {
-            let dirty = if tab.buffer.is_dirty() { " ●" } else { "" };
-            let label = format!(" {}{dirty} × ", tab.title());
-            let width = UnicodeWidthStr::width(label.as_str()) + usize::from(index > 0);
+        let icon_set = icons(state.settings.ui.icon_mode);
+        for index in state.visual_tab_order() {
+            let tab = &state.tabs[index];
+            let pin = if tab.pinned {
+                format!("{} ", icon_set.pin)
+            } else {
+                String::new()
+            };
+            let dirty = if tab.buffer.is_dirty() {
+                format!(" {}", icon_set.dirty)
+            } else {
+                String::new()
+            };
+            let (errors, warnings) = tab.buffer.path().map_or((0, 0), |path| {
+                state.diagnostics.for_file(path).fold(
+                    (0usize, 0usize),
+                    |(errors, warnings), diagnostic| match diagnostic.severity {
+                        crate::diagnostics::DiagnosticSeverity::Error => (errors + 1, warnings),
+                        crate::diagnostics::DiagnosticSeverity::Warning => (errors, warnings + 1),
+                        _ => (errors, warnings),
+                    },
+                )
+            });
+            let diagnostic = if errors > 0 {
+                format!(" E{errors}")
+            } else if warnings > 0 {
+                format!(" W{warnings}")
+            } else {
+                String::new()
+            };
+            let close = if tab.pinned {
+                " ".to_owned()
+            } else {
+                format!(" {} ", icon_set.close)
+            };
+            let label = format!(" {pin}{}{dirty}{diagnostic}{close}", tab.title());
+            let width = UnicodeWidthStr::width(label.as_str()) + usize::from(start > 0);
             if target < start + width {
-                return Some(if target + 3 >= start + width {
+                if left_drag {
+                    return state
+                        .tab_drag_source
+                        .filter(|source| *source != index)
+                        .map(|source| Command::ReorderTab {
+                            from: source,
+                            to: index,
+                        });
+                }
+                if event.modifiers.contains(KeyModifiers::CONTROL) {
+                    return Some(Command::TogglePinTab(index));
+                }
+                return Some(if !tab.pinned && target + 3 >= start + width {
                     Command::CloseTab(index)
                 } else {
-                    Command::SelectTab(index)
+                    Command::BeginTabDrag(index)
                 });
             }
             start += width;

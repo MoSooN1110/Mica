@@ -27,6 +27,7 @@ pub enum ColumnHint {
 
 #[derive(Debug)]
 pub enum AppEvent {
+    Tick,
     Command(Command),
     FileOpened {
         path: PathBuf,
@@ -116,6 +117,12 @@ pub enum AppEvent {
         source: String,
         message: String,
     },
+    ConfigReloaded {
+        settings: crate::config::Settings,
+        keymap: crate::config::Keymap,
+        warnings: Vec<String>,
+    },
+    ConfigFilePrepared(Result<PathBuf, String>),
     LspClient {
         language: String,
         event: crate::lsp::LspClientEvent,
@@ -138,6 +145,8 @@ pub enum Effect {
         column: Option<ColumnHint>,
     },
     ScanWorkspace,
+    ReloadConfig,
+    PrepareConfigFile(PathBuf),
     Save {
         tab: usize,
         snapshot: SaveSnapshot,

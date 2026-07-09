@@ -1,0 +1,28 @@
+---
+source: tests/snapshots.rs
+expression: "redact(&text, &state.workspace)"
+---
+▎E  EXPLORER                    │  Welcome
+ G ▎▾ src                       │▎ Mica Workspace
+ S  │╭ NOTIFICATION HISTORY · 2 · ALT+N/ESC CLOSE ────────────────────────────────────────────╮
+    ││ E 02:02:02Z  Git push failed                                                           │
+    ≡│ I 01:01:01Z  Saved src/main.rs                                                         │
+    ≡│                                                                                        │
+     │                                                                                        │
+     │                                                                                        │
+     │                                                                                        │
+     │                                                                                        │
+     │                                                                                        │
+     │                                                                                        │
+     │                                                                                        │
+     │                                                                                        │
+     │                                                                                        │
+     │                                                                                        │
+     │                                                                                        │
+     │                                                                                        │
+     │                                                                                        │
+     │                                                                                        │
+     │                                                                                        │
+     ╰────────────────────────────────────────────────────────────────────────────────────────╯
+                                │
+ OVERLAY                                                                         Notifs 2 │ F1 Help

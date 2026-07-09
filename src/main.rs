@@ -26,7 +26,7 @@ use mica::{
     buffer::{BufferError, SaveSnapshot, TextBuffer, atomic_save_if_unchanged, disk_content_hash},
     cli::{Cli, CliLocale},
     command::Command,
-    config::{ConfigLoad, Keymap, Locale},
+    config::{ConfigLoad, ConfigWatcher, Keymap, Locale},
     editor::highlight,
     git::{GitBackend, GitCliBackend},
     lsp::{LspClient, LspClientConfig},
@@ -108,28 +108,36 @@ fn run() -> Result<(), Box<dyn Error>> {
                     restored_paths = restored
                         .buffers
                         .iter()
-                        .map(|(path, _)| path.clone())
+                        .map(|buffer| buffer.path.clone())
                         .filter(|path| path.is_file())
                         .collect();
                 }
                 Ok(None) => {}
-                Err(error) => state.notification = Some(error.to_string()),
+                Err(error) => state.notify(error.to_string()),
             }
             match store.discover_recovery() {
                 Ok(recovery) if recovery.buffers.is_empty() => {
                     if let Err(error) = discard_recovery(&recovery.journal_paths) {
-                        state.notification = Some(error.to_string());
+                        state.notify(error.to_string());
                     }
                 }
                 Ok(recovery) => state.offer_recovery(recovery),
-                Err(error) => state.notification = Some(error.to_string()),
+                Err(error) => state.notify(error.to_string()),
             }
             session_journal = Some(SessionJournal::start(store));
         }
-        Err(error) => state.notification = Some(format!("Session recovery unavailable: {error}")),
+        Err(error) => state.notify(format!("Session recovery unavailable: {error}")),
     }
     let (sender, receiver) = mpsc::channel();
-    let mut runtime = Runtime::new(sender.clone());
+    let (theme_sender, theme_receiver) = mpsc::channel();
+    let config_runtime = ConfigRuntime {
+        workspace: target.workspace.clone(),
+        explicit: cli.config.clone(),
+        safe_mode: cli.safe_mode,
+        no_mouse: cli.no_mouse,
+        locale: cli.locale,
+    };
+    let mut runtime = Runtime::new(sender.clone(), theme_sender, config_runtime.clone());
     execute_effects(
         &state,
         vec![Effect::ScanWorkspace, Effect::RefreshGit],
@@ -170,7 +178,28 @@ fn run() -> Result<(), Box<dyn Error>> {
         Ok(watcher) => Some(watcher),
         Err(error) => {
             tracing::warn!(%error, "file watcher unavailable");
-            state.notification = Some(format!("File watcher unavailable: {error}"));
+            state.notify(format!("File watcher unavailable: {error}"));
+            None
+        }
+    };
+    let config_watch_sender = sender.clone();
+    let config_watcher = ConfigWatcher::spawn(
+        ConfigLoad::candidate_paths(&target.workspace, cli.config.as_deref(), cli.safe_mode),
+        move || {
+            let _ = config_watch_sender.send(AppEvent::Command(Command::Invoke(
+                mica::command::CONFIG_RELOAD.to_owned(),
+            )));
+        },
+    );
+    let _config_watcher = match config_watcher {
+        Ok(watcher) => Some(watcher),
+        Err(error) if cli.safe_mode => {
+            tracing::debug!(%error, "configuration watcher disabled in safe mode");
+            None
+        }
+        Err(error) => {
+            tracing::warn!(%error, "configuration watcher unavailable");
+            state.notify(format!("Configuration watcher unavailable: {error}"));
             None
         }
     };
@@ -186,7 +215,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let theme = match Theme::load(&state.settings.ui.theme, color_mode) {
         Ok(theme) => theme,
         Err(error) => {
-            state.notification = Some(format!("Theme: {error}; using mica-dark"));
+            state.notify(format!("Theme: {error}; using mica-dark"));
             Theme::mica_dark(color_mode)
         }
     };
@@ -196,8 +225,11 @@ fn run() -> Result<(), Box<dyn Error>> {
     event_loop(
         &mut terminal,
         &mut state,
-        &theme,
-        receiver,
+        theme,
+        EventReceivers {
+            app: receiver,
+            theme: theme_receiver,
+        },
         sender,
         session_journal.as_ref(),
         &mut runtime,
@@ -212,8 +244,8 @@ fn run() -> Result<(), Box<dyn Error>> {
 fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     state: &mut AppState,
-    theme: &Theme,
-    receiver: Receiver<AppEvent>,
+    mut theme: Theme,
+    receivers: EventReceivers,
     sender: Sender<AppEvent>,
     session_journal: Option<&SessionJournal>,
     runtime: &mut Runtime,
@@ -228,8 +260,22 @@ fn event_loop(
     // is exactly when `needs_redraw` gets set again before the next draw.
     let mut needs_redraw = true;
     while !state.should_quit {
+        let had_notification = state.notification.is_some();
+        state.update(AppEvent::Tick);
+        if had_notification != state.notification.is_some() {
+            needs_redraw = true;
+        }
+        while let Ok(update) = receivers.theme.try_recv() {
+            needs_redraw = true;
+            match update {
+                ThemeUpdate::Loaded(next) => theme = next,
+                ThemeUpdate::Failed(error) => {
+                    state.notify(format!("Theme reload failed: {error}"));
+                }
+            }
+        }
         for _ in 0..256 {
-            let Ok(event) = receiver.try_recv() else {
+            let Ok(event) = receivers.app.try_recv() else {
                 break;
             };
             needs_redraw = true;
@@ -241,7 +287,7 @@ fn event_loop(
         }
         if needs_redraw {
             terminal.draw(|frame| {
-                regions = render(frame, state, theme);
+                regions = render(frame, state, &theme);
             })?;
             needs_redraw = false;
         }
@@ -278,16 +324,29 @@ fn event_loop(
     Ok(())
 }
 
+struct EventReceivers {
+    app: Receiver<AppEvent>,
+    theme: Receiver<ThemeUpdate>,
+}
+
 struct Runtime {
     terminal: Option<TerminalRuntime>,
     lsp: HashMap<String, LspClient>,
+    theme_events: Sender<ThemeUpdate>,
+    config: ConfigRuntime,
 }
 
 impl Runtime {
-    fn new(events: Sender<AppEvent>) -> Self {
+    fn new(
+        events: Sender<AppEvent>,
+        theme_events: Sender<ThemeUpdate>,
+        config: ConfigRuntime,
+    ) -> Self {
         Self {
             terminal: Some(TerminalRuntime::spawn(events)),
             lsp: HashMap::new(),
+            theme_events,
+            config,
         }
     }
 
@@ -301,6 +360,20 @@ impl Runtime {
         self.lsp.clear();
         self.terminal.take();
     }
+}
+
+#[derive(Clone)]
+struct ConfigRuntime {
+    workspace: std::path::PathBuf,
+    explicit: Option<std::path::PathBuf>,
+    safe_mode: bool,
+    no_mouse: bool,
+    locale: Option<CliLocale>,
+}
+
+enum ThemeUpdate {
+    Loaded(Theme),
+    Failed(String),
 }
 
 enum TerminalRuntimeCommand {
@@ -462,6 +535,60 @@ fn execute_effects(
                     )
                     .map_err(|error| error.to_string());
                     let _ = sender.send(AppEvent::TreeLoaded(result));
+                });
+            }
+            Effect::ReloadConfig => {
+                let context = runtime.config.clone();
+                let theme_events = runtime.theme_events.clone();
+                thread::spawn(move || {
+                    let mut config = ConfigLoad::load(
+                        &context.workspace,
+                        context.explicit.as_deref(),
+                        context.safe_mode,
+                    );
+                    if context.no_mouse {
+                        config.settings.editor.mouse = false;
+                    }
+                    if let Some(locale) = context.locale {
+                        config.settings.ui.locale = match locale {
+                            CliLocale::En => Locale::En,
+                            CliLocale::Ja => Locale::Ja,
+                        };
+                    }
+                    let (keymap, key_warnings) = Keymap::from_overrides(&config.settings.keymap);
+                    config.warnings.extend(key_warnings);
+                    let registry = mica::command::CommandRegistry::built_in();
+                    for (chord, command) in &config.settings.keymap {
+                        if !registry.contains(command) {
+                            config
+                                .warnings
+                                .push(format!("unknown command ID for {chord}: {command}"));
+                        }
+                    }
+                    match Theme::load(&config.settings.ui.theme, detect_color_mode()) {
+                        Ok(theme) => {
+                            let _ = theme_events.send(ThemeUpdate::Loaded(theme));
+                        }
+                        Err(error) => {
+                            config.warnings.push(format!(
+                                "theme reload failed: {error}; keeping current theme"
+                            ));
+                            let _ = theme_events.send(ThemeUpdate::Failed(error.to_string()));
+                        }
+                    }
+                    let _ = sender.send(AppEvent::ConfigReloaded {
+                        settings: config.settings,
+                        keymap,
+                        warnings: config.warnings,
+                    });
+                });
+            }
+            Effect::PrepareConfigFile(path) => {
+                thread::spawn(move || {
+                    let result = mica::config::prepare_config_template(&path)
+                        .map(|_| path)
+                        .map_err(|error| error.to_string());
+                    let _ = sender.send(AppEvent::ConfigFilePrepared(result));
                 });
             }
             Effect::Save { tab, snapshot } => {

@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use vte::{Params, Parser, Perform};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -50,6 +50,13 @@ pub struct TerminalSnapshot {
     pub title: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalSearchMatch {
+    pub history_row: usize,
+    pub start_column: usize,
+    pub end_column: usize,
+}
+
 pub struct TerminalEmulator {
     parser: Parser,
     screen: Screen,
@@ -90,6 +97,48 @@ impl TerminalEmulator {
 
     pub fn scrollback_len(&self) -> usize {
         self.screen.scrollback.len()
+    }
+
+    pub fn history_len(&self) -> usize {
+        self.screen.scrollback.len() + self.screen.grid.len()
+    }
+
+    pub fn visible_history_start(&self, scroll_offset: usize) -> usize {
+        if self.screen.alternate_screen {
+            return 0;
+        }
+        self.history_len()
+            .saturating_sub(scroll_offset.min(self.screen.scrollback.len()))
+            .saturating_sub(self.screen.rows)
+    }
+
+    pub fn search(&self, query: &str) -> Vec<TerminalSearchMatch> {
+        if query.is_empty() || self.screen.alternate_screen {
+            return Vec::new();
+        }
+        self.screen
+            .scrollback
+            .iter()
+            .chain(self.screen.grid.iter())
+            .enumerate()
+            .flat_map(|(history_row, cells)| {
+                let text = cells
+                    .iter()
+                    .filter(|cell| !cell.wide_continuation)
+                    .map(|cell| cell.character)
+                    .collect::<String>();
+                text.match_indices(query)
+                    .map(|(byte, matched)| {
+                        let start_column = UnicodeWidthStr::width(&text[..byte]);
+                        TerminalSearchMatch {
+                            history_row,
+                            start_column,
+                            end_column: start_column + UnicodeWidthStr::width(matched),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     pub fn selected_text(
@@ -619,5 +668,34 @@ mod tests {
         let mut terminal = TerminalEmulator::new(2, 8, 10);
         terminal.feed(b"hello\r\nworld");
         assert_eq!(terminal.selected_text(0, (0, 1), (1, 2)), "ello\nwor");
+    }
+
+    #[test]
+    fn searches_scrollback_with_terminal_display_columns() {
+        let mut terminal = TerminalEmulator::new(2, 12, 10);
+        terminal.feed("first foo\r\n日foo\r\nlast foo".as_bytes());
+
+        assert_eq!(
+            terminal.search("foo"),
+            vec![
+                TerminalSearchMatch {
+                    history_row: 0,
+                    start_column: 6,
+                    end_column: 9,
+                },
+                TerminalSearchMatch {
+                    history_row: 1,
+                    start_column: 2,
+                    end_column: 5,
+                },
+                TerminalSearchMatch {
+                    history_row: 2,
+                    start_column: 5,
+                    end_column: 8,
+                },
+            ]
+        );
+        assert_eq!(terminal.visible_history_start(0), 1);
+        assert_eq!(terminal.visible_history_start(1), 0);
     }
 }

@@ -13,7 +13,22 @@ use crate::{
 
 impl AppState {
     pub fn update(&mut self, event: AppEvent) -> Vec<Effect> {
+        let previous_notification = self.notification.clone();
+        let effects = self.update_inner(event);
+        if self.notification != previous_notification
+            && let Some(message) = self.notification.clone()
+        {
+            self.record_notification(message);
+        }
+        effects
+    }
+
+    fn update_inner(&mut self, event: AppEvent) -> Vec<Effect> {
         match event {
+            AppEvent::Tick => {
+                self.expire_notification();
+                Vec::new()
+            }
             AppEvent::Command(command) => self.execute(command),
             AppEvent::FileOpened {
                 path,
@@ -22,6 +37,7 @@ impl AppState {
                 result,
             } => {
                 let restored_cursor = self.restore_cursors.remove(&path);
+                let restored_pin = self.restore_pins.remove(&path);
                 match result {
                     Ok(buffer) => {
                         let recent_path = path
@@ -45,6 +61,9 @@ impl AppState {
                         if let Some(tab) =
                             self.active_tab.and_then(|index| self.tabs.get_mut(index))
                         {
+                            if let Some(pinned) = restored_pin {
+                                tab.pinned = pinned;
+                            }
                             let offset = restored_cursor.unwrap_or_else(|| {
                                 let target_line = line
                                     .unwrap_or(1)
@@ -551,6 +570,9 @@ impl AppState {
                     return Vec::new();
                 }
                 self.terminal.feed(&bytes);
+                if matches!(self.overlay, Some(Overlay::TerminalSearch)) {
+                    self.refresh_terminal_search();
+                }
                 Vec::new()
             }
             AppEvent::TerminalExited {
@@ -600,6 +622,39 @@ impl AppState {
                 self.append_output(&source, message);
                 Vec::new()
             }
+            AppEvent::ConfigReloaded {
+                settings,
+                keymap,
+                warnings,
+            } => {
+                self.settings = settings;
+                self.keymap = keymap;
+                self.config_warnings = warnings;
+                self.notification = Some(if self.config_warnings.is_empty() {
+                    "Configuration reloaded".to_owned()
+                } else {
+                    format!(
+                        "Configuration reloaded with warnings: {}",
+                        self.config_warnings.join("; ")
+                    )
+                });
+                vec![Effect::ScanWorkspace]
+            }
+            AppEvent::ConfigFilePrepared(result) => match result {
+                Ok(path) => {
+                    self.notification = Some("Workspace configuration opened".to_owned());
+                    vec![Effect::OpenFile {
+                        path,
+                        read_only: self.force_read_only,
+                        line: None,
+                        column: None,
+                    }]
+                }
+                Err(error) => {
+                    self.notification = Some(format!("Cannot open configuration: {error}"));
+                    Vec::new()
+                }
+            },
             AppEvent::LspClient { language, event } => self.handle_lsp_event(language, event),
         }
     }
@@ -1003,6 +1058,14 @@ impl AppState {
             Command::TerminalOpenReference { row, column } => {
                 self.open_terminal_reference(row, column)
             }
+            Command::TerminalSearchNext => {
+                self.select_terminal_search_match(1);
+                Vec::new()
+            }
+            Command::TerminalSearchPrevious => {
+                self.select_terminal_search_match(-1);
+                Vec::new()
+            }
             Command::DiagnosticSelect(index) => {
                 self.diagnostic_selected =
                     index.min(self.visible_diagnostics().len().saturating_sub(1));
@@ -1063,6 +1126,37 @@ impl AppState {
                     self.focus = Focus::Editor;
                 }
                 self.active_syntax_effect().into_iter().collect()
+            }
+            Command::BeginTabDrag(index) => {
+                if index < self.tabs.len() {
+                    self.tab_drag_source = Some(index);
+                    self.active_tab = Some(index);
+                    self.git_diff_active = false;
+                    self.focus = Focus::Editor;
+                }
+                Vec::new()
+            }
+            Command::ReorderTab { from, to } => {
+                self.reorder_tab(from, to);
+                self.tab_drag_source = Some(from);
+                Vec::new()
+            }
+            Command::TogglePinTab(index) => {
+                if index < self.tabs.len() {
+                    self.tabs[index].pinned = !self.tabs[index].pinned;
+                    self.active_tab = Some(index);
+                    self.tab_order = self.visual_tab_order();
+                    self.notification = Some(if self.tabs[index].pinned {
+                        format!("Pinned {}", self.tabs[index].title())
+                    } else {
+                        format!("Unpinned {}", self.tabs[index].title())
+                    });
+                }
+                Vec::new()
+            }
+            Command::EndTabDrag => {
+                self.tab_drag_source = None;
+                Vec::new()
             }
             Command::SplitEditor => {
                 if self.split_tab.is_none() {
@@ -1154,6 +1248,18 @@ impl AppState {
 
     fn execute_overlay(&mut self, command: Command) -> Vec<Effect> {
         match command {
+            Command::TerminalSearchNext
+                if matches!(self.overlay, Some(Overlay::TerminalSearch)) =>
+            {
+                self.select_terminal_search_match(1);
+                return Vec::new();
+            }
+            Command::TerminalSearchPrevious
+                if matches!(self.overlay, Some(Overlay::TerminalSearch)) =>
+            {
+                self.select_terminal_search_match(-1);
+                return Vec::new();
+            }
             Command::RecoveryRecover if matches!(self.overlay, Some(Overlay::RecoveryPrompt)) => {
                 return self.recover_pending();
             }
@@ -1181,6 +1287,10 @@ impl AppState {
                     return Vec::new();
                 }
                 self.palette_query.push(character);
+                if matches!(self.overlay, Some(Overlay::TerminalSearch)) {
+                    self.refresh_terminal_search();
+                    return Vec::new();
+                }
                 if matches!(self.overlay, Some(Overlay::LspCompletion)) {
                     self.filter_lsp_completions();
                     return Vec::new();
@@ -1203,6 +1313,10 @@ impl AppState {
                     return Vec::new();
                 }
                 self.palette_query.pop();
+                if matches!(self.overlay, Some(Overlay::TerminalSearch)) {
+                    self.refresh_terminal_search();
+                    return Vec::new();
+                }
                 if matches!(self.overlay, Some(Overlay::LspCompletion)) {
                     self.filter_lsp_completions();
                     return Vec::new();
@@ -1289,6 +1403,14 @@ impl AppState {
             Command::MoveUp { .. } if matches!(self.overlay, Some(Overlay::LspCompletion)) => {
                 self.lsp_completion_selected = self.lsp_completion_selected.saturating_sub(1);
             }
+            Command::MoveUp { .. } if matches!(self.overlay, Some(Overlay::KeybindingHelp)) => {
+                self.help_selected = self.help_selected.saturating_sub(1);
+            }
+            Command::MoveUp { .. }
+                if matches!(self.overlay, Some(Overlay::NotificationHistory)) =>
+            {
+                self.notification_selected = self.notification_selected.saturating_sub(1);
+            }
             Command::MoveDown { .. } if matches!(self.overlay, Some(Overlay::FilePicker)) => {
                 self.file_picker_selected =
                     (self.file_picker_selected + 1).min(self.file_matches.len().saturating_sub(1));
@@ -1301,6 +1423,16 @@ impl AppState {
             Command::MoveDown { .. } if matches!(self.overlay, Some(Overlay::LspCompletion)) => {
                 self.lsp_completion_selected = (self.lsp_completion_selected + 1)
                     .min(self.lsp_completions.len().saturating_sub(1));
+            }
+            Command::MoveDown { .. } if matches!(self.overlay, Some(Overlay::KeybindingHelp)) => {
+                self.help_selected =
+                    (self.help_selected + 1).min(self.active_keybindings().len().saturating_sub(1));
+            }
+            Command::MoveDown { .. }
+                if matches!(self.overlay, Some(Overlay::NotificationHistory)) =>
+            {
+                self.notification_selected = (self.notification_selected + 1)
+                    .min(self.notification_history.len().saturating_sub(1));
             }
             Command::PaletteAccept => {
                 let overlay = self.overlay.take();
@@ -1490,6 +1622,17 @@ impl AppState {
                         self.focus = Focus::Editor;
                         return vec![Effect::StopTerminal];
                     }
+                    Some(Overlay::TerminalSearch) => {
+                        self.overlay = Some(Overlay::TerminalSearch);
+                        self.select_terminal_search_match(1);
+                        return Vec::new();
+                    }
+                    Some(Overlay::KeybindingHelp) => {
+                        self.focus = self.help_context;
+                    }
+                    Some(Overlay::NotificationHistory) => {
+                        self.focus = self.notification_context;
+                    }
                     Some(Overlay::LspHover) => {
                         self.focus = Focus::Editor;
                     }
@@ -1531,6 +1674,11 @@ impl AppState {
                 }
             }
             Command::Cancel => {
+                let restore_help_focus = matches!(self.overlay, Some(Overlay::KeybindingHelp))
+                    .then_some(self.help_context);
+                let restore_notification_focus =
+                    matches!(self.overlay, Some(Overlay::NotificationHistory))
+                        .then_some(self.notification_context);
                 if let Some(Overlay::BufferSearch { tab }) = self.overlay.as_ref()
                     && let Some(tab) = self.tabs.get_mut(*tab)
                 {
@@ -1539,6 +1687,8 @@ impl AppState {
                     tab.view.search.current = 0;
                 }
                 self.overlay = None;
+                self.terminal_search_matches.clear();
+                self.terminal_search_selected = 0;
                 self.buffer_replace_focused = false;
                 self.buffer_replace_visible = false;
                 self.palette_query.clear();
@@ -1548,7 +1698,9 @@ impl AppState {
                 self.file_matches.clear();
                 self.file_preview_path = None;
                 self.file_preview_lines.clear();
-                self.focus = Focus::Editor;
+                self.focus = restore_help_focus
+                    .or(restore_notification_focus)
+                    .unwrap_or(Focus::Editor);
             }
             _ => {}
         }
@@ -1653,6 +1805,20 @@ impl AppState {
                 if let Some(index) = self.active_tab {
                     return self.request_close_tab(index);
                 }
+                Vec::new()
+            }
+            command::EDITOR_TOGGLE_PIN => {
+                let Some(index) = self.active_tab else {
+                    return Vec::new();
+                };
+                self.execute(Command::TogglePinTab(index))
+            }
+            command::EDITOR_MOVE_TAB_LEFT => {
+                self.move_active_tab(-1);
+                Vec::new()
+            }
+            command::EDITOR_MOVE_TAB_RIGHT => {
+                self.move_active_tab(1);
                 Vec::new()
             }
             command::EDITOR_COPY => {
@@ -1876,6 +2042,16 @@ impl AppState {
                 let snapshot = self.terminal.snapshot(self.terminal_scroll_offset);
                 self.open_terminal_reference(snapshot.cursor_row, Some(snapshot.cursor_col))
             }
+            command::TERMINAL_SEARCH => {
+                self.bottom_panel_visible = true;
+                self.bottom_panel_view = BottomPanelView::Terminal;
+                self.focus = Focus::BottomPanel;
+                self.palette_query.clear();
+                self.terminal_search_matches.clear();
+                self.terminal_search_selected = 0;
+                self.overlay = Some(Overlay::TerminalSearch);
+                Vec::new()
+            }
             command::VIEW_OUTPUT => {
                 self.bottom_panel_visible = true;
                 self.bottom_panel_view = BottomPanelView::Output;
@@ -2030,6 +2206,35 @@ impl AppState {
             command::WORKSPACE_REFRESH => {
                 self.git_loading = true;
                 vec![Effect::ScanWorkspace, Effect::RefreshGit]
+            }
+            command::CONFIG_RELOAD => vec![Effect::ReloadConfig],
+            command::CONFIG_OPEN => {
+                let relative = std::path::Path::new(".mica/config.toml");
+                if let Err(error) = self.workspace.resolve(relative) {
+                    self.notification = Some(format!("Cannot open configuration: {error}"));
+                    return Vec::new();
+                }
+                match self.workspace.resolve_lexical(relative) {
+                    Ok(path) => vec![Effect::PrepareConfigFile(path)],
+                    Err(error) => {
+                        self.notification = Some(format!("Cannot open configuration: {error}"));
+                        Vec::new()
+                    }
+                }
+            }
+            command::HELP_KEYBINDINGS => {
+                self.help_context = self.focus;
+                self.help_selected = 0;
+                self.overlay = Some(Overlay::KeybindingHelp);
+                self.focus = Focus::Overlay;
+                Vec::new()
+            }
+            command::NOTIFICATIONS_HISTORY => {
+                self.notification_context = self.focus;
+                self.notification_selected = 0;
+                self.overlay = Some(Overlay::NotificationHistory);
+                self.focus = Focus::Overlay;
+                Vec::new()
             }
             command::WORKSPACE_OPEN_FILE => {
                 self.overlay = Some(Overlay::FilePicker);
@@ -2245,6 +2450,45 @@ impl AppState {
             line: Some(reference.line),
             column: Some(ColumnHint::Chars(reference.column)),
         }]
+    }
+
+    fn refresh_terminal_search(&mut self) {
+        self.terminal_search_matches = self.terminal.search(&self.palette_query);
+        self.terminal_search_selected = 0;
+        self.reveal_terminal_search_match();
+    }
+
+    fn select_terminal_search_match(&mut self, direction: i32) {
+        if self.terminal_search_matches.is_empty() {
+            return;
+        }
+        let length = self.terminal_search_matches.len();
+        self.terminal_search_selected = if direction < 0 {
+            self.terminal_search_selected
+                .checked_sub(1)
+                .unwrap_or(length - 1)
+        } else {
+            (self.terminal_search_selected + 1) % length
+        };
+        self.reveal_terminal_search_match();
+    }
+
+    fn reveal_terminal_search_match(&mut self) {
+        let Some(matched) = self
+            .terminal_search_matches
+            .get(self.terminal_search_selected)
+        else {
+            return;
+        };
+        let viewport_rows = self.terminal.snapshot(0).lines.len();
+        let maximum_start = self.terminal.history_len().saturating_sub(viewport_rows);
+        let desired_start = matched
+            .history_row
+            .saturating_sub(viewport_rows / 2)
+            .min(maximum_start);
+        self.terminal_scroll_offset = maximum_start
+            .saturating_sub(desired_start)
+            .min(self.terminal.scrollback_len());
     }
 
     fn lsp_open_effect(&mut self, path: &std::path::Path) -> Vec<Effect> {
@@ -3434,6 +3678,10 @@ impl AppState {
             self.notification = Some("Wait for pending saves before closing a tab".to_owned());
             return Vec::new();
         }
+        if self.tabs[index].pinned {
+            self.notification = Some("Unpin the tab before closing it".to_owned());
+            return Vec::new();
+        }
         if self.tabs[index].buffer.is_dirty() {
             self.overlay = Some(Overlay::ConfirmClose { tab: index });
             self.focus = Focus::Overlay;
@@ -3463,6 +3711,17 @@ impl AppState {
                 }),
             });
         self.tabs.remove(index);
+        self.tab_order.retain(|tab| *tab != index);
+        for tab in &mut self.tab_order {
+            if *tab > index {
+                *tab -= 1;
+            }
+        }
+        self.tab_drag_source = self.tab_drag_source.and_then(|tab| match tab.cmp(&index) {
+            std::cmp::Ordering::Less => Some(tab),
+            std::cmp::Ordering::Equal => None,
+            std::cmp::Ordering::Greater => Some(tab - 1),
+        });
         self.split_tab = self.split_tab.and_then(|split| match split.cmp(&index) {
             std::cmp::Ordering::Less => Some(split),
             std::cmp::Ordering::Equal => None,
@@ -3479,6 +3738,44 @@ impl AppState {
             Some(active) => Some(active),
         };
         lsp_close
+    }
+
+    fn reorder_tab(&mut self, from: usize, to: usize) {
+        if from >= self.tabs.len()
+            || to >= self.tabs.len()
+            || self.tabs[from].pinned != self.tabs[to].pinned
+        {
+            return;
+        }
+        let mut order = self.visual_tab_order();
+        let Some(from_position) = order.iter().position(|tab| *tab == from) else {
+            return;
+        };
+        let Some(to_position) = order.iter().position(|tab| *tab == to) else {
+            return;
+        };
+        let tab = order.remove(from_position);
+        order.insert(to_position, tab);
+        self.tab_order = order;
+    }
+
+    fn move_active_tab(&mut self, direction: i32) {
+        let Some(active) = self.active_tab else {
+            return;
+        };
+        let order = self.visual_tab_order();
+        let Some(position) = order.iter().position(|tab| *tab == active) else {
+            return;
+        };
+        let target = if direction < 0 {
+            position.checked_sub(1)
+        } else {
+            (position + 1 < order.len()).then_some(position + 1)
+        };
+        let Some(target) = target else {
+            return;
+        };
+        self.reorder_tab(active, order[target]);
     }
 
     fn reveal_cursor(&mut self, tab_index: usize) {
@@ -3920,7 +4217,7 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use crate::session::{RecoveryBuffer, RecoverySet};
+    use crate::session::{RecoveryBuffer, RecoverySet, RestoredBuffer, RestoredSession};
     use crate::{buffer::TextBuffer, config::Keymap, workspace::WorkspaceRoot};
 
     fn state() -> AppState {
@@ -4343,6 +4640,100 @@ mod tests {
     }
 
     #[test]
+    fn tabs_pin_reorder_and_close_without_changing_stable_buffer_indices() {
+        let mut state = state();
+        for name in ["one.rs", "two.rs", "three.rs"] {
+            state.tabs.push(BufferTab::new(TextBuffer::empty(
+                Some(state.workspace.as_path().join(name)),
+                false,
+            )));
+        }
+        state.active_tab = Some(1);
+        state.update(AppEvent::Command(Command::TogglePinTab(1)));
+        assert_eq!(state.visual_tab_order(), vec![1, 0, 2]);
+        assert_eq!(state.active_tab, Some(1));
+
+        state.update(AppEvent::Command(Command::ReorderTab { from: 2, to: 0 }));
+        assert_eq!(state.visual_tab_order(), vec![1, 2, 0]);
+        state.update(AppEvent::Command(Command::ReorderTab { from: 1, to: 2 }));
+        assert_eq!(state.visual_tab_order(), vec![1, 2, 0]);
+
+        state.update(AppEvent::Command(Command::CloseTab(1)));
+        assert_eq!(state.tabs.len(), 3, "pinned tab must be protected");
+        state.update(AppEvent::Command(Command::TogglePinTab(1)));
+        state.update(AppEvent::Command(Command::CloseTab(1)));
+        assert_eq!(state.tabs.len(), 2);
+        assert_eq!(state.visual_tab_order(), vec![1, 0]);
+    }
+
+    #[test]
+    fn session_snapshot_preserves_visual_tab_order_and_pin_state() {
+        let mut state = state();
+        for name in ["one.rs", "two.rs"] {
+            state.tabs.push(BufferTab::new(TextBuffer::empty(
+                Some(state.workspace.as_path().join(name)),
+                false,
+            )));
+        }
+        state.tabs[1].pinned = true;
+        state.active_tab = Some(0);
+        let snapshot = state.session_snapshot();
+        assert_eq!(
+            snapshot.buffers[0]
+                .path
+                .as_ref()
+                .and_then(|path| path.file_name())
+                .and_then(|name| name.to_str()),
+            Some("two.rs")
+        );
+        assert!(snapshot.buffers[0].pinned);
+        assert_eq!(snapshot.active_tab, Some(1));
+    }
+
+    #[test]
+    fn restored_tab_order_survives_out_of_order_file_completion() {
+        let mut state = state();
+        let first = state.workspace.as_path().join("first.rs");
+        let second = state.workspace.as_path().join("second.rs");
+        state.apply_restored_session(&RestoredSession {
+            buffers: vec![
+                RestoredBuffer {
+                    path: first.clone(),
+                    cursor_char: 0,
+                    pinned: true,
+                },
+                RestoredBuffer {
+                    path: second.clone(),
+                    cursor_char: 0,
+                    pinned: false,
+                },
+            ],
+            active_path: Some(second.clone()),
+            sidebar_visible: true,
+            sidebar_view: SidebarView::Explorer,
+            bottom_panel_visible: false,
+            sidebar_width: 30,
+            bottom_panel_height: 12,
+        });
+        for path in [second.clone(), first.clone()] {
+            state.update(AppEvent::FileOpened {
+                path: path.clone(),
+                line: None,
+                column: None,
+                result: Ok(TextBuffer::empty(Some(path), false)),
+            });
+        }
+        let paths = state
+            .visual_tab_order()
+            .into_iter()
+            .filter_map(|index| state.tabs[index].buffer.path().map(PathBuf::from))
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec![first, second.clone()]);
+        assert!(state.tabs[state.visual_tab_order()[0]].pinned);
+        assert_eq!(state.active_path(), Some(second.as_path()));
+    }
+
+    #[test]
     fn diff_next_previous_reveal_the_selected_hunk() {
         let mut state = state();
         let diff = crate::git::parse_unified_diff(
@@ -4527,6 +4918,167 @@ mod tests {
                 ..
             }] if path == &state.workspace.as_path().join("src/main.rs")
         ));
+    }
+
+    #[test]
+    fn terminal_search_command_finds_scrollback_and_reveals_matches() {
+        let mut state = state();
+        for line in 0..20 {
+            state
+                .terminal
+                .feed(format!("line {line} needle\r\n").as_bytes());
+        }
+
+        state.update(AppEvent::Command(Command::Invoke(
+            command::TERMINAL_SEARCH.to_owned(),
+        )));
+        for character in "needle".chars() {
+            state.update(AppEvent::Command(Command::PaletteInput(character)));
+        }
+
+        assert!(matches!(state.overlay, Some(Overlay::TerminalSearch)));
+        assert_eq!(state.terminal_search_matches.len(), 20);
+        assert!(state.terminal_scroll_offset > 0);
+        let first = state.terminal_search_selected;
+        state.update(AppEvent::Command(Command::TerminalSearchNext));
+        assert_eq!(state.terminal_search_selected, first + 1);
+        state.update(AppEvent::Command(Command::TerminalSearchPrevious));
+        assert_eq!(state.terminal_search_selected, first);
+    }
+
+    #[test]
+    fn configuration_reload_command_and_result_update_runtime_settings() {
+        let mut state = state();
+        let effects = state.update(AppEvent::Command(Command::Invoke(
+            command::CONFIG_RELOAD.to_owned(),
+        )));
+        assert!(matches!(effects.as_slice(), [Effect::ReloadConfig]));
+
+        let mut settings = state.settings.clone();
+        settings.editor.tab_width = 8;
+        settings
+            .keymap
+            .insert("alt-r".to_owned(), command::CONFIG_RELOAD.to_owned());
+        let (keymap, warnings) = crate::config::Keymap::from_overrides(&settings.keymap);
+        state.update(AppEvent::ConfigReloaded {
+            settings,
+            keymap,
+            warnings,
+        });
+
+        assert_eq!(state.settings.editor.tab_width, 8);
+        assert_eq!(
+            state.notification.as_deref(),
+            Some("Configuration reloaded")
+        );
+    }
+
+    #[test]
+    fn configuration_open_prepares_workspace_file_then_opens_it() {
+        let mut state = state();
+        let expected = state.workspace.as_path().join(".mica/config.toml");
+        let effects = state.update(AppEvent::Command(Command::Invoke(
+            command::CONFIG_OPEN.to_owned(),
+        )));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::PrepareConfigFile(path)] if path == &expected
+        ));
+
+        let effects = state.update(AppEvent::ConfigFilePrepared(Ok(expected.clone())));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::OpenFile { path, line: None, column: None, .. }] if path == &expected
+        ));
+    }
+
+    #[test]
+    fn keybinding_help_filters_for_focus_and_restores_it_on_close() {
+        let mut state = state();
+        state.focus = Focus::Editor;
+        state.update(AppEvent::Command(Command::Invoke(
+            command::HELP_KEYBINDINGS.to_owned(),
+        )));
+        let editor_commands = state
+            .active_keybindings()
+            .into_iter()
+            .map(|(_, id, _)| id.to_owned())
+            .collect::<Vec<_>>();
+        assert!(editor_commands.iter().any(|id| id == command::EDITOR_SAVE));
+        assert!(
+            !editor_commands
+                .iter()
+                .any(|id| id == command::TERMINAL_SEARCH)
+        );
+        state.update(AppEvent::Command(Command::Cancel));
+        assert_eq!(state.focus, Focus::Editor);
+
+        state.focus = Focus::BottomPanel;
+        state.bottom_panel_view = BottomPanelView::Terminal;
+        state.update(AppEvent::Command(Command::Invoke(
+            command::HELP_KEYBINDINGS.to_owned(),
+        )));
+        let terminal_commands = state
+            .active_keybindings()
+            .into_iter()
+            .map(|(_, id, _)| id.to_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            terminal_commands
+                .iter()
+                .any(|id| id == command::TERMINAL_SEARCH)
+        );
+        assert!(
+            !terminal_commands
+                .iter()
+                .any(|id| id == command::EDITOR_SAVE)
+        );
+    }
+
+    #[test]
+    fn notifications_are_retained_and_expire_as_toasts() {
+        let mut state = state();
+        state.update(AppEvent::Command(Command::Invoke(
+            "unknown.command".to_owned(),
+        )));
+        assert_eq!(state.notification_history.len(), 1);
+        assert!(state.notification_expires_at.is_some());
+        state.update(AppEvent::ConfigFilePrepared(Err(
+            "permission denied".to_owned()
+        )));
+        assert_eq!(
+            state.notification_history.back().map(|entry| entry.level),
+            Some(crate::app::NotificationLevel::Error)
+        );
+
+        state.notification_expires_at = Some(std::time::Instant::now());
+        state.update(AppEvent::Tick);
+        assert!(state.notification.is_none());
+        assert_eq!(state.notification_history.len(), 2);
+
+        for index in 0..205 {
+            state.notify(format!("message {index}"));
+        }
+        assert_eq!(state.notification_history.len(), 200);
+        assert_eq!(
+            state
+                .notification_history
+                .front()
+                .map(|entry| entry.message.as_str()),
+            Some("message 5")
+        );
+    }
+
+    #[test]
+    fn notification_history_opens_and_restores_focus() {
+        let mut state = state();
+        state.focus = Focus::BottomPanel;
+        state.update(AppEvent::Command(Command::Invoke(
+            command::NOTIFICATIONS_HISTORY.to_owned(),
+        )));
+        assert!(matches!(state.overlay, Some(Overlay::NotificationHistory)));
+        state.update(AppEvent::Command(Command::Cancel));
+        assert_eq!(state.focus, Focus::BottomPanel);
     }
 
     #[test]

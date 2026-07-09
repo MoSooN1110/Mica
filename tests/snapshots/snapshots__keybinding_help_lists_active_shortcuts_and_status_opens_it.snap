@@ -1,0 +1,34 @@
+---
+source: tests/snapshots.rs
+expression: "redact(&text, &state.workspace)"
+---
+▎E  EXPLORER                    │  main.rs ×
+ G ▎▾ src                       │▎ src  ›  main.rs
+ S  │ ◆ ╭ ACTIVE SHORTCUTS · EDITOR · F1/ESC CLOSE ────────────────────────────────────────╮
+    │ ◆ │Alt+1             Show Explorer                     view.explorer                 │
+    ≡ RE│Alt+2             Show Source Control               view.source_control           │
+    ≡ 設 │Alt+3             Show Search                       view.search                   │
+        │Alt+Down          Move Selected Lines Down          editor.move_line_down         │
+        │Alt+Left          Navigate Back                     editor.navigate_back          │
+        │Alt+N             Notifications: Show History       notifications.history         │
+        │Alt+Right         Navigate Forward                  editor.navigate_forward       │
+        │Alt+Shift+Down    Duplicate Selected Lines          editor.duplicate_line         │
+        │Alt+Shift+F       LSP: Format Document              lsp.format                    │
+        │Alt+Up            Move Selected Lines Up            editor.move_line_up           │
+        │Ctrl+.            LSP: Code Action                  lsp.code_action               │
+        │Ctrl+/            Toggle Line Comment               editor.toggle_line_comment    │
+        │Ctrl+A            Select All                        editor.select_all             │
+        │Ctrl+Alt+P        Editor: Toggle Pin Active Tab     editor.toggle_pin             │
+        │Ctrl+Alt+S        Save All                          editor.save_all               │
+        │Ctrl+B            Toggle Sidebar                    view.toggle_sidebar           │
+        │Ctrl+C            Copy                              editor.copy                   │
+        │Ctrl+F            Find in Buffer                    editor.find                   │
+        │Ctrl+G            Go to Line                        editor.goto_line              │
+        │Ctrl+H            Replace in Buffer                 editor.replace                │
+        │Ctrl+J            Toggle Bottom Panel               view.toggle_bottom_panel      │
+        │Ctrl+P            Open File                         workspace.open_file           │
+        │Ctrl+Q            Quit Mica                         app.quit                      │
+        │Ctrl+S            Save File                         editor.save                   │
+        ╰──────────────────────────────────────────────────────────────────────────────────╯
+                                │
+ EDITOR                                          rust │ UTF-8 LF │ Ln 1, Col 1 │ Notifs 0 │ F1 Help

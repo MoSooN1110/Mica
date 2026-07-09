@@ -3,8 +3,8 @@ source: tests/snapshots.rs
 expression: "redact(&text, &state.workspace)"
 ---
  PROBLEMS  OUTPUT  TERMINAL   [All; all sources; all files] F severity S source C file ─────────────
-▾ <WORKSPACE>/src/main.rs                                                   
-  W unused variable: `unused` [unused_variables] — compiler  2:9                                    
-  E expected `;`, found `}` [E0308] — compiler  4:9                                                 
-▾ <WORKSPACE>/src/utils.rs                                                  
+▾ <WORKSPACE>/src/main.rs
+  W unused variable: `unused` [unused_variables] — compiler  2:9
+  E expected `;`, found `}` [E0308] — compiler  4:9
+▾ <WORKSPACE>/src/utils.rs
   W missing documentation — compiler  1:1
