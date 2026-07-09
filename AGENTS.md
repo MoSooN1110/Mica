@@ -22,6 +22,7 @@ Read the spec files relevant to your task before writing code.
 | Tech stack, modules, event flow, command layer | `SPEC/08_architecture.md` |
 | Performance, safety, reliability, sessions | `SPEC/09_quality.md` |
 | Test requirements | `SPEC/10_testing.md` |
+| Agent work log | `WORK_LOG.md` |
 
 Precedence when documents disagree: `USER_WANTED.md` > `SPEC/*` > this file. If the spec conflicts with what you need to implement, **stop and propose a spec change** in your summary instead of quietly diverging.
 
@@ -109,9 +110,23 @@ For each task:
 4. State assumptions and any spec ambiguities in the change summary.
 5. Implement, then add or update tests.
 6. Run the quality gates (§6).
-7. Report: files changed, behavior added, tests run, known limitations, and any deviation from the spec.
+7. Update `WORK_LOG.md` with a concise dated entry. This applies to every coding agent, including Claude, Codex, and human-assisted agent sessions.
+8. Report: files changed, behavior added, tests run, known limitations, and any deviation from the spec.
 
 Do not claim completion while required tests are failing. Do not mark a spec item done if you implemented a reduced version — say exactly what is missing.
+
+### Work log requirements
+
+When a task changes code, tests, specs, configuration, or user-visible behavior, append an entry to `WORK_LOG.md` before the final handoff. Keep entries factual and compact:
+
+- date and agent/tool name if known
+- short summary of the request and implemented behavior
+- important files or areas changed
+- tests/quality gates run, or the explicit reason they were not run
+- commit hash after committing, if a commit was created
+- known limitations, follow-ups, or spec deviations
+
+Do not use `WORK_LOG.md` as a replacement for Git history or commit messages. It is a cross-agent handoff log so another agent, including Claude, can quickly understand recent work without reconstructing context from the full diff.
 
 ---
 
