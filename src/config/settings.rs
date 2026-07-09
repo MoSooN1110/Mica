@@ -114,7 +114,7 @@ impl Default for TerminalSettings {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DiagnosticsSettings {
     pub enabled: bool,
@@ -122,17 +122,7 @@ pub struct DiagnosticsSettings {
     pub check_on_save: bool,
 }
 
-impl Default for DiagnosticsSettings {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            inline_messages: false,
-            check_on_save: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LspSettings {
     pub enabled: bool,
@@ -155,12 +145,6 @@ impl Default for LanguageSettings {
             args: Vec::new(),
             root_markers: vec![".git".to_owned()],
         }
-    }
-}
-
-impl Default for LspSettings {
-    fn default() -> Self {
-        Self { enabled: true }
     }
 }
 

@@ -30,6 +30,7 @@ use mica::{
     diagnostics::{Diagnostic, DiagnosticSeverity, DiagnosticSource, TextPosition, TextRange},
     editor::EditorView,
     git::{DiffTarget, FileDiff, GitFileChange, GitFileKind, GitStatus, parse_unified_diff},
+    search::WorkspaceMatch,
     ui::{ColorMode, Regions, Theme, command_for_mouse, render},
     workspace::{FileOperations, FileTree, WorkspaceRoot},
 };
@@ -374,6 +375,190 @@ fn source_control_sidebar_shows_git_sections() {
     insta::assert_snapshot!(redact(&text, &state.workspace));
 }
 
+#[test]
+fn source_control_mouse_buttons_stage_and_open_commit_input() {
+    let mut state = base_state("git-sidebar-mouse");
+    state.sidebar_view = SidebarView::SourceControl;
+    state.git_status = Some(sample_git_status());
+    state.focus = Focus::Sidebar;
+
+    let theme = Theme::mica_dark(ColorMode::Ansi256);
+    let (regions, _) = draw(&state, &theme, 100, 30);
+    let unstage = command_for_mouse(
+        &state,
+        regions,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: regions.sidebar.x + 2,
+            row: regions.sidebar.y + 5,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(matches!(unstage, Some(Command::UnstageGit(0))));
+
+    let working_index = state
+        .git_entries()
+        .iter()
+        .position(|(path, target)| {
+            path == &PathBuf::from("src/main.rs") && *target == DiffTarget::WorkingTree
+        })
+        .expect("working tree entry");
+    let working_row = (0..usize::from(regions.sidebar.height))
+        .find(|row| state.git_index_at_row(*row) == Some(working_index))
+        .expect("visible working tree row");
+
+    let stage = command_for_mouse(
+        &state,
+        regions,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: regions.sidebar.x + 2,
+            row: regions.sidebar.y + u16::try_from(working_row).expect("row fits"),
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(matches!(stage, Some(Command::StageGit(index)) if index == working_index));
+
+    let commit = command_for_mouse(
+        &state,
+        regions,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: regions.sidebar.right().saturating_sub(2),
+            row: regions.sidebar.y + 2,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(matches!(commit, Some(Command::Invoke(id)) if id == "git.commit"));
+}
+
+#[test]
+fn search_sidebar_renders_clickable_box_toggles_and_focus_shortcuts() {
+    let mut state = base_state("search-sidebar");
+    state.sidebar_view = SidebarView::Search;
+    state.focus = Focus::Sidebar;
+    state.workspace_search.query = "value".to_owned();
+    state.workspace_search.regex = true;
+    state.workspace_matches = vec![WorkspaceMatch {
+        path: PathBuf::from("src/main.rs"),
+        line: 3,
+        column: 14,
+        line_text: "    println!(\"value\");".to_owned(),
+        match_start: 14,
+        match_end: 19,
+    }];
+
+    let theme = Theme::mica_dark(ColorMode::Ansi256);
+    let (regions, terminal) = draw(&state, &theme, 100, 30);
+    let text = region_text(terminal.backend().buffer(), regions.sidebar);
+    insta::assert_snapshot!(redact(&text, &state.workspace));
+    let status = region_text(terminal.backend().buffer(), regions.status);
+    assert!(status.contains("type ↑↓ Enter"));
+
+    let focus = command_for_mouse(
+        &state,
+        regions,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: regions.sidebar.x + 5,
+            row: regions.sidebar.y + 1,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(matches!(focus, Some(Command::FocusSidebar)));
+
+    let toggle = command_for_mouse(
+        &state,
+        regions,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: regions.sidebar.x + 18,
+            row: regions.sidebar.y + 5,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(matches!(toggle, Some(Command::WorkspaceSearchToggleHidden)));
+}
+
+#[test]
+fn explorer_mouse_click_moves_selection_and_second_click_opens_file() {
+    let mut state = base_state("explorer-mouse");
+    state.sidebar_view = SidebarView::Explorer;
+    state.focus = Focus::Sidebar;
+
+    let theme = Theme::mica_dark(ColorMode::Ansi256);
+    let (regions, _) = draw(&state, &theme, 100, 30);
+    let file_row = 2u16;
+    let click = command_for_mouse(
+        &state,
+        regions,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: regions.sidebar.x + 8,
+            row: regions.sidebar.y + file_row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(matches!(click, Some(Command::ClickTree(1))));
+    let effects = state.update(mica::app::AppEvent::Command(click.expect("tree click")));
+    assert!(effects.is_empty());
+    assert_eq!(state.tree_selected, 1);
+
+    let second = Command::ClickTree(1);
+    let effects = state.update(mica::app::AppEvent::Command(second));
+    assert!(matches!(
+        effects.as_slice(),
+        [mica::app::Effect::OpenFile { path, .. }]
+            if path.ends_with("src/main.rs")
+    ));
+}
+
+#[test]
+fn sidebar_border_drag_resizes_sidebar_width() {
+    let mut state = base_state("sidebar-resize");
+    let theme = Theme::mica_dark(ColorMode::Ansi256);
+    let (regions, _) = draw(&state, &theme, 100, 30);
+
+    let down = command_for_mouse(
+        &state,
+        regions,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: regions.sidebar.right().saturating_sub(1),
+            row: regions.sidebar.y + 4,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(matches!(down, Some(Command::BeginSidebarResize)));
+    state.update(mica::app::AppEvent::Command(down.expect("resize begin")));
+
+    let drag = command_for_mouse(
+        &state,
+        regions,
+        MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: regions.sidebar.x + 39,
+            row: regions.sidebar.y + 4,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(matches!(drag, Some(Command::ResizeSidebar(40))));
+    state.update(mica::app::AppEvent::Command(drag.expect("resize drag")));
+    assert_eq!(state.settings.ui.sidebar_width, 40);
+
+    let up = command_for_mouse(
+        &state,
+        regions,
+        MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: regions.sidebar.x + 39,
+            row: regions.sidebar.y + 4,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(matches!(up, Some(Command::EndSidebarResize)));
+}
+
 /// Bullet: Source Controlビュー、差分表示 (read-only editor tab half).
 #[test]
 fn git_diff_panel_renders_unified_hunks() {
@@ -571,6 +756,35 @@ fn editor_gutter_shows_diff_and_diagnostic_markers() {
     let (regions, terminal) = draw(&state, &theme, 60, 12);
     let text = region_text(terminal.backend().buffer(), regions.editor);
     insta::assert_snapshot!(redact(&text, &state.workspace));
+}
+
+#[test]
+fn editor_line_numbers_and_word_wrap_can_be_toggled() {
+    let mut state = base_state("editor-display-toggles");
+    state.settings.editor.line_numbers = false;
+    let path = state.workspace.as_path().join("wrap.rs");
+    let mut buffer = TextBuffer::empty(Some(path), false);
+    buffer
+        .insert("long-line-with-enough-characters-to-wrap-when-word-wrap-is-enabled")
+        .unwrap();
+    state.tabs.push(BufferTab::new(buffer));
+    state.active_tab = Some(0);
+    state.focus = Focus::Editor;
+
+    let theme = Theme::mica_dark(ColorMode::Ansi256);
+    let (regions, terminal) = draw(&state, &theme, 40, 12);
+    let text = region_text(terminal.backend().buffer(), regions.editor);
+    assert!(!text.contains("  1 long-line"));
+
+    state.update(mica::app::AppEvent::Command(Command::Invoke(
+        mica::command::EDITOR_TOGGLE_LINE_NUMBERS.to_owned(),
+    )));
+    assert!(state.settings.editor.line_numbers);
+
+    state.update(mica::app::AppEvent::Command(Command::Invoke(
+        mica::command::EDITOR_TOGGLE_WORD_WRAP.to_owned(),
+    )));
+    assert!(state.settings.editor.word_wrap);
 }
 
 /// Bullet: コマンドパレット、ダイアログ (palette half).

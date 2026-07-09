@@ -79,6 +79,8 @@ impl Default for Keymap {
             ("ctrl-f", "editor.find"),
             ("ctrl-h", "editor.replace"),
             ("ctrl-/", "editor.toggle_line_comment"),
+            ("alt-shift-l", "editor.toggle_line_numbers"),
+            ("alt-z", "editor.toggle_word_wrap"),
             ("ctrl-a", "editor.select_all"),
             ("shift-alt-down", "editor.duplicate_line"),
             ("alt-up", "editor.move_line_up"),

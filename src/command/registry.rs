@@ -112,6 +112,14 @@ impl CommandRegistry {
                     title: "Toggle Line Comment",
                 },
                 CommandMeta {
+                    id: EDITOR_TOGGLE_LINE_NUMBERS,
+                    title: "Editor: Toggle Line Numbers",
+                },
+                CommandMeta {
+                    id: EDITOR_TOGGLE_WORD_WRAP,
+                    title: "Editor: Toggle Word Wrap",
+                },
+                CommandMeta {
                     id: EDITOR_SELECT_ALL,
                     title: "Select All",
                 },

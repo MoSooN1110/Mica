@@ -51,12 +51,12 @@ shell = ""              # 空なら$SHELL
 scrollback_lines = 10000
 
 [diagnostics]
-enabled = true
+enabled = false
 inline_messages = false
 check_on_save = false
 
 [lsp]
-enabled = true
+enabled = false
 # 言語別定義は06_diagnostics_lsp.mdの[languages.*]
 
 [ui]

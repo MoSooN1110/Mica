@@ -74,6 +74,18 @@ pub struct IconSet {
     pub error_icon: &'static str,
     /// Status-bar diagnostics summary warning glyph.
     pub warning_icon: &'static str,
+    /// Activity-bar Explorer view glyph.
+    pub activity_explorer: &'static str,
+    /// Activity-bar Source Control view glyph.
+    pub activity_source_control: &'static str,
+    /// Activity-bar Search view glyph.
+    pub activity_search: &'static str,
+    /// Stage/add action glyph in the Source Control view.
+    pub stage: &'static str,
+    /// Unstage action glyph in the Source Control view.
+    pub unstage: &'static str,
+    /// Commit action glyph in the Source Control view.
+    pub commit: &'static str,
 }
 
 const UNICODE: IconSet = IconSet {
@@ -97,6 +109,12 @@ const UNICODE: IconSet = IconSet {
     separator: "│",
     error_icon: "✗",
     warning_icon: "▲",
+    activity_explorer: "▣",
+    activity_source_control: "⎇",
+    activity_search: "⌕",
+    stage: "+",
+    unstage: "−",
+    commit: "✓",
 };
 
 const ASCII: IconSet = IconSet {
@@ -120,6 +138,12 @@ const ASCII: IconSet = IconSet {
     separator: "|",
     error_icon: "x",
     warning_icon: "!",
+    activity_explorer: "#",
+    activity_source_control: "+-",
+    activity_search: "?",
+    stage: "+",
+    unstage: "-",
+    commit: "!",
 };
 
 // Nerd Font codepoints below are the Devicons (`nf-dev-*`) glyphs, which are

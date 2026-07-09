@@ -1,10 +1,11 @@
 ---
 source: tests/snapshots.rs
+assertion_line: 816
 expression: "redact(&text, &state.workspace)"
 ---
-▎E  EXPLORER                    │  main.rs ×
- G ▎▾ src                       │▎ src  ›  main.rs
- S  │ ◆ ╭ ACTIVE SHORTCUTS · EDITOR · F1/ESC CLOSE ────────────────────────────────────────╮
+▎▣  EXPLORER                    │  main.rs ×
+ ⎇ ▎▾ src                       │▎ src  ›  main.rs
+ ⌕  │ ◆ ╭ ACTIVE SHORTCUTS · EDITOR · F1/ESC CLOSE ────────────────────────────────────────╮
     │ ◆ │Alt+1             Show Explorer                     view.explorer                 │
     ≡ RE│Alt+2             Show Source Control               view.source_control           │
     ≡ 設 │Alt+3             Show Search                       view.search                   │
@@ -14,7 +15,9 @@ expression: "redact(&text, &state.workspace)"
         │Alt+Right         Navigate Forward                  editor.navigate_forward       │
         │Alt+Shift+Down    Duplicate Selected Lines          editor.duplicate_line         │
         │Alt+Shift+F       LSP: Format Document              lsp.format                    │
+        │Alt+Shift+L       Editor: Toggle Line Numbers       editor.toggle_line_numbers    │
         │Alt+Up            Move Selected Lines Up            editor.move_line_up           │
+        │Alt+Z             Editor: Toggle Word Wrap          editor.toggle_word_wrap       │
         │Ctrl+.            LSP: Code Action                  lsp.code_action               │
         │Ctrl+/            Toggle Line Comment               editor.toggle_line_comment    │
         │Ctrl+A            Select All                        editor.select_all             │
@@ -27,8 +30,6 @@ expression: "redact(&text, &state.workspace)"
         │Ctrl+H            Replace in Buffer                 editor.replace                │
         │Ctrl+J            Toggle Bottom Panel               view.toggle_bottom_panel      │
         │Ctrl+P            Open File                         workspace.open_file           │
-        │Ctrl+Q            Quit Mica                         app.quit                      │
-        │Ctrl+S            Save File                         editor.save                   │
         ╰──────────────────────────────────────────────────────────────────────────────────╯
                                 │
- EDITOR                                          rust │ UTF-8 LF │ Ln 1, Col 1 │ Notifs 0 │ F1 Help
+ EDITOR                           rust │ UTF-8 LF │ Ln 1, Col 1 │ Ctrl+S Alt+Z │ Notifs 0 │ F1 Help

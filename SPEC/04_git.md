@@ -56,6 +56,7 @@
 - ファイル変更のrestore(discard)
 - ハンク変更のrestore(discard)
 - restore系は破壊的操作として確認必須
+- Source Controlビューではファイル行の`+`/`−`アクションからstage / unstageできる。キーボード・マウス・コマンドパレットはいずれも同じコマンド層を通る
 
 ## 5. Commit
 
@@ -67,6 +68,7 @@
 - commit実行、成功・失敗の表示
 - Gitフック(pre-commit等)の失敗をstderr付きで表示する。フックを迂回しない(`--no-verify`は明示操作としてのみ将来検討)
 - commit後の状態更新
+- Source ControlビューのCommitボタン、または`git.commit`コマンドから同じコミットメッセージ入力を開ける
 - amendは1.0では対象外(将来拡張)
 
 ## 6. Branch

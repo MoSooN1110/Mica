@@ -42,12 +42,12 @@ shell = ""
 scrollback_lines = 10000
 
 [diagnostics]
-enabled = true
+enabled = false
 inline_messages = false
 check_on_save = false
 
 [lsp]
-enabled = true
+enabled = false
 
 [ui]
 # Built-ins: mica-dark, mica-light. A theme file name is also accepted.

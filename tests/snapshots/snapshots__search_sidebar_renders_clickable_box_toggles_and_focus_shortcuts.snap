@@ -1,23 +1,23 @@
 ---
 source: tests/snapshots.rs
-assertion_line: 374
+assertion_line: 454
 expression: "redact(&text, &state.workspace)"
 ---
- SOURCE CONTROL              │
- ◉ feature/snapshots  ↑2  ↓1 │
-  ✓ Commit staged changes    │
+ SEARCH                      │
+╭─ FIND                      │
+│ ❯ value                    │
+╰─ click box, type query, Ent│
+ □ Case    □ Word            │
+ ✓ Regex    □ Hidden         │
+ □ Binary   1 results        │
+▾ src/main.rs (1)            │
+  3:14      println!("value")│
                              │
-─ STAGED CHANGES (1) ────────│
-  −  M ◆ src/utils.rs        │
                              │
-─ CONFLICTED (1) ────────────│
-▎ +  ! ◆ src/legacy.rs       │
                              │
-─ UNTRACKED (1) ─────────────│
-  +  U ≡ 設 計 .md             │
                              │
-─ WORKING TREE CHANGES (1) ──│
-  +  M ◆ src/main.rs         │
+                             │
+                             │
                              │
                              │
                              │

@@ -241,6 +241,7 @@ pub struct AppState {
     pub commands: CommandRegistry,
     pub tree: FileTree,
     pub tree_selected: usize,
+    pub tree_last_click: Option<(usize, Instant)>,
     pub tabs: Vec<BufferTab>,
     /// Visual tab order. Entries are stable indices into `tabs`; missing
     /// indices are appended by `visual_tab_order` for newly opened tabs.
@@ -255,6 +256,7 @@ pub struct AppState {
     pub focus: Focus,
     pub sidebar_view: SidebarView,
     pub sidebar_visible: bool,
+    pub sidebar_resize_active: bool,
     pub bottom_panel_visible: bool,
     pub overlay: Option<Overlay>,
     pub palette_query: String,
@@ -367,6 +369,7 @@ impl AppState {
             commands: CommandRegistry::built_in(),
             tree: FileTree::default(),
             tree_selected: 0,
+            tree_last_click: None,
             tabs: Vec::new(),
             tab_order: Vec::new(),
             tab_drag_source: None,
@@ -376,6 +379,7 @@ impl AppState {
             focus: Focus::Editor,
             sidebar_view: SidebarView::Explorer,
             sidebar_visible: true,
+            sidebar_resize_active: false,
             bottom_panel_visible: false,
             overlay: None,
             palette_query: String::new(),
@@ -522,7 +526,7 @@ impl AppState {
 
     pub fn git_index_at_row(&self, row: usize) -> Option<usize> {
         let status = self.git_status.as_ref()?;
-        let mut visual_row = 1usize;
+        let mut visual_row = 3usize;
         let mut selection = 0usize;
         for section in GitSection::ALL {
             let count = status

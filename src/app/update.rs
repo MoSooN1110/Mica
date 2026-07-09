@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::atomic::Ordering};
+use std::{path::PathBuf, sync::atomic::Ordering, time::Instant};
 
 use crate::{
     app::{
@@ -601,6 +601,9 @@ impl AppState {
                 generation,
                 diagnostics,
             } => {
+                if !self.settings.diagnostics.enabled {
+                    return self.finish_cargo_diagnostics(source);
+                }
                 self.diagnostics
                     .replace_source(source, generation, diagnostics);
                 self.diagnostic_selected = self
@@ -614,6 +617,9 @@ impl AppState {
                 error,
             } => {
                 self.diagnostics.clear_source(source, generation);
+                if !self.settings.diagnostics.enabled {
+                    return self.finish_cargo_diagnostics(source);
+                }
                 self.append_output("diagnostics", &error);
                 self.notification = Some(error);
                 self.finish_cargo_diagnostics(source)
@@ -776,14 +782,65 @@ impl AppState {
                 self.tree_selected = index.min(self.tree.visible_len().saturating_sub(1));
                 Vec::new()
             }
+            Command::ClickTree(index) => {
+                let index = index.min(self.tree.visible_len().saturating_sub(1));
+                let now = Instant::now();
+                let repeated = self.tree_last_click.is_some_and(|(last, at)| {
+                    last == index && now.duration_since(at).as_millis() <= 500
+                });
+                self.tree_selected = index;
+                self.tree_last_click = Some((index, now));
+                if !repeated {
+                    return Vec::new();
+                }
+                let Some(entry) = self.tree.visible_entry(index) else {
+                    return Vec::new();
+                };
+                if entry.kind == TreeEntryKind::Directory {
+                    self.tree.toggle_visible_directory(index);
+                    self.tree_last_click = None;
+                    Vec::new()
+                } else {
+                    let path = self.requested_file(&entry.relative_path);
+                    self.tree_last_click = None;
+                    vec![Effect::OpenFile {
+                        path,
+                        read_only: self.force_read_only,
+                        line: None,
+                        column: None,
+                    }]
+                }
+            }
             Command::ToggleTree(index) => {
                 self.tree.toggle_visible_directory(index);
                 self.tree_selected = index.min(self.tree.visible_len().saturating_sub(1));
+                self.tree_last_click = None;
+                Vec::new()
+            }
+            Command::BeginSidebarResize => {
+                self.sidebar_resize_active = true;
+                Vec::new()
+            }
+            Command::ResizeSidebar(width) => {
+                self.sidebar_visible = true;
+                self.settings.ui.sidebar_width = width.clamp(16, 80);
+                Vec::new()
+            }
+            Command::EndSidebarResize => {
+                self.sidebar_resize_active = false;
                 Vec::new()
             }
             Command::SelectGit(index) => {
                 self.git_selected = index.min(self.git_entries().len().saturating_sub(1));
                 Vec::new()
+            }
+            Command::StageGit(index) => {
+                self.git_selected = index.min(self.git_entries().len().saturating_sub(1));
+                self.selected_git_operation(true)
+            }
+            Command::UnstageGit(index) => {
+                self.git_selected = index.min(self.git_entries().len().saturating_sub(1));
+                self.selected_git_operation(false)
             }
             Command::SelectGitAndOpen(index) => {
                 self.git_selected = index.min(self.git_entries().len().saturating_sub(1));
@@ -1021,6 +1078,11 @@ impl AppState {
                 if self.bottom_panel_view == BottomPanelView::Terminal {
                     self.focus = Focus::BottomPanel;
                 }
+                Vec::new()
+            }
+            Command::FocusSidebar => {
+                self.sidebar_visible = true;
+                self.focus = Focus::Sidebar;
                 Vec::new()
             }
             Command::TerminalSetSelection {
@@ -1918,6 +1980,24 @@ impl AppState {
             command::EDITOR_INDENT => self.change_selected_indent(false),
             command::EDITOR_OUTDENT => self.change_selected_indent(true),
             command::EDITOR_TOGGLE_LINE_COMMENT => self.toggle_line_comment(),
+            command::EDITOR_TOGGLE_LINE_NUMBERS => {
+                self.settings.editor.line_numbers = !self.settings.editor.line_numbers;
+                self.notification = Some(if self.settings.editor.line_numbers {
+                    "Line numbers shown".to_owned()
+                } else {
+                    "Line numbers hidden".to_owned()
+                });
+                Vec::new()
+            }
+            command::EDITOR_TOGGLE_WORD_WRAP => {
+                self.settings.editor.word_wrap = !self.settings.editor.word_wrap;
+                self.notification = Some(if self.settings.editor.word_wrap {
+                    "Word wrap enabled".to_owned()
+                } else {
+                    "Word wrap disabled".to_owned()
+                });
+                Vec::new()
+            }
             command::EDITOR_SELECT_ALL => {
                 if let Some(tab) = self.active_tab.and_then(|index| self.tabs.get_mut(index)) {
                     tab.buffer.select_all();
@@ -2722,6 +2802,9 @@ impl AppState {
         if method != Some("textDocument/publishDiagnostics") {
             return Vec::new();
         }
+        if !self.settings.diagnostics.enabled {
+            return Vec::new();
+        }
         let Some(params) = message.get("params") else {
             return Vec::new();
         };
@@ -3208,6 +3291,12 @@ impl AppState {
     }
 
     fn start_cargo_diagnostics(&mut self, notify: bool) -> Vec<Effect> {
+        if !self.settings.diagnostics.enabled {
+            if notify {
+                self.notification = Some("Diagnostics are disabled".to_owned());
+            }
+            return Vec::new();
+        }
         if !self.workspace.as_path().join("Cargo.toml").is_file() {
             if notify {
                 self.notification =
@@ -5171,6 +5260,7 @@ mod tests {
     #[test]
     fn cargo_diagnostics_save_triggers_are_coalesced_while_running() {
         let mut state = state();
+        state.settings.diagnostics.enabled = true;
         fs::write(
             state.workspace.as_path().join("Cargo.toml"),
             "[package]\nname='x'",
@@ -5326,6 +5416,12 @@ mod tests {
             effect,
             Effect::HighlightSyntax { language, .. } if *language == editor::SyntaxLanguage::Rust
         )));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::StartLsp { .. })),
+            "syntax highlighting must still run while code analysis is disabled"
+        );
 
         // TOML has no default entry in `settings.languages` (no LSP server
         // configured for it), so this must fall back to `from_extension`.
@@ -5372,6 +5468,7 @@ mod tests {
     #[test]
     fn rust_file_lazily_starts_lsp_and_sends_full_document_changes() {
         let mut state = state();
+        state.settings.lsp.enabled = true;
         let path = state.workspace.as_path().join("main.rs");
         let mut buffer = TextBuffer::empty(Some(path.clone()), false);
         buffer.insert("fn main() {}").unwrap();
@@ -5604,6 +5701,7 @@ mod tests {
     #[test]
     fn lsp_diagnostics_convert_utf16_and_hover_response_opens_overlay() {
         let mut state = state();
+        state.settings.diagnostics.enabled = true;
         let path = state.workspace.as_path().join("unicode.rs");
         let mut buffer = TextBuffer::empty(Some(path.clone()), false);
         buffer.insert("a😀value").unwrap();

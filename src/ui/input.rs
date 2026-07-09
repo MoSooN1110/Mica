@@ -365,6 +365,14 @@ pub fn command_for_mouse(state: &AppState, regions: Regions, event: MouseEvent) 
             _ => None,
         };
     }
+    if event.kind == MouseEventKind::Up(MouseButton::Left) && state.sidebar_resize_active {
+        return Some(Command::EndSidebarResize);
+    }
+    if event.kind == MouseEventKind::Drag(MouseButton::Left) && state.sidebar_resize_active {
+        return Some(Command::ResizeSidebar(sidebar_width_from_mouse(
+            regions, event,
+        )));
+    }
     if event.kind == MouseEventKind::Up(MouseButton::Left) && state.tab_drag_source.is_some() {
         return Some(Command::EndTabDrag);
     }
@@ -471,23 +479,53 @@ pub fn command_for_mouse(state: &AppState, regions: Regions, event: MouseEvent) 
         };
         return Some(Command::Invoke(id.to_owned()));
     }
+    if left_down
+        && state.sidebar_visible
+        && contains(regions.sidebar, point)
+        && event.column >= regions.sidebar.right().saturating_sub(1)
+    {
+        return Some(Command::BeginSidebarResize);
+    }
     if left_down && contains(regions.sidebar, point) {
         let index = usize::from(event.row.saturating_sub(regions.sidebar.y));
         if state.sidebar_view == crate::app::SidebarView::SourceControl {
+            let column = usize::from(event.column.saturating_sub(regions.sidebar.x));
+            if index == 2 {
+                return Some(Command::Invoke("git.commit".to_owned()));
+            }
+            if (1..=3).contains(&column)
+                && let Some(git_index) = state.git_index_at_row(index)
+                && let Some((_, target)) = state.git_entries().get(git_index)
+            {
+                return Some(if *target == crate::git::DiffTarget::Staged {
+                    Command::UnstageGit(git_index)
+                } else {
+                    Command::StageGit(git_index)
+                });
+            }
             return state.git_index_at_row(index).map(Command::SelectGitAndOpen);
         }
         if state.sidebar_view == crate::app::SidebarView::Search {
-            if index == 1 {
-                let column = usize::from(event.column.saturating_sub(regions.sidebar.x));
-                return match column {
-                    0..=7 => Some(Command::WorkspaceSearchToggleCase),
-                    8..=15 => Some(Command::WorkspaceSearchToggleWord),
-                    16..=24 => Some(Command::WorkspaceSearchToggleRegex),
-                    25..=34 => Some(Command::WorkspaceSearchToggleHidden),
-                    _ => Some(Command::WorkspaceSearchToggleBinary),
-                };
+            let column = usize::from(event.column.saturating_sub(regions.sidebar.x));
+            if index <= 3 {
+                return Some(Command::FocusSidebar);
             }
-            let row = index.saturating_sub(3);
+            if index == 4 {
+                if column < 14 {
+                    return Some(Command::WorkspaceSearchToggleCase);
+                }
+                return Some(Command::WorkspaceSearchToggleWord);
+            }
+            if index == 5 {
+                if column < 15 {
+                    return Some(Command::WorkspaceSearchToggleRegex);
+                }
+                return Some(Command::WorkspaceSearchToggleHidden);
+            }
+            if index == 6 {
+                return Some(Command::WorkspaceSearchToggleBinary);
+            }
+            let row = index.saturating_sub(7);
             return match state.workspace_search_rows().get(row) {
                 Some(crate::app::WorkspaceSearchRow::File(path)) => {
                     Some(Command::WorkspaceSearchToggleFile(path.clone()))
@@ -498,11 +536,13 @@ pub fn command_for_mouse(state: &AppState, regions: Regions, event: MouseEvent) 
                 None => None,
             };
         }
-        return state.tree.visible_entry(index).map(|entry| {
-            if entry.kind == TreeEntryKind::Directory {
-                Command::ToggleTree(index)
+        let tree_index = index.checked_sub(1)?;
+        return state.tree.visible_entry(tree_index).map(|entry| {
+            let column = usize::from(event.column.saturating_sub(regions.sidebar.x));
+            if entry.kind == TreeEntryKind::Directory && column <= 4 {
+                Command::ToggleTree(tree_index)
             } else {
-                Command::OpenFile(state.requested_file(&entry.relative_path))
+                Command::ClickTree(tree_index)
             }
         });
     }
@@ -615,14 +655,18 @@ pub fn command_for_mouse(state: &AppState, regions: Regions, event: MouseEvent) 
     }
     if contains(regions.editor, point) && event.row > regions.editor.y + 1 {
         let tab = state.active_tab()?;
-        let gutter_width = tab.buffer.text().len_lines().to_string().len().max(2) + 3;
+        let number_width = if state.settings.editor.line_numbers {
+            tab.buffer.text().len_lines().to_string().len().max(2)
+        } else {
+            0
+        };
+        let gutter_width = number_width + 3;
         let group_x = if state.split_tab.is_some() && state.split_focus_right {
             regions.editor.x + regions.editor.width / 2 + 1
         } else {
             regions.editor.x
         };
-        let display_column =
-            usize::from(event.column.saturating_sub(group_x)).saturating_sub(gutter_width);
+        let editor_column = usize::from(event.column.saturating_sub(group_x));
         let visual_offset = usize::from(event.row.saturating_sub(regions.editor.y + 2));
         let (line_index, segment_start) = if state.settings.editor.word_wrap {
             let group_width = if state.split_tab.is_some() {
@@ -648,6 +692,7 @@ pub fn command_for_mouse(state: &AppState, regions: Regions, event: MouseEvent) 
         if line_index >= tab.buffer.text().len_lines() {
             return None;
         }
+        let display_column = editor_column.saturating_sub(gutter_width);
         let line = tab.buffer.text().line(line_index).to_string();
         let content = line.trim_end_matches(['\r', '\n']);
         let segment = content.chars().skip(segment_start).collect::<String>();
@@ -696,4 +741,11 @@ fn contains(rect: ratatui::layout::Rect, point: (u16, u16)) -> bool {
         && point.0 < rect.x + rect.width
         && point.1 >= rect.y
         && point.1 < rect.y + rect.height
+}
+
+fn sidebar_width_from_mouse(regions: Regions, event: MouseEvent) -> u16 {
+    event
+        .column
+        .saturating_sub(regions.sidebar.x)
+        .saturating_add(1)
 }

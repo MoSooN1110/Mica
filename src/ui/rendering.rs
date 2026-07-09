@@ -420,9 +420,13 @@ fn render_activity(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         .as_ref()
         .map_or(0, |status| status.files.len());
     let entries = [
-        ("E", SidebarView::Explorer, 0usize),
-        ("G", SidebarView::SourceControl, changed_files),
-        ("S", SidebarView::Search, 0usize),
+        (icon_set.activity_explorer, SidebarView::Explorer, 0usize),
+        (
+            icon_set.activity_source_control,
+            SidebarView::SourceControl,
+            changed_files,
+        ),
+        (icon_set.activity_search, SidebarView::Search, 0usize),
     ];
     let lines = entries
         .into_iter()
@@ -497,9 +501,14 @@ fn render_sidebar(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme
     }
     if state.sidebar_view != SidebarView::Explorer {
         frame.render_widget(
-            Paragraph::new(search_sidebar_lines(state, theme, usize::from(area.height)))
-                .block(block)
-                .style(Style::default().fg(theme.text_muted).bg(theme.surface)),
+            Paragraph::new(search_sidebar_lines(
+                state,
+                theme,
+                usize::from(area.height),
+                usize::from(area.width.saturating_sub(1)),
+            ))
+            .block(block)
+            .style(Style::default().fg(theme.text_muted).bg(theme.surface)),
             area,
         );
         return;
@@ -684,47 +693,83 @@ fn git_status_color(change: &crate::git::GitFileChange, theme: &Theme) -> Color 
     }
 }
 
-fn search_sidebar_lines(state: &AppState, theme: &Theme, height: usize) -> Vec<Line<'static>> {
+fn search_sidebar_lines(
+    state: &AppState,
+    theme: &Theme,
+    height: usize,
+    width: usize,
+) -> Vec<Line<'static>> {
     let icon_set = icons(state.settings.ui.icon_mode);
     let running = if state.workspace_search_running {
         format!(" {}", icon_set.ellipsis)
     } else {
         String::new()
     };
+    let input_label = if state.workspace_search.query.is_empty() {
+        "type to search workspace"
+    } else {
+        state.workspace_search.query.as_str()
+    };
     let mut lines = vec![
         Line::from(Span::styled(
-            format!("> {}{running}", state.workspace_search.query),
-            Style::default().fg(theme.text).bg(theme.selection),
+            format!("╭─ FIND {running}"),
+            Style::default().fg(theme.accent).bg(theme.surface),
         )),
-        Line::from(format!(
-            "[{}]Case [{}]Word [{}]Regex [{}]Hidden [{}]Binary",
-            if state.workspace_search.case_sensitive {
-                "x"
-            } else {
-                " "
-            },
-            if state.workspace_search.whole_word {
-                "x"
-            } else {
-                " "
-            },
-            if state.workspace_search.regex {
-                "x"
-            } else {
-                " "
-            },
-            if state.workspace_search.show_hidden {
-                "x"
-            } else {
-                " "
-            },
-            if state.workspace_search.include_binary {
-                "x"
-            } else {
-                " "
-            }
+        Line::from(pad_to_width(
+            vec![
+                Span::styled(
+                    "│ ",
+                    Style::default().fg(theme.border).bg(theme.surface_raised),
+                ),
+                Span::styled(
+                    icon_set.prompt,
+                    Style::default().fg(theme.accent).bg(theme.surface_raised),
+                ),
+                Span::styled(
+                    format!(" {input_label}"),
+                    Style::default()
+                        .fg(if state.workspace_search.query.is_empty() {
+                            theme.text_faint
+                        } else {
+                            theme.text
+                        })
+                        .bg(theme.surface_raised),
+                ),
+            ],
+            width,
+            theme.surface_raised,
         )),
-        Line::from(format!(" {} results", state.workspace_matches.len())),
+        Line::from(Span::styled(
+            "╰─ click box, type query, Enter opens result",
+            Style::default().fg(theme.text_faint).bg(theme.surface),
+        )),
+        search_toggle_line(
+            "Case",
+            state.workspace_search.case_sensitive,
+            "Word",
+            state.workspace_search.whole_word,
+            theme,
+            width,
+        ),
+        search_toggle_line(
+            "Regex",
+            state.workspace_search.regex,
+            "Hidden",
+            state.workspace_search.show_hidden,
+            theme,
+            width,
+        ),
+        Line::from(pad_to_width(
+            vec![
+                search_toggle_span("Binary", state.workspace_search.include_binary, theme),
+                Span::styled(
+                    format!("  {} results", state.workspace_matches.len()),
+                    Style::default().fg(theme.text_muted).bg(theme.surface),
+                ),
+            ],
+            width,
+            theme.surface,
+        )),
     ];
     for row in state
         .workspace_search_rows()
@@ -793,6 +838,47 @@ fn search_sidebar_lines(state: &AppState, theme: &Theme, height: usize) -> Vec<L
     lines
 }
 
+fn search_toggle_line(
+    left_label: &str,
+    left_enabled: bool,
+    right_label: &str,
+    right_enabled: bool,
+    theme: &Theme,
+    width: usize,
+) -> Line<'static> {
+    Line::from(pad_to_width(
+        vec![
+            search_toggle_span(left_label, left_enabled, theme),
+            Span::styled("  ", Style::default().bg(theme.surface)),
+            search_toggle_span(right_label, right_enabled, theme),
+        ],
+        width,
+        theme.surface,
+    ))
+}
+
+fn search_toggle_span(label: &str, enabled: bool, theme: &Theme) -> Span<'static> {
+    Span::styled(
+        format!(" {} {} ", if enabled { "✓" } else { "□" }, label),
+        Style::default()
+            .fg(if enabled {
+                theme.accent
+            } else {
+                theme.text_muted
+            })
+            .bg(if enabled {
+                theme.selection
+            } else {
+                theme.surface_raised
+            })
+            .add_modifier(if enabled {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            }),
+    )
+}
+
 fn git_sidebar_lines(
     state: &AppState,
     theme: &Theme,
@@ -839,7 +925,24 @@ fn git_sidebar_lines(
             Style::default().fg(theme.git_modified).bg(theme.surface),
         ));
     }
-    let mut lines = vec![Line::from(branch_spans)];
+    let commit_label = format!(" {} Commit staged changes", icon_set.commit);
+    let mut lines = vec![
+        Line::from(branch_spans),
+        Line::from(pad_to_width(
+            vec![
+                Span::styled(" ", Style::default().bg(theme.surface)),
+                Span::styled(
+                    commit_label,
+                    Style::default()
+                        .fg(theme.git_added)
+                        .bg(theme.surface)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ],
+            width,
+            theme.surface,
+        )),
+    ];
     let mut selection_index = 0usize;
     for section in GitSection::ALL {
         let files = status
@@ -861,6 +964,11 @@ fn git_sidebar_lines(
         for file in files {
             let marker = crate::git::status_symbol(file);
             let marker_color = git_status_color(file, theme);
+            let action = if section == GitSection::Staged {
+                Some((icon_set.unstage, theme.git_deleted))
+            } else {
+                Some((icon_set.stage, theme.git_added))
+            };
             let selected = selection_index == state.git_selected;
             let background = if selected {
                 if focused {
@@ -889,6 +997,13 @@ fn git_sidebar_lines(
                             theme.text_faint
                         })
                         .bg(background),
+                ),
+                Span::styled(
+                    action.map_or_else(|| "   ".to_owned(), |(glyph, _)| format!(" {glyph} ")),
+                    Style::default()
+                        .fg(action.map_or(theme.text_faint, |(_, color)| color))
+                        .bg(background)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!(" {marker} "),
@@ -1128,7 +1243,12 @@ fn render_editor_group(
         .text()
         .char_to_line(selection.head.0.min(tab.buffer.text().len_chars()));
     let line_start = tab.buffer.text().line_to_char(cursor_line);
-    let gutter_width = tab.buffer.text().len_lines().to_string().len().max(2);
+    let number_width = if state.settings.editor.line_numbers {
+        tab.buffer.text().len_lines().to_string().len().max(2)
+    } else {
+        0
+    };
+    let gutter_width = number_width + 3;
     let large_file = u64::try_from(tab.buffer.text().len_bytes()).unwrap_or(u64::MAX)
         > state
             .settings
@@ -1148,7 +1268,7 @@ fn render_editor_group(
         .flatten();
     let visible_height = usize::from(rows[2].height);
     let wrap_width = usize::from(rows[2].width)
-        .saturating_sub(gutter_width + 3)
+        .saturating_sub(gutter_width)
         .max(1);
     let visual_rows = if state.settings.editor.word_wrap {
         crate::editor::visible_visual_rows(
@@ -1189,9 +1309,13 @@ fn render_editor_group(
                 editor_gutter_marker(state, tab.buffer.path(), line_index, theme)
             };
             let number = if visual_row.range_in_line.start == 0 {
-                format!("{marker} {:>width$} ", line_index + 1, width = gutter_width)
+                if state.settings.editor.line_numbers {
+                    format!("{marker} {:>width$} ", line_index + 1, width = number_width)
+                } else {
+                    format!("{marker}  ")
+                }
             } else {
-                format!("  {:>width$} ", "", width = gutter_width)
+                " ".repeat(gutter_width)
             };
             let active = line_index == cursor_line;
             let mut spans = vec![Span::styled(
@@ -1274,7 +1398,6 @@ fn render_editor_group(
         let x = rows[2].x
             + u16::try_from(
                 gutter_width
-                    + 3
                     + crate::editor::display_column(
                         &segment_before_cursor,
                         segment_before_cursor.chars().count(),
@@ -2163,6 +2286,14 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         format!("Notifs {}", state.notification_history.len()),
         Style::default().fg(theme.text_muted).bg(background),
     )];
+    let shortcut_segment = if area.width >= 90 {
+        vec![Span::styled(
+            shortcut_hint(state),
+            Style::default().fg(theme.text_muted).bg(background),
+        )]
+    } else {
+        Vec::new()
+    };
 
     let left = join_segments(
         vec![pane_segment, git_segment],
@@ -2178,6 +2309,7 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
             language_segment,
             encoding_segment,
             position_segment,
+            shortcut_segment,
             notification_segment,
             help_segment,
         ],
@@ -2208,6 +2340,23 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         columns[1],
     );
     frame.render_widget(Paragraph::new(Line::from(right)).style(base), columns[2]);
+}
+
+fn shortcut_hint(state: &AppState) -> &'static str {
+    match state.focus {
+        Focus::Sidebar => match state.sidebar_view {
+            SidebarView::Explorer => "↑↓ Enter",
+            SidebarView::SourceControl => "S/U/C",
+            SidebarView::Search => "type ↑↓ Enter",
+        },
+        Focus::Editor => "Ctrl+S Alt+Z",
+        Focus::BottomPanel => match state.bottom_panel_view {
+            BottomPanelView::Problems => "↑↓ Enter",
+            BottomPanelView::Output => "F1",
+            BottomPanelView::Terminal => "Ctrl+` Ctrl+Alt+F",
+        },
+        Focus::Overlay => "Enter Esc",
+    }
 }
 
 fn render_palette(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
